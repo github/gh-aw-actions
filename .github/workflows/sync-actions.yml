@@ -94,6 +94,24 @@ jobs:
             exit 1
           fi
 
+          # Verify the ref exists in the github/gh-aw repository (skip for 'latest' which is resolved below)
+          if [[ "$RAW_REF" != "latest" ]]; then
+            echo "Verifying '$RAW_REF' exists in github/gh-aw..."
+            API_ERROR=$(mktemp)
+            COMMIT_SHA=$(gh api "repos/github/gh-aw/commits/$RAW_REF" --jq '.sha' 2>"$API_ERROR" || echo "")
+            if [[ -z "$COMMIT_SHA" ]]; then
+              if [[ -s "$API_ERROR" ]]; then
+                echo "::error::Failed to verify ref '$RAW_REF' in github/gh-aw: $(cat "$API_ERROR")"
+              else
+                echo "::error::Ref '$RAW_REF' was not found in the github/gh-aw repository."
+              fi
+              rm -f "$API_ERROR"
+              exit 1
+            fi
+            rm -f "$API_ERROR"
+            echo "Ref '$RAW_REF' found in github/gh-aw (commit: $COMMIT_SHA). ✓"
+          fi
+
           if [[ "$RAW_REF" == "latest" ]]; then
             echo "Resolving 'latest' to the most recent gh-aw release..."
             LATEST_TAG=$(gh api repos/github/gh-aw/releases/latest --jq '.tag_name' 2>/dev/null || echo "")
