@@ -1,0 +1,32 @@
+{
+  "devDependencies": {
+    "@actions/core": "^3.0.0",
+    "@actions/exec": "^3.0.0",
+    "@actions/github": "^9.0.0",
+    "@actions/github-script": "github:actions/github-script",
+    "@actions/glob": "^0.6.1",
+    "@actions/io": "^3.0.2",
+    "@types/node": "^25.3.3",
+    "@vitest/coverage-v8": "^4.0.18",
+    "@vitest/ui": "^4.0.18",
+    "prettier": "^3.8.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "vitest": "^4.0.18"
+  },
+  "overrides": {
+    "undici": "^6.23.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && vitest run --no-file-parallelism",
+    "test:js": "vitest run",
+    "test:js-watch": "vitest",
+    "test:js-coverage": "vitest run --coverage",
+    "format:cjs": "npx prettier --write '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../../../.prettierignore",
+    "lint:cjs": "npx prettier --check '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../../../.prettierignore",
+    "format:schema": "npx prettier --write ../../../pkg/workflow/schemas/github-workflow.json --ignore-path /dev/null",
+    "format:pkg-json": "npx prettier --write '../../../**/*.json' '!../../../pkg/workflow/js/**/*.json' --ignore-path ../../../.prettierignore",
+    "check:pkg-json": "npx prettier --check '../../../**/*.json' '!../../../pkg/workflow/js/**/*.json' --ignore-path ../../../.prettierignore"
+  }
+}
