@@ -1,0 +1,225 @@
+name: Sync Actions from gh-aw
+
+on:
+  repository_dispatch:
+    types: [sync-actions]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref to sync from gh-aw (tag, branch, SHA, or "latest"). Defaults to latest release.'
+        required: false
+        default: 'latest'
+        type: string
+
+jobs:
+  sync:
+    name: Sync Actions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Log workflow context
+        run: |
+          echo "::group::Workflow Context"
+          echo "Repository:  ${{ github.repository }}"
+          echo "Actor:       ${{ github.actor }}"
+          echo "Event:       ${{ github.event_name }}"
+          echo "Ref:         ${{ github.ref }}"
+          echo "Run ID:      ${{ github.run_id }}"
+          echo "Run number:  ${{ github.run_number }}"
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            echo "Client payload ref: ${{ github.event.client_payload.ref }}"
+          else
+            echo "Workflow dispatch input ref: ${{ github.event.inputs.ref }}"
+          fi
+          echo "::endgroup::"
+
+      - name: Check repository is not a fork
+        run: |
+          echo "::group::Fork Check"
+          REPO="${{ github.repository }}"
+          echo "Checking if '$REPO' is a fork..."
+          IS_FORK=$(gh api "repos/$REPO" --jq '.fork')
+          echo "Is fork: $IS_FORK"
+          if [[ "$IS_FORK" == "true" ]]; then
+            echo "::error::This workflow is disabled on forks. Repository '$REPO' is a fork."
+            exit 1
+          fi
+          echo "Repository '$REPO' is not a fork. ✓"
+          echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check actor has admin or maintainer role
+        run: |
+          echo "::group::Permission Check"
+          ACTOR="${{ github.actor }}"
+          REPO="${{ github.repository }}"
+          echo "Checking permissions for actor '$ACTOR' on '$REPO'..."
+          ROLE=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq '.role_name' 2>/dev/null || echo "none")
+          echo "Actor role: $ROLE"
+          if [[ "$ROLE" != "admin" && "$ROLE" != "maintain" ]]; then
+            echo "::error::Actor '$ACTOR' does not have the required role (role: '$ROLE'). This workflow requires admin or maintainer access."
+            exit 1
+          fi
+          echo "Actor '$ACTOR' has required permissions (role: $ROLE). ✓"
+          echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve ref
+        id: resolve-ref
+        run: |
+          echo "::group::Resolving Ref"
+
+          # Determine raw ref from event inputs
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            RAW_REF="${{ github.event.client_payload.ref }}"
+          else
+            RAW_REF="${{ github.event.inputs.ref }}"
+          fi
+
+          # Default to 'latest' if empty
+          if [[ -z "$RAW_REF" ]]; then
+            RAW_REF="latest"
+          fi
+
+          echo "Raw ref: $RAW_REF"
+
+          if [[ "$RAW_REF" == "latest" ]]; then
+            echo "Resolving 'latest' to the most recent gh-aw release..."
+            LATEST_TAG=$(gh api repos/github/gh-aw/releases/latest --jq '.tag_name' 2>/dev/null || echo "")
+            if [[ -n "$LATEST_TAG" ]]; then
+              RESOLVED_REF="$LATEST_TAG"
+              echo "Latest release tag resolved to: $RESOLVED_REF"
+            else
+              echo "::warning::No releases found in gh-aw. Falling back to main branch HEAD."
+              RESOLVED_REF=$(gh api repos/github/gh-aw/commits/main --jq '.sha')
+              echo "Using main HEAD SHA: $RESOLVED_REF"
+            fi
+          else
+            RESOLVED_REF="$RAW_REF"
+            echo "Using provided ref: $RESOLVED_REF"
+          fi
+
+          # Determine whether to create a tag after syncing.
+          # Create a tag when the ref is not a full 40-character SHA and not "latest".
+          if [[ "$RAW_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            IS_LONG_SHA="true"
+          else
+            IS_LONG_SHA="false"
+          fi
+
+          if [[ "$IS_LONG_SHA" == "false" && "$RAW_REF" != "latest" ]]; then
+            SHOULD_CREATE_TAG="true"
+          else
+            SHOULD_CREATE_TAG="false"
+          fi
+
+          echo "Resolved ref:      $RESOLVED_REF"
+          echo "Is long SHA:       $IS_LONG_SHA"
+          echo "Should create tag: $SHOULD_CREATE_TAG"
+
+          echo "resolved_ref=$RESOLVED_REF"    >> "$GITHUB_OUTPUT"
+          echo "raw_ref=$RAW_REF"              >> "$GITHUB_OUTPUT"
+          echo "should_create_tag=$SHOULD_CREATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout gh-aw-actions (this repository)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: gh-aw-actions
+
+      - name: Checkout gh-aw at resolved ref (actions/ only)
+        uses: actions/checkout@v4
+        with:
+          repository: github/gh-aw
+          ref: ${{ steps.resolve-ref.outputs.resolved_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: gh-aw
+          sparse-checkout: actions
+          sparse-checkout-cone-mode: true
+
+      - name: Log source actions directory
+        run: |
+          echo "::group::Source — gh-aw/actions/ at ref '${{ steps.resolve-ref.outputs.resolved_ref }}'"
+          find gh-aw/actions -type f | sort
+          echo "::endgroup::"
+
+      - name: Log destination before sync
+        run: |
+          echo "::group::Destination — gh-aw-actions/actions/ before sync"
+          find gh-aw-actions/actions -type f 2>/dev/null | sort || echo "(actions/ directory does not exist yet)"
+          echo "::endgroup::"
+
+      - name: Sync actions directory (remote wins)
+        run: |
+          echo "::group::Syncing actions/"
+          echo "Source:      gh-aw/actions/"
+          echo "Destination: gh-aw-actions/actions/"
+          echo ""
+          # --archive preserves permissions/timestamps; --delete removes files absent in source (remote wins)
+          rsync --archive --verbose --delete gh-aw/actions/ gh-aw-actions/actions/
+          echo "::endgroup::"
+
+      - name: Log destination after sync
+        run: |
+          echo "::group::Destination — gh-aw-actions/actions/ after sync"
+          find gh-aw-actions/actions -type f | sort
+          echo "::endgroup::"
+
+      - name: Commit and push changes to main
+        id: commit
+        run: |
+          echo "::group::Git Commit"
+          cd gh-aw-actions
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A actions/
+
+          if git diff --staged --quiet; then
+            echo "No changes detected — nothing to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changes staged for commit:"
+            git diff --staged --stat
+            echo ""
+            COMMIT_MSG="chore: sync actions from gh-aw@${{ steps.resolve-ref.outputs.resolved_ref }}"
+            git commit -m "$COMMIT_MSG"
+            git push origin main
+            echo ""
+            echo "Changes committed and pushed to main. ✓"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "::endgroup::"
+
+      - name: Create tag
+        if: steps.resolve-ref.outputs.should_create_tag == 'true' && steps.commit.outputs.changed == 'true'
+        run: |
+          echo "::group::Creating Tag"
+          cd gh-aw-actions
+          TAG="${{ steps.resolve-ref.outputs.raw_ref }}"
+          echo "Creating tag: $TAG"
+
+          # If the tag already exists, delete and re-create it so it points to the
+          # new commit produced by this sync run.  Re-running a sync for the same
+          # named ref (e.g. a branch name or a short alias) is an explicit request
+          # to advance the tag, so force-updating is the expected behaviour.
+          if git tag -d "$TAG" 2>/dev/null; then
+            echo "Deleted existing local tag '$TAG' (will re-create at new HEAD)."
+          fi
+          if git push origin ":refs/tags/$TAG" 2>/dev/null; then
+            echo "Deleted existing remote tag '$TAG' (will re-create at new HEAD)."
+          fi
+
+          git tag -a "$TAG" -m "Sync from gh-aw@$TAG"
+          git push origin "$TAG"
+          echo "Tag '$TAG' created and pushed. ✓"
+          echo "::endgroup::"
