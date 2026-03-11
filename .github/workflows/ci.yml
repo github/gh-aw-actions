@@ -25,6 +25,6 @@ jobs:
           persist-credentials: false
 
       - name: Run zizmor on sync-actions.yml
-        uses: zizmorcore/zizmor-action@v1.5.0
+        uses: zizmorcore/zizmor-action@latest
         with:
           args: .github/workflows/sync-actions.yml
