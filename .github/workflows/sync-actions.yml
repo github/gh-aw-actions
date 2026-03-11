@@ -37,7 +37,7 @@ jobs:
           echo "Repository:  ${{ github.repository }}"
           echo "Actor:       ${{ github.actor }}"
           echo "Event:       ${{ github.event_name }}"
-          echo "Ref:         ${{ github.ref }}"
+          echo "Ref:         $GH_REF"
           echo "Run ID:      ${{ github.run_id }}"
           echo "Run number:  ${{ github.run_number }}"
           if [[ "${{ github.event_name }}" == "workflow_call" ]]; then
@@ -46,6 +46,8 @@ jobs:
             echo "Workflow dispatch input ref: ${{ inputs.ref }}"
           fi
           echo "::endgroup::"
+        env:
+          GH_REF: ${{ github.ref }}
 
       - name: Check repository is not a fork
         run: |
