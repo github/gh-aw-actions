@@ -339,8 +339,7 @@ jobs:
           if [[ "${{ steps.create-pr.outputs.changed }}" == "true" ]]; then
             echo "PR was merged — fetching main to tag the merge commit..."
             git fetch origin main
-            git checkout main
-            git reset --hard origin/main
+            git checkout -B main origin/main
           fi
 
           TAG="${{ steps.resolve-ref.outputs.raw_ref }}"
