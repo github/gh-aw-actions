@@ -182,7 +182,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add actions/
+          git add -A actions/
 
           if git diff --staged --quiet; then
             echo "No changes detected — nothing to commit."
