@@ -37,7 +37,7 @@ jobs:
           echo "Repository:  ${{ github.repository }}"
           echo "Actor:       $ACTOR"
           echo "Event:       ${{ github.event_name }}"
-          echo "Ref:         ${{ github.ref }}"
+          echo "Ref:         $GH_REF"
           echo "Run ID:      ${{ github.run_id }}"
           echo "Run number:  ${{ github.run_number }}"
           if [[ "${{ github.event_name }}" == "workflow_call" ]]; then
@@ -47,6 +47,7 @@ jobs:
           fi
           echo "::endgroup::"
         env:
+          GH_REF: ${{ github.ref }}
           ACTOR: ${{ github.actor }}
           INPUT_REF: ${{ inputs.ref }}
 
