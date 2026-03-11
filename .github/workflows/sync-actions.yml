@@ -94,7 +94,8 @@ jobs:
             exit 1
           fi
 
-          # Verify the ref exists in the github/gh-aw repository (skip for 'latest' which is resolved below)
+          # Verify the ref exists in github/gh-aw and is reachable from the main branch
+          # (skip for 'latest', which is resolved to the newest release below)
           if [[ "$RAW_REF" != "latest" ]]; then
             echo "Verifying '$RAW_REF' exists in github/gh-aw..."
             API_ERROR=$(mktemp)
@@ -109,7 +110,25 @@ jobs:
               exit 1
             fi
             rm -f "$API_ERROR"
-            echo "Ref '$RAW_REF' found in github/gh-aw (commit: $COMMIT_SHA). ✓"
+            echo "Ref '$RAW_REF' resolved to commit $COMMIT_SHA."
+
+            # Confirm the commit is reachable from the main branch.
+            # compare/main...<sha>: status "behind" or "identical" means the commit
+            # is an ancestor of (or equal to) main HEAD.
+            echo "Checking that $COMMIT_SHA is in the main branch history of github/gh-aw..."
+            API_ERROR=$(mktemp)
+            COMPARE_STATUS=$(gh api "repos/github/gh-aw/compare/main...$COMMIT_SHA" --jq '.status' 2>"$API_ERROR" || echo "")
+            if [[ -z "$COMPARE_STATUS" ]]; then
+              echo "::error::Failed to compare ref '$RAW_REF' against main in github/gh-aw: $(cat "$API_ERROR")"
+              rm -f "$API_ERROR"
+              exit 1
+            fi
+            rm -f "$API_ERROR"
+            if [[ "$COMPARE_STATUS" != "behind" && "$COMPARE_STATUS" != "identical" ]]; then
+              echo "::error::Ref '$RAW_REF' (commit $COMMIT_SHA) is not in the main branch history of github/gh-aw (compare status: '$COMPARE_STATUS')."
+              exit 1
+            fi
+            echo "Ref '$RAW_REF' is in the main branch history of github/gh-aw. ✓"
           fi
 
           if [[ "$RAW_REF" == "latest" ]]; then
