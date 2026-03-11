@@ -329,10 +329,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create tag
-        if: steps.resolve-ref.outputs.should_create_tag == 'true' && steps.create-pr.outputs.changed == 'true'
+        if: steps.resolve-ref.outputs.should_create_tag == 'true'
         run: |
           echo "::group::Creating Tag"
           cd gh-aw-actions
+
+          # When a PR was created and merged, we need to pull the merge commit from main
+          # because the working directory is still on the sync branch.
+          if [[ "${{ steps.create-pr.outputs.changed }}" == "true" ]]; then
+            echo "PR was merged — fetching main to tag the merge commit..."
+            git fetch origin main
+            git checkout -B main origin/main
+          fi
+
           TAG="${{ steps.resolve-ref.outputs.raw_ref }}"
           echo "Creating tag: $TAG"
 
