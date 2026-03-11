@@ -205,24 +205,34 @@ jobs:
 
       - name: Log destination before sync
         run: |
-          echo "::group::Destination — gh-aw-actions/actions/ before sync"
-          find gh-aw-actions/actions -type f 2>/dev/null | sort || echo "(actions/ directory does not exist yet)"
+          echo "::group::Destination — gh-aw-actions/ (action folders) before sync"
+          for dir in gh-aw/actions/*/; do
+            name=$(basename "$dir")
+            echo "--- $name/ ---"
+            find "gh-aw-actions/$name" -type f 2>/dev/null | sort || echo "(does not exist yet)"
+          done
           echo "::endgroup::"
 
-      - name: Sync actions directory (remote wins)
+      - name: Sync action folders (remote wins, local README preserved)
         run: |
-          echo "::group::Syncing actions/"
-          echo "Source:      gh-aw/actions/"
-          echo "Destination: gh-aw-actions/actions/"
-          echo ""
+          echo "::group::Syncing action folders from gh-aw/actions/ to repo root"
           # --archive preserves permissions/timestamps; --delete removes files absent in source (remote wins)
-          rsync --archive --verbose --delete gh-aw/actions/ gh-aw-actions/actions/
+          # --exclude='README*' preserves any local README files in each destination folder
+          for dir in gh-aw/actions/*/; do
+            name=$(basename "$dir")
+            echo "Syncing: gh-aw/actions/$name/ -> gh-aw-actions/$name/"
+            rsync --archive --verbose --delete --exclude='README*' "gh-aw/actions/$name/" "gh-aw-actions/$name/"
+          done
           echo "::endgroup::"
 
       - name: Log destination after sync
         run: |
-          echo "::group::Destination — gh-aw-actions/actions/ after sync"
-          find gh-aw-actions/actions -type f | sort
+          echo "::group::Destination — gh-aw-actions/ (action folders) after sync"
+          for dir in gh-aw/actions/*/; do
+            name=$(basename "$dir")
+            echo "--- $name/ ---"
+            find "gh-aw-actions/$name" -type f | sort
+          done
           echo "::endgroup::"
 
       - name: Commit and push changes to main
@@ -234,7 +244,10 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -A actions/
+          for dir in ../gh-aw/actions/*/; do
+            name=$(basename "$dir")
+            git add -A "$name/"
+          done
 
           if git diff --staged --quiet; then
             echo "No changes detected — nothing to commit."
