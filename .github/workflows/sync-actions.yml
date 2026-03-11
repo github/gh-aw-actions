@@ -87,6 +87,13 @@ jobs:
 
           echo "Raw ref: $RAW_REF"
 
+          # Validate ref format: must be a semver (vMAJOR.MINOR.PATCH), a 40-char SHA, or "latest"
+          SEMVER_PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [[ "$RAW_REF" != "latest" && ! "$RAW_REF" =~ $SEMVER_PATTERN && ! "$RAW_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid ref '$RAW_REF'. Must be a semver version (vMAJOR.MINOR.PATCH), a 40-character SHA, or 'latest'."
+            exit 1
+          fi
+
           if [[ "$RAW_REF" == "latest" ]]; then
             echo "Resolving 'latest' to the most recent gh-aw release..."
             LATEST_TAG=$(gh api repos/github/gh-aw/releases/latest --jq '.tag_name' 2>/dev/null || echo "")
@@ -117,13 +124,21 @@ jobs:
             SHOULD_CREATE_TAG="false"
           fi
 
+          if [[ "$RAW_REF" =~ $SEMVER_PATTERN ]]; then
+            IS_SEMVER="true"
+          else
+            IS_SEMVER="false"
+          fi
+
           echo "Resolved ref:      $RESOLVED_REF"
           echo "Is long SHA:       $IS_LONG_SHA"
+          echo "Is semver:         $IS_SEMVER"
           echo "Should create tag: $SHOULD_CREATE_TAG"
 
           echo "resolved_ref=$RESOLVED_REF"    >> "$GITHUB_OUTPUT"
           echo "raw_ref=$RAW_REF"              >> "$GITHUB_OUTPUT"
           echo "should_create_tag=$SHOULD_CREATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "is_semver=$IS_SEMVER"          >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -222,4 +237,25 @@ jobs:
           git tag -a "$TAG" -m "Sync from gh-aw@$TAG"
           git push origin "$TAG"
           echo "Tag '$TAG' created and pushed. ✓"
+
+          # If the ref is a semver, also update the vMAJOR and vMAJOR.MINOR floating tags
+          if [[ "${{ steps.resolve-ref.outputs.is_semver }}" == "true" ]]; then
+            # These sed patterns are safe: the format was already validated as vMAJOR.MINOR.PATCH above
+            MAJOR_TAG="v$(echo "$TAG" | sed 's/^v\([0-9]*\)\..*/\1/')"
+            MINOR_TAG="v$(echo "$TAG" | sed 's/^v\([0-9]*\.[0-9]*\)\..*/\1/')"
+
+            for FLOATING_TAG in "$MAJOR_TAG" "$MINOR_TAG"; do
+              echo "Updating floating tag: $FLOATING_TAG"
+              if git tag -d "$FLOATING_TAG" 2>/dev/null; then
+                echo "Deleted existing local tag '$FLOATING_TAG'."
+              fi
+              if git push origin ":refs/tags/$FLOATING_TAG" 2>/dev/null; then
+                echo "Deleted existing remote tag '$FLOATING_TAG'."
+              fi
+              git tag -a "$FLOATING_TAG" -m "Sync from gh-aw@$TAG"
+              git push origin "$FLOATING_TAG"
+              echo "Floating tag '$FLOATING_TAG' updated. ✓"
+            done
+          fi
+
           echo "::endgroup::"
