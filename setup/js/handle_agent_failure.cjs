@@ -1,0 +1,1019 @@
+// @ts-check
+/// <reference types="@actions/github-script" />
+
+const { getErrorMessage } = require("./error_helpers.cjs");
+const { sanitizeContent } = require("./sanitize_content.cjs");
+const { getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateXMLMarker } = require("./messages.cjs");
+const { renderTemplate } = require("./messages_core.cjs");
+const { getCurrentBranch } = require("./get_current_branch.cjs");
+const { createExpirationLine, generateFooterWithExpiration } = require("./ephemerals.cjs");
+const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
+const { formatMissingData } = require("./missing_info_formatter.cjs");
+const fs = require("fs");
+
+/**
+ * Attempt to find a pull request for the current branch
+ * @returns {Promise<{number: number, html_url: string, head_sha: string, mergeable: boolean | null, mergeable_state: string, updated_at: string} | null>} PR info or null if not found
+ */
+async function findPullRequestForCurrentBranch() {
+  try {
+    const { owner, repo } = context.repo;
+    const currentBranch = getCurrentBranch();
+
+    core.info(`Searching for pull request from branch: ${currentBranch}`);
+
+    // Search for open PRs with the current branch as head
+    const searchQuery = `repo:${owner}/${repo} is:pr is:open head:${currentBranch}`;
+
+    const searchResult = await github.rest.search.issuesAndPullRequests({
+      q: searchQuery,
+      per_page: 1,
+    });
+
+    if (searchResult.data.total_count > 0) {
+      const pr = searchResult.data.items[0];
+      core.info(`Found pull request #${pr.number}: ${pr.html_url}`);
+
+      // Fetch detailed PR info to get mergeable state and head SHA
+      try {
+        const detailedPR = await github.rest.pulls.get({
+          owner,
+          repo,
+          pull_number: pr.number,
+        });
+
+        core.info(`PR #${pr.number} details - head_sha: ${detailedPR.data.head.sha}, mergeable: ${detailedPR.data.mergeable}, mergeable_state: ${detailedPR.data.mergeable_state}`);
+
+        return {
+          number: pr.number,
+          html_url: pr.html_url,
+          head_sha: detailedPR.data.head.sha,
+          mergeable: detailedPR.data.mergeable,
+          mergeable_state: detailedPR.data.mergeable_state || "unknown",
+          updated_at: detailedPR.data.updated_at,
+        };
+      } catch (detailsError) {
+        core.warning(`Failed to fetch detailed PR info: ${getErrorMessage(detailsError)}`);
+        // Fall back to basic info
+        return {
+          number: pr.number,
+          html_url: pr.html_url,
+          head_sha: "",
+          mergeable: null,
+          mergeable_state: "unknown",
+          updated_at: "",
+        };
+      }
+    }
+
+    core.info(`No pull request found for branch: ${currentBranch}`);
+    return null;
+  } catch (error) {
+    core.warning(`Failed to find pull request for current branch: ${getErrorMessage(error)}`);
+    return null;
+  }
+}
+
+/**
+ * Search for or create the parent issue for all agentic workflow failures
+ * @param {number|null} previousParentNumber - Previous parent issue number if creating due to limit
+ * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
+ */
+async function ensureParentIssue(previousParentNumber = null) {
+  const { owner, repo } = context.repo;
+  const parentTitle = "[aw] Failed runs";
+  const parentLabel = "agentic-workflows";
+
+  core.info(`Searching for parent issue: "${parentTitle}"`);
+
+  // Search for existing parent issue
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:${parentLabel} in:title "${parentTitle}"`;
+
+  try {
+    const searchResult = await github.rest.search.issuesAndPullRequests({
+      q: searchQuery,
+      per_page: 1,
+    });
+
+    if (searchResult.data.total_count > 0) {
+      const existingIssue = searchResult.data.items[0];
+      core.info(`Found existing parent issue #${existingIssue.number}: ${existingIssue.html_url}`);
+
+      // Check the sub-issue count
+      const subIssueCount = await getSubIssueCount(owner, repo, existingIssue.number);
+
+      if (subIssueCount !== null && subIssueCount >= MAX_SUB_ISSUES) {
+        core.warning(`Parent issue #${existingIssue.number} has ${subIssueCount} sub-issues (max: ${MAX_SUB_ISSUES})`);
+        core.info(`Creating a new parent issue (previous parent #${existingIssue.number} is full)`);
+
+        // Fall through to create a new parent issue, passing the previous parent number
+        previousParentNumber = existingIssue.number;
+      } else {
+        // Parent issue is within limits, return it
+        if (subIssueCount !== null) {
+          core.info(`Parent issue has ${subIssueCount} sub-issues (within limit of ${MAX_SUB_ISSUES})`);
+        }
+        return {
+          number: existingIssue.number,
+          node_id: existingIssue.node_id,
+        };
+      }
+    }
+  } catch (error) {
+    core.warning(`Error searching for parent issue: ${getErrorMessage(error)}`);
+  }
+
+  // Create parent issue if it doesn't exist or if previous one is full
+  const creationReason = previousParentNumber ? `creating new parent (previous #${previousParentNumber} reached limit)` : "creating first parent";
+  core.info(`No suitable parent issue found, ${creationReason}`);
+
+  let parentBodyContent = `This issue tracks all failures from agentic workflows in this repository. Each failed workflow run creates a sub-issue linked here for organization and easy filtering.`;
+
+  // Add reference to previous parent if this is a continuation
+  if (previousParentNumber) {
+    parentBodyContent += `
+
+> **Note:** This is a continuation parent issue. The previous parent issue #${previousParentNumber} reached the maximum of ${MAX_SUB_ISSUES} sub-issues.`;
+  }
+
+  parentBodyContent += `
+
+### Purpose
+
+This parent issue helps you:
+- View all workflow failures in one place by checking the sub-issues below
+- Filter out failure issues from your main issue list using \`no:parent-issue\`
+- Track the health of your agentic workflows over time
+
+### Sub-Issues
+
+All individual workflow failure issues are linked as sub-issues below. Click on any sub-issue to see details about a specific failure.
+
+### Troubleshooting Failed Workflows
+
+#### Using agentic-workflows Agent (Recommended)
+
+**Agent:** \`agentic-workflows\`  
+**Purpose:** Debug and fix workflow failures
+
+**Instructions:**
+
+1. Invoke the agent: Type \`/agent\` in GitHub Copilot Chat and select **agentic-workflows**
+2. Provide context: Tell the agent to **debug** the workflow failure
+3. Supply the workflow run URL for analysis
+4. The agent will:
+   - Analyze failure logs
+   - Identify root causes
+   - Propose specific fixes
+   - Validate solutions
+
+#### Using gh aw CLI
+
+You can also debug failures using the \`gh aw\` CLI:
+
+\`\`\`bash
+# Download and analyze workflow logs
+gh aw logs <workflow-run-url>
+
+# Audit a specific workflow run
+gh aw audit <run-id>
+\`\`\`
+
+#### Manual Investigation
+
+1. Click on a sub-issue to see the failed workflow details
+2. Follow the workflow run link in the issue
+3. Review the agent job logs for error messages
+4. Check the workflow configuration in your repository
+
+### Resources
+
+- [GitHub Agentic Workflows Documentation](https://github.com/github/gh-aw)
+- [Troubleshooting Guide](https://github.github.com/gh-aw/troubleshooting/common-issues/)
+
+---
+
+> This issue is automatically managed by GitHub Agentic Workflows. Do not close this issue manually.`;
+
+  // Add expiration marker (7 days from now) inside the quoted section using helper
+  const footer = generateFooterWithExpiration({
+    footerText: parentBodyContent,
+    expiresHours: 24 * 7, // 7 days
+  });
+  const parentBody = footer;
+
+  try {
+    const newIssue = await github.rest.issues.create({
+      owner,
+      repo,
+      title: parentTitle,
+      body: parentBody,
+      labels: [parentLabel],
+    });
+
+    core.info(`✓ Created parent issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
+    return {
+      number: newIssue.data.number,
+      node_id: newIssue.data.node_id,
+    };
+  } catch (error) {
+    core.error(`Failed to create parent issue: ${getErrorMessage(error)}`);
+    throw error;
+  }
+}
+
+/**
+ * Link an issue as a sub-issue to a parent issue
+ * @param {string} parentNodeId - GraphQL node ID of the parent issue
+ * @param {string} subIssueNodeId - GraphQL node ID of the sub-issue
+ * @param {number} parentNumber - Parent issue number (for logging)
+ * @param {number} subIssueNumber - Sub-issue number (for logging)
+ */
+async function linkSubIssue(parentNodeId, subIssueNodeId, parentNumber, subIssueNumber) {
+  core.info(`Linking issue #${subIssueNumber} as sub-issue of #${parentNumber}`);
+
+  try {
+    // Use GraphQL to link the sub-issue
+    await github.graphql(
+      `mutation($parentId: ID!, $subIssueId: ID!) {
+        addSubIssue(input: {issueId: $parentId, subIssueId: $subIssueId}) {
+          issue {
+            id
+            number
+          }
+          subIssue {
+            id
+            number
+          }
+        }
+      }`,
+      {
+        parentId: parentNodeId,
+        subIssueId: subIssueNodeId,
+      }
+    );
+
+    core.info(`✓ Successfully linked #${subIssueNumber} as sub-issue of #${parentNumber}`);
+  } catch (error) {
+    const errorMessage = getErrorMessage(error);
+    if (errorMessage.includes("Field 'addSubIssue' doesn't exist") || errorMessage.includes("not yet available")) {
+      core.warning(`Sub-issue API not available. Issue #${subIssueNumber} created but not linked to parent.`);
+    } else {
+      core.warning(`Failed to link sub-issue: ${errorMessage}`);
+    }
+  }
+}
+
+/**
+ * Build create_discussion errors context string from error environment variable
+ * @param {string} createDiscussionErrors - Newline-separated error strings
+ * @returns {string} Formatted error context for display
+ */
+function buildCreateDiscussionErrorsContext(createDiscussionErrors) {
+  if (!createDiscussionErrors) {
+    return "";
+  }
+
+  let context = "\n**⚠️ Create Discussion Failed**: Failed to create one or more discussions.\n\n**Discussion Errors:**\n";
+  const errorLines = createDiscussionErrors.split("\n").filter(line => line.trim());
+  for (const errorLine of errorLines) {
+    const parts = errorLine.split(":");
+    if (parts.length >= 4) {
+      // parts[0] is "discussion", parts[1] is index - both unused
+      const repo = parts[2];
+      const title = parts[3];
+      const error = parts.slice(4).join(":"); // Rest is the error message
+      context += `- Discussion "${title}" in ${repo}: ${error}\n`;
+    }
+  }
+  context += "\n";
+  return context;
+}
+
+/**
+ * Build a fork context hint string when the repository is a fork.
+ * @returns {string} Fork hint string, or empty string if not a fork
+ */
+function buildForkContextHint() {
+  if (context.payload?.repository?.fork) {
+    return "\n💡 **This repository is a fork.** If this failure is due to missing API keys or tokens, note that secrets from the parent repository are not inherited. Configure the required secrets directly in your fork's Settings → Secrets and variables → Actions.\n";
+  }
+  return "";
+}
+
+/**
+ * Build a context string describing code-push failures for inclusion in failure issue/comment bodies.
+ * Manifest file protection refusals are separated from other push failures to give them a dedicated
+ * section with clearer remediation instructions.
+ * @param {string} codePushFailureErrors - Newline-separated list of "type:error" entries
+ * @param {{number: number, html_url: string, head_sha?: string, mergeable?: boolean | null, mergeable_state?: string, updated_at?: string} | null} pullRequest - PR info if available
+ * @returns {string} Formatted context string, or empty string if no failures
+ */
+function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null) {
+  if (!codePushFailureErrors) {
+    return "";
+  }
+
+  // Split errors into protected-file protection refusals, patch size errors, and other push failures
+  const manifestErrors = [];
+  const patchSizeErrors = [];
+  const otherErrors = [];
+  const errorLines = codePushFailureErrors.split("\n").filter(line => line.trim());
+  for (const errorLine of errorLines) {
+    const colonIndex = errorLine.indexOf(":");
+    if (colonIndex !== -1) {
+      const type = errorLine.substring(0, colonIndex);
+      const error = errorLine.substring(colonIndex + 1);
+      if (error.includes("manifest files") || error.includes("protected files")) {
+        manifestErrors.push({ type, error });
+      } else if (error.includes("Patch size") && error.includes("exceeds")) {
+        patchSizeErrors.push({ type, error });
+      } else {
+        otherErrors.push({ type, error });
+      }
+    }
+  }
+
+  let context = "";
+
+  // Protected file protection section — shown before generic failures
+  if (manifestErrors.length > 0) {
+    context +=
+      "\n**🛡️ Protected Files**: The code push was refused because the patch modifies protected files (package manifests, agent instruction files, or repository security configuration). " +
+      "This protection guards against unintended supply chain changes.\n";
+    if (pullRequest) {
+      context += `\n**Target Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})\n`;
+    }
+    context += "\n**Blocked Operations:**\n";
+    for (const { type, error } of manifestErrors) {
+      context += `- \`${type}\`: ${error}\n`;
+    }
+    // Build a dynamic YAML snippet listing only the safe output types that were actually blocked
+    const typeToYamlKey = {
+      create_pull_request: "create-pull-request",
+      push_to_pull_request_branch: "push-to-pull-request-branch",
+    };
+    const blockedTypes = [...new Set(manifestErrors.map(e => e.type))];
+    let yamlSnippet = "```yaml\nsafe-outputs:\n";
+    for (const type of blockedTypes) {
+      const yamlKey = typeToYamlKey[type] || type.replace(/_/g, "-");
+      yamlSnippet += `  ${yamlKey}:\n    protected-files: fallback-to-issue\n`;
+    }
+    yamlSnippet += "```\n";
+    context += "\nTo review and apply these changes manually, configure `protected-files: fallback-to-issue` — the agent will create a review issue with instructions instead of blocking:\n";
+    context += yamlSnippet;
+  }
+
+  // Patch size exceeded section
+  if (patchSizeErrors.length > 0) {
+    context += "\n**📦 Patch Size Exceeded**: The code push was rejected because the generated patch is too large.\n";
+    if (pullRequest) {
+      context += `\n**Target Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})\n`;
+    }
+    context += "\n**Errors:**\n";
+    for (const { type, error } of patchSizeErrors) {
+      context += `- \`${type}\`: ${error}\n`;
+    }
+    // Build a dynamic YAML snippet listing only the safe output types that had patch size errors
+    const typeToYamlKey = {
+      create_pull_request: "create-pull-request",
+      push_to_pull_request_branch: "push-to-pull-request-branch",
+    };
+    const affectedTypes = [...new Set(patchSizeErrors.map(e => e.type))];
+    let yamlSnippet = "```yaml\nsafe-outputs:\n";
+    for (const type of affectedTypes) {
+      const yamlKey = typeToYamlKey[type] || type.replace(/_/g, "-");
+      yamlSnippet += `  ${yamlKey}:\n    max-patch-size: 2048  # Example: double the default limit (in KB, default: 1024)\n`;
+    }
+    yamlSnippet += "```\n";
+    context += "\nTo allow larger patches, increase `max-patch-size` in your workflow's front matter (value in KB):\n";
+    context += yamlSnippet;
+  }
+
+  // Generic code-push failure section
+  if (otherErrors.length > 0) {
+    context += "\n**⚠️ Code Push Failed**: A code push safe output failed, and subsequent safe outputs were cancelled.";
+    if (pullRequest) {
+      context += `\n\n**Target Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
+
+      // Add PR state diagnostics
+      const workflowSha = process.env.GITHUB_SHA || "";
+      const prDetails = [];
+
+      // Check for merge conflicts
+      if (pullRequest.mergeable === false) {
+        prDetails.push("❌ **Merge conflicts detected** - the PR has conflicts that need resolution");
+      } else if (pullRequest.mergeable_state === "dirty") {
+        prDetails.push("❌ **PR is in dirty state** - likely has merge conflicts");
+      } else if (pullRequest.mergeable_state === "blocked") {
+        prDetails.push("⚠️ **PR is blocked** - required status checks or reviews may be missing");
+      } else if (pullRequest.mergeable_state === "behind") {
+        prDetails.push("⚠️ **PR is behind base branch** - may need to be updated");
+      }
+
+      // Check if branch was updated since workflow started
+      if (workflowSha && pullRequest.head_sha && workflowSha !== pullRequest.head_sha) {
+        prDetails.push(`⚠️ **Branch was updated** - workflow started at \`${workflowSha.substring(0, 7)}\`, PR head is now \`${pullRequest.head_sha.substring(0, 7)}\``);
+      }
+
+      // Add SHA info for debugging
+      if (pullRequest.head_sha) {
+        prDetails.push(`**PR head SHA:** \`${pullRequest.head_sha.substring(0, 7)}\``);
+      }
+      if (workflowSha) {
+        prDetails.push(`**Workflow SHA:** \`${workflowSha.substring(0, 7)}\``);
+      }
+      if (pullRequest.mergeable_state && pullRequest.mergeable_state !== "unknown") {
+        prDetails.push(`**Mergeable state:** ${pullRequest.mergeable_state}`);
+      }
+
+      if (prDetails.length > 0) {
+        context += "\n\n**PR State at Push Time:**\n";
+        for (const detail of prDetails) {
+          context += `- ${detail}\n`;
+        }
+      }
+    }
+    context += "\n**Code Push Errors:**\n";
+    for (const { type, error } of otherErrors) {
+      context += `- \`${type}\`: ${error}\n`;
+    }
+    context += "\n";
+  } else if (manifestErrors.length > 0 || patchSizeErrors.length > 0) {
+    // Only manifest or patch size errors — ensure trailing newline
+    context += "\n";
+  }
+
+  return context;
+}
+
+/**
+ * Build a context string for push_repo_memory job failures, with a dedicated section for patch size errors.
+ * @param {boolean} hasPushRepoMemoryFailure - Whether the push_repo_memory job failed
+ * @param {string[]} repoMemoryPatchSizeExceededIDs - Memory IDs that exceeded the patch size limit
+ * @param {string} runUrl - URL of the current workflow run
+ * @returns {string} Formatted context string, or empty string if no failure
+ */
+function buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryPatchSizeExceededIDs, runUrl) {
+  if (!hasPushRepoMemoryFailure) {
+    return "";
+  }
+  if (repoMemoryPatchSizeExceededIDs.length > 0) {
+    let context = "\n**📦 Repo-Memory Patch Size Exceeded**: The repo-memory push failed because the memory data is too large.\n";
+    context += "\n**Affected memories:** " + repoMemoryPatchSizeExceededIDs.map(id => `\`${id}\``).join(", ") + "\n";
+    context += "\nTo allow larger memory snapshots, increase `max-patch-size` in your workflow's `repo-memory` front matter (value in bytes):\n";
+    context += "```yaml\nrepo-memory:\n";
+    for (const memoryID of repoMemoryPatchSizeExceededIDs) {
+      context += `  - id: ${memoryID}\n    max-patch-size: 51200  # Example: 5x the default limit (in bytes, default: 10240, max: 102400)\n`;
+    }
+    context += "```\n\n";
+    return context;
+  }
+  return (
+    "\n**⚠️ Repo-Memory Push Failed**: The push-repo-memory job failed to write memory back to the repository. This may indicate a permission issue, a configuration error, or a network problem. Check the [workflow run](" +
+    runUrl +
+    ") for details.\n\n"
+  );
+}
+
+/**
+ * Load missing_data messages from agent output
+ * @returns {Array<{data_type: string, reason: string, context?: string, alternatives?: string}>} Array of missing data messages
+ */
+function loadMissingDataMessages() {
+  try {
+    const { loadAgentOutput } = require("./load_agent_output.cjs");
+    const agentOutputResult = loadAgentOutput();
+
+    if (!agentOutputResult.success || !agentOutputResult.items) {
+      return [];
+    }
+
+    // Extract missing_data messages from agent output
+    const missingDataMessages = [];
+    for (const item of agentOutputResult.items) {
+      if (item.type === "missing_data") {
+        // Extract the fields we need
+        if (item.data_type && item.reason) {
+          missingDataMessages.push({
+            data_type: item.data_type,
+            reason: item.reason,
+            context: item.context || null,
+            alternatives: item.alternatives || null,
+          });
+        }
+      }
+    }
+
+    return missingDataMessages;
+  } catch (error) {
+    core.warning(`Failed to load missing_data messages: ${getErrorMessage(error)}`);
+    return [];
+  }
+}
+
+/**
+ * Build missing_data context string for display in failure issues/comments
+ * @returns {string} Formatted missing data context
+ */
+function buildMissingDataContext() {
+  const missingDataMessages = loadMissingDataMessages();
+
+  if (missingDataMessages.length === 0) {
+    return "";
+  }
+
+  core.info(`Found ${missingDataMessages.length} missing_data message(s)`);
+
+  // Format the missing data using the existing formatter
+  const formattedList = formatMissingData(missingDataMessages);
+
+  let context = "\n**⚠️ Missing Data Reported**: The agent reported missing data during execution.\n\n**Missing Data:**\n";
+  context += formattedList;
+  context += "\n\n";
+
+  return context;
+}
+
+/**
+ * Build a context string with a frontmatter hint when the agent timed out.
+ * @param {boolean} isTimedOut - Whether the agent job timed out
+ * @param {string} timeoutMinutes - Current timeout value in minutes (e.g. "20")
+ * @returns {string} Formatted timeout context string, or empty string if not timed out
+ */
+function buildTimeoutContext(isTimedOut, timeoutMinutes) {
+  if (!isTimedOut) {
+    return "";
+  }
+
+  const currentMinutes = parseInt(timeoutMinutes || "20", 10);
+  const suggestedMinutes = currentMinutes + 10;
+
+  let ctx = "\n**⏱️ Agent Timed Out**: The agent job exceeded the maximum allowed execution time";
+  ctx += ` (${currentMinutes} minutes).`;
+  ctx += "\n\nTo increase the timeout, add or update the `timeout-minutes` setting in your workflow's frontmatter:\n\n";
+  ctx += "```yaml\n";
+  ctx += "---\n";
+  ctx += `timeout-minutes: ${suggestedMinutes}\n`;
+  ctx += "---\n";
+  ctx += "```\n\n";
+
+  return ctx;
+}
+
+/**
+ * Build a context string when the Copilot CLI failed due to the token lacking inference access.
+ * @param {boolean} hasInferenceAccessError - Whether an inference access error was detected
+ * @returns {string} Formatted context string, or empty string if no error
+ */
+function buildInferenceAccessErrorContext(hasInferenceAccessError) {
+  if (!hasInferenceAccessError) {
+    return "";
+  }
+
+  const templatePath = "/opt/gh-aw/prompts/inference_access_error.md";
+  const template = fs.readFileSync(templatePath, "utf8");
+  return "\n" + template;
+}
+
+/**
+ * Handle agent job failure by creating or updating a failure tracking issue
+ * This script is called from the conclusion job when the agent job has failed
+ * or when the agent succeeded but produced no safe outputs
+ */
+async function main() {
+  try {
+    // Get workflow context
+    const workflowName = process.env.GH_AW_WORKFLOW_NAME || "unknown";
+    const workflowID = process.env.GH_AW_WORKFLOW_ID || "unknown";
+    const agentConclusion = process.env.GH_AW_AGENT_CONCLUSION || "";
+    const runUrl = process.env.GH_AW_RUN_URL || "";
+    const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE || "";
+    const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL || "";
+    const secretVerificationResult = process.env.GH_AW_SECRET_VERIFICATION_RESULT || "";
+    const assignmentErrors = process.env.GH_AW_ASSIGNMENT_ERRORS || "";
+    const assignmentErrorCount = process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0";
+    const createDiscussionErrors = process.env.GH_AW_CREATE_DISCUSSION_ERRORS || "";
+    const createDiscussionErrorCount = process.env.GH_AW_CREATE_DISCUSSION_ERROR_COUNT || "0";
+    const codePushFailureErrors = process.env.GH_AW_CODE_PUSH_FAILURE_ERRORS || "";
+    const codePushFailureCount = process.env.GH_AW_CODE_PUSH_FAILURE_COUNT || "0";
+    const checkoutPRSuccess = process.env.GH_AW_CHECKOUT_PR_SUCCESS || "";
+    const timeoutMinutes = process.env.GH_AW_TIMEOUT_MINUTES || "";
+    const inferenceAccessError = process.env.GH_AW_INFERENCE_ACCESS_ERROR === "true";
+    const pushRepoMemoryResult = process.env.GH_AW_PUSH_REPO_MEMORY_RESULT || "";
+    const reportFailureAsIssue = process.env.GH_AW_FAILURE_REPORT_AS_ISSUE !== "false"; // Default to true
+
+    // Collect repo-memory validation errors from all memory configurations
+    const repoMemoryValidationErrors = [];
+    const repoMemoryPatchSizeExceededIDs = [];
+    for (const key in process.env) {
+      if (key.startsWith("GH_AW_REPO_MEMORY_VALIDATION_FAILED_")) {
+        const memoryID = key.replace("GH_AW_REPO_MEMORY_VALIDATION_FAILED_", "");
+        const failed = process.env[key] === "true";
+        if (failed) {
+          const errorKey = `GH_AW_REPO_MEMORY_VALIDATION_ERROR_${memoryID}`;
+          const errorMessage = process.env[errorKey] || "Unknown validation error";
+          repoMemoryValidationErrors.push({ memoryID, errorMessage });
+        }
+      }
+      if (key.startsWith("GH_AW_REPO_MEMORY_PATCH_SIZE_EXCEEDED_")) {
+        const memoryID = key.replace("GH_AW_REPO_MEMORY_PATCH_SIZE_EXCEEDED_", "");
+        if (process.env[key] === "true") {
+          repoMemoryPatchSizeExceededIDs.push(memoryID);
+        }
+      }
+    }
+
+    core.info(`Agent conclusion: ${agentConclusion}`);
+    core.info(`Workflow name: ${workflowName}`);
+    core.info(`Workflow ID: ${workflowID}`);
+    core.info(`Secret verification result: ${secretVerificationResult}`);
+    core.info(`Assignment error count: ${assignmentErrorCount}`);
+    core.info(`Create discussion error count: ${createDiscussionErrorCount}`);
+    core.info(`Code push failure count: ${codePushFailureCount}`);
+    core.info(`Checkout PR success: ${checkoutPRSuccess}`);
+    core.info(`Inference access error: ${inferenceAccessError}`);
+    core.info(`Push repo-memory result: ${pushRepoMemoryResult}`);
+
+    // Check if the agent timed out
+    const isTimedOut = agentConclusion === "timed_out";
+
+    // Check if there are assignment errors (regardless of agent job status)
+    const hasAssignmentErrors = parseInt(assignmentErrorCount, 10) > 0;
+
+    // Check if there are create_discussion errors (regardless of agent job status)
+    const hasCreateDiscussionErrors = parseInt(createDiscussionErrorCount, 10) > 0;
+
+    // Check if there are code-push failures (regardless of agent job status)
+    const hasCodePushFailures = parseInt(codePushFailureCount, 10) > 0;
+
+    // Check if the push_repo_memory job itself failed (e.g. permission or config errors)
+    const hasPushRepoMemoryFailure = pushRepoMemoryResult === "failure";
+
+    // Check if agent succeeded but produced no safe outputs
+    let hasMissingSafeOutputs = false;
+    let hasOnlyNoopOutputs = false;
+    if (agentConclusion === "success") {
+      const { loadAgentOutput } = require("./load_agent_output.cjs");
+      const agentOutputResult = loadAgentOutput();
+
+      if (!agentOutputResult.success || !agentOutputResult.items || agentOutputResult.items.length === 0) {
+        hasMissingSafeOutputs = true;
+        core.info("Agent succeeded but produced no safe outputs");
+      } else {
+        // Check if all outputs are noop types
+        const nonNoopItems = agentOutputResult.items.filter(item => item.type !== "noop");
+        if (nonNoopItems.length === 0) {
+          hasOnlyNoopOutputs = true;
+          core.info("Agent succeeded with only noop outputs - this is not a failure");
+        }
+      }
+    }
+
+    // Only proceed if the agent job actually failed OR timed out OR there are assignment errors OR create_discussion errors OR code-push failures OR push_repo_memory failed OR missing safe outputs
+    // BUT skip if we only have noop outputs (that's a successful no-action scenario)
+    if (agentConclusion !== "failure" && !isTimedOut && !hasAssignmentErrors && !hasCreateDiscussionErrors && !hasCodePushFailures && !hasPushRepoMemoryFailure && !hasMissingSafeOutputs) {
+      core.info(`Agent job did not fail and no assignment/discussion/code-push/push-repo-memory errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`);
+      return;
+    }
+
+    // If we only have noop outputs, skip failure handling - this is a successful no-action scenario
+    if (hasOnlyNoopOutputs) {
+      core.info("Agent completed with only noop outputs - skipping failure handling");
+      return;
+    }
+
+    // Check if failure issue reporting is disabled
+    if (!reportFailureAsIssue) {
+      core.info("Failure issue reporting is disabled (report-failure-as-issue: false), skipping failure issue creation");
+      return;
+    }
+
+    // Check if the failure was due to PR checkout (e.g., PR was merged and branch deleted)
+    // If checkout_pr_success is "false", skip creating an issue as this is expected behavior
+    if (agentConclusion === "failure" && checkoutPRSuccess === "false") {
+      core.info("Skipping failure handling - failure was due to PR checkout (likely PR merged)");
+      return;
+    }
+
+    const { owner, repo } = context.repo;
+
+    // Try to find a pull request for the current branch
+    const pullRequest = await findPullRequestForCurrentBranch();
+
+    // Check if parent issue creation is enabled (defaults to false)
+    const groupReports = process.env.GH_AW_GROUP_REPORTS === "true";
+
+    // Ensure parent issue exists first (only if enabled)
+    let parentIssue;
+    if (groupReports) {
+      try {
+        parentIssue = await ensureParentIssue();
+      } catch (error) {
+        core.warning(`Could not create parent issue, proceeding without parent: ${getErrorMessage(error)}`);
+        // Continue without parent issue
+      }
+    } else {
+      core.info("Parent issue creation is disabled (group-reports: false)");
+    }
+
+    // Sanitize workflow name for title
+    const sanitizedWorkflowName = sanitizeContent(workflowName, { maxLength: 100 });
+    const issueTitle = `[aw] ${sanitizedWorkflowName} failed`;
+
+    core.info(`Checking for existing issue with title: "${issueTitle}"`);
+
+    // Search for existing open issue with this title and label
+    const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows in:title "${issueTitle}"`;
+
+    try {
+      const searchResult = await github.rest.search.issuesAndPullRequests({
+        q: searchQuery,
+        per_page: 1,
+      });
+
+      if (searchResult.data.total_count > 0) {
+        // Issue exists, add a comment
+        const existingIssue = searchResult.data.items[0];
+        core.info(`Found existing issue #${existingIssue.number}: ${existingIssue.html_url}`);
+
+        // Read comment template
+        const commentTemplatePath = "/opt/gh-aw/prompts/agent_failure_comment.md";
+        const commentTemplate = fs.readFileSync(commentTemplatePath, "utf8");
+
+        // Extract run ID from URL (e.g., https://github.com/owner/repo/actions/runs/123 -> "123")
+        let runId = "";
+        const runIdMatch = runUrl.match(/\/actions\/runs\/(\d+)/);
+        if (runIdMatch) {
+          runId = runIdMatch[1];
+        }
+
+        // Build assignment errors context
+        let assignmentErrorsContext = "";
+        if (hasAssignmentErrors && assignmentErrors) {
+          assignmentErrorsContext = "\n**⚠️ Agent Assignment Failed**: Failed to assign agent to issues due to insufficient permissions or missing token.\n\n**Assignment Errors:**\n";
+          const errorLines = assignmentErrors.split("\n").filter(line => line.trim());
+          for (const errorLine of errorLines) {
+            const parts = errorLine.split(":");
+            if (parts.length >= 4) {
+              const type = parts[0]; // "issue" or "pr"
+              const number = parts[1];
+              const agent = parts[2];
+              const error = parts.slice(3).join(":"); // Rest is the error message
+              assignmentErrorsContext += `- ${type === "issue" ? "Issue" : "PR"} #${number} (agent: ${agent}): ${error}\n`;
+            }
+          }
+          assignmentErrorsContext += "\n";
+        }
+
+        // Build create_discussion errors context
+        const createDiscussionErrorsContext = hasCreateDiscussionErrors ? buildCreateDiscussionErrorsContext(createDiscussionErrors) : "";
+
+        // Build code-push failure context
+        const codePushFailureContext = hasCodePushFailures ? buildCodePushFailureContext(codePushFailureErrors, pullRequest) : "";
+
+        // Build repo-memory validation errors context
+        let repoMemoryValidationContext = "";
+        if (repoMemoryValidationErrors.length > 0) {
+          repoMemoryValidationContext = "\n**⚠️ Repo-Memory Validation Failed**: Invalid file types detected in repo-memory.";
+          if (pullRequest) {
+            repoMemoryValidationContext += `\n\n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
+          }
+          repoMemoryValidationContext += "\n\n**Validation Errors:**\n";
+          for (const { memoryID, errorMessage } of repoMemoryValidationErrors) {
+            repoMemoryValidationContext += `- Memory "${memoryID}": ${errorMessage}\n`;
+          }
+          repoMemoryValidationContext += "\n";
+        }
+
+        // Build push_repo_memory job failure context
+        const pushRepoMemoryFailureContext = buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryPatchSizeExceededIDs, runUrl);
+
+        // Build missing_data context
+        const missingDataContext = buildMissingDataContext();
+
+        // Build missing safe outputs context
+        let missingSafeOutputsContext = "";
+        if (hasMissingSafeOutputs) {
+          missingSafeOutputsContext = "\n**⚠️ No Safe Outputs Generated**: The agent job succeeded but did not produce any safe outputs.";
+          if (pullRequest) {
+            missingSafeOutputsContext += `\n\n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
+          }
+          missingSafeOutputsContext += "\n\nThis typically indicates:\n";
+          missingSafeOutputsContext += "- The safe output server failed to run\n";
+          missingSafeOutputsContext += "- The prompt failed to generate any meaningful result\n";
+          missingSafeOutputsContext += "- The agent should have called `noop` to explicitly indicate no action was taken\n\n";
+        }
+
+        // Build fork context hint
+        const forkContext = buildForkContextHint();
+
+        // Build timeout context
+        const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
+
+        // Build inference access error context
+        const inferenceAccessErrorContext = buildInferenceAccessErrorContext(inferenceAccessError);
+
+        // Create template context
+        const templateContext = {
+          run_url: runUrl,
+          run_id: runId,
+          workflow_name: workflowName,
+          workflow_source: workflowSource,
+          workflow_source_url: workflowSourceURL,
+          secret_verification_failed: String(secretVerificationResult === "failed"),
+          secret_verification_context:
+            secretVerificationResult === "failed"
+              ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
+              : "",
+          assignment_errors_context: assignmentErrorsContext,
+          create_discussion_errors_context: createDiscussionErrorsContext,
+          code_push_failure_context: codePushFailureContext,
+          repo_memory_validation_context: repoMemoryValidationContext,
+          push_repo_memory_failure_context: pushRepoMemoryFailureContext,
+          missing_data_context: missingDataContext,
+          missing_safe_outputs_context: missingSafeOutputsContext,
+          timeout_context: timeoutContext,
+          fork_context: forkContext,
+          inference_access_error_context: inferenceAccessErrorContext,
+        };
+
+        // Render the comment template
+        const commentBody = renderTemplate(commentTemplate, templateContext);
+
+        // Generate footer for the comment using templated message
+        const ctx = {
+          workflowName,
+          runUrl,
+          workflowSource,
+          workflowSourceUrl: workflowSourceURL,
+        };
+        const footer = getFooterAgentFailureCommentMessage(ctx);
+
+        // Combine comment body with footer
+        const fullCommentBody = sanitizeContent(commentBody + "\n\n" + footer, { maxLength: 65000 });
+
+        await github.rest.issues.createComment({
+          owner,
+          repo,
+          issue_number: existingIssue.number,
+          body: fullCommentBody,
+        });
+
+        core.info(`✓ Added comment to existing issue #${existingIssue.number}`);
+      } else {
+        // No existing issue, create a new one
+        core.info("No existing issue found, creating a new one");
+
+        // Read issue template
+        const issueTemplatePath = "/opt/gh-aw/prompts/agent_failure_issue.md";
+        const issueTemplate = fs.readFileSync(issueTemplatePath, "utf8");
+
+        // Get current branch information
+        const currentBranch = getCurrentBranch();
+
+        // Build assignment errors context
+        let assignmentErrorsContext = "";
+        if (hasAssignmentErrors && assignmentErrors) {
+          assignmentErrorsContext = "\n**⚠️ Agent Assignment Failed**: Failed to assign agent to issues due to insufficient permissions or missing token.\n\n**Assignment Errors:**\n";
+          const errorLines = assignmentErrors.split("\n").filter(line => line.trim());
+          for (const errorLine of errorLines) {
+            const parts = errorLine.split(":");
+            if (parts.length >= 4) {
+              const type = parts[0]; // "issue" or "pr"
+              const number = parts[1];
+              const agent = parts[2];
+              const error = parts.slice(3).join(":"); // Rest is the error message
+              assignmentErrorsContext += `- ${type === "issue" ? "Issue" : "PR"} #${number} (agent: ${agent}): ${error}\n`;
+            }
+          }
+          assignmentErrorsContext += "\n";
+        }
+
+        // Build create_discussion errors context
+        const createDiscussionErrorsContext = hasCreateDiscussionErrors ? buildCreateDiscussionErrorsContext(createDiscussionErrors) : "";
+
+        // Build code-push failure context
+        const codePushFailureContext = hasCodePushFailures ? buildCodePushFailureContext(codePushFailureErrors, pullRequest) : "";
+
+        // Build repo-memory validation errors context
+        let repoMemoryValidationContext = "";
+        if (repoMemoryValidationErrors.length > 0) {
+          repoMemoryValidationContext = "\n**⚠️ Repo-Memory Validation Failed**: Invalid file types detected in repo-memory.";
+          if (pullRequest) {
+            repoMemoryValidationContext += `\n\n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
+          }
+          repoMemoryValidationContext += "\n\n**Validation Errors:**\n";
+          for (const { memoryID, errorMessage } of repoMemoryValidationErrors) {
+            repoMemoryValidationContext += `- Memory "${memoryID}": ${errorMessage}\n`;
+          }
+          repoMemoryValidationContext += "\n";
+        }
+
+        // Build push_repo_memory job failure context
+        const pushRepoMemoryFailureContext = buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryPatchSizeExceededIDs, runUrl);
+
+        // Build missing_data context
+        const missingDataContext = buildMissingDataContext();
+
+        // Build missing safe outputs context
+        let missingSafeOutputsContext = "";
+        if (hasMissingSafeOutputs) {
+          missingSafeOutputsContext = "\n**⚠️ No Safe Outputs Generated**: The agent job succeeded but did not produce any safe outputs.";
+          if (pullRequest) {
+            missingSafeOutputsContext += `\n\n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
+          }
+          missingSafeOutputsContext += "\n\nThis typically indicates:\n";
+          missingSafeOutputsContext += "- The safe output server failed to run\n";
+          missingSafeOutputsContext += "- The prompt failed to generate any meaningful result\n";
+          missingSafeOutputsContext += "- The agent should have called `noop` to explicitly indicate no action was taken\n\n";
+        }
+
+        // Build fork context hint
+        const forkContext = buildForkContextHint();
+
+        // Build timeout context
+        const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
+
+        // Build inference access error context
+        const inferenceAccessErrorContext = buildInferenceAccessErrorContext(inferenceAccessError);
+
+        // Create template context with sanitized workflow name
+        const templateContext = {
+          workflow_name: sanitizedWorkflowName,
+          workflow_id: workflowID,
+          run_url: runUrl,
+          workflow_source_url: workflowSourceURL || "#",
+          branch: currentBranch,
+          pull_request_info: pullRequest ? `  \n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})` : "",
+          secret_verification_failed: String(secretVerificationResult === "failed"),
+          secret_verification_context:
+            secretVerificationResult === "failed"
+              ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
+              : "",
+          assignment_errors_context: assignmentErrorsContext,
+          create_discussion_errors_context: createDiscussionErrorsContext,
+          code_push_failure_context: codePushFailureContext,
+          repo_memory_validation_context: repoMemoryValidationContext,
+          push_repo_memory_failure_context: pushRepoMemoryFailureContext,
+          missing_data_context: missingDataContext,
+          missing_safe_outputs_context: missingSafeOutputsContext,
+          timeout_context: timeoutContext,
+          fork_context: forkContext,
+          inference_access_error_context: inferenceAccessErrorContext,
+        };
+
+        // Render the issue template
+        const issueBodyContent = renderTemplate(issueTemplate, templateContext);
+
+        // Generate footer for the issue using templated message
+        const ctx = {
+          workflowName,
+          runUrl,
+          workflowSource,
+          workflowSourceUrl: workflowSourceURL,
+        };
+        const footer = getFooterAgentFailureIssueMessage(ctx);
+
+        // Add expiration marker (7 days from now) inside the quoted footer section using helper
+        const footerWithExpires = generateFooterWithExpiration({
+          footerText: footer,
+          expiresHours: 24 * 7, // 7 days
+          suffix: `\n\n${generateXMLMarker(workflowName, runUrl)}`,
+        });
+
+        // Combine issue body with footer
+        const bodyLines = [issueBodyContent, "", footerWithExpires];
+        const issueBody = bodyLines.join("\n");
+
+        const newIssue = await github.rest.issues.create({
+          owner,
+          repo,
+          title: issueTitle,
+          body: issueBody,
+          labels: ["agentic-workflows"],
+        });
+
+        core.info(`✓ Created new issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
+
+        // Link as sub-issue to parent if parent issue was created
+        if (parentIssue) {
+          try {
+            await linkSubIssue(parentIssue.node_id, newIssue.data.node_id, parentIssue.number, newIssue.data.number);
+          } catch (error) {
+            core.warning(`Could not link issue as sub-issue: ${getErrorMessage(error)}`);
+            // Continue even if linking fails
+          }
+        }
+      }
+    } catch (error) {
+      core.warning(`Failed to create or update failure tracking issue: ${getErrorMessage(error)}`);
+      // Don't fail the workflow if we can't create the issue
+    }
+  } catch (error) {
+    core.warning(`Error in handle_agent_failure: ${getErrorMessage(error)}`);
+    // Don't fail the workflow
+  }
+}
+
+module.exports = { main, buildCodePushFailureContext, buildPushRepoMemoryFailureContext };

@@ -1,0 +1,31 @@
+name: 'Setup Activation'
+description: 'Copy activation job files to the agent environment'
+author: 'GitHub Next'
+
+inputs:
+  destination:
+    description: 'Destination directory for activation files (default: /opt/gh-aw/actions)'
+    required: false
+    default: '/opt/gh-aw/actions'
+  safe-output-custom-tokens:
+    description: 'Install @actions/github for handlers that use a per-handler github-token (creates Octokit via getOctokit)'
+    required: false
+    default: 'false'
+
+outputs:
+  files-copied:
+    description: 'Number of files copied'
+  
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Activation Scripts
+      shell: bash
+      env:
+        INPUT_DESTINATION: ${{ inputs.destination }}
+        INPUT_SAFE_OUTPUT_CUSTOM_TOKENS: ${{ inputs.safe-output-custom-tokens }}
+      run: ${{ github.action_path }}/setup.sh
+
+branding:
+  icon: 'play'
+  color: 'blue'
