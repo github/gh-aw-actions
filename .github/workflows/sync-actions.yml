@@ -270,13 +270,12 @@ jobs:
             COMMIT_MSG="chore: sync actions from gh-aw@${{ steps.resolve-ref.outputs.resolved_ref }}"
             git commit -m "$COMMIT_MSG"
             git push origin "$BRANCH"
-            gh pr create \
+            PR_URL=$(gh pr create \
               --title "$COMMIT_MSG" \
               --body "Automated sync of actions from [gh-aw](https://github.com/github/gh-aw) at \`${{ steps.resolve-ref.outputs.resolved_ref }}\`." \
               --base main \
-              --head "$BRANCH"
-            PR_NUMBER=$(gh pr view --head "$BRANCH" --json number --jq '.number')
-            PR_URL="https://github.com/${{ github.repository }}/pull/$PR_NUMBER"
+              --head "$BRANCH")
+            PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
             echo ""
             echo "Pull request #$PR_NUMBER created: $PR_URL ✓"
             echo "changed=true" >> "$GITHUB_OUTPUT"
