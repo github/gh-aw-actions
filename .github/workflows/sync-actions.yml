@@ -8,6 +8,10 @@ on:
         required: false
         default: 'latest'
         type: string
+    outputs:
+      pr_number:
+        description: 'The number of the pull request created for the sync (empty if no changes).'
+        value: ${{ jobs.sync.outputs.pr_number }}
   workflow_dispatch:
     inputs:
       ref:
@@ -22,6 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
+    outputs:
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
 
     steps:
       - name: Log workflow context
@@ -236,8 +243,8 @@ jobs:
           done
           echo "::endgroup::"
 
-      - name: Commit and push changes to main
-        id: commit
+      - name: Create branch, commit, and open pull request
+        id: create-pr
         run: |
           echo "::group::Git Commit"
           cd gh-aw-actions
@@ -253,21 +260,72 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes detected — nothing to commit."
             echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
           else
             echo "Changes staged for commit:"
             git diff --staged --stat
             echo ""
+            BRANCH="sync/gh-aw-${{ steps.resolve-ref.outputs.resolved_ref }}"
+            git checkout -b "$BRANCH"
             COMMIT_MSG="chore: sync actions from gh-aw@${{ steps.resolve-ref.outputs.resolved_ref }}"
             git commit -m "$COMMIT_MSG"
-            git push origin main
+            git push origin "$BRANCH"
+            gh pr create \
+              --title "$COMMIT_MSG" \
+              --body "Automated sync of actions from [gh-aw](https://github.com/github/gh-aw) at \`${{ steps.resolve-ref.outputs.resolved_ref }}\`." \
+              --base main \
+              --head "$BRANCH"
+            PR_NUMBER=$(gh pr view --head "$BRANCH" --json number --jq '.number')
+            PR_URL="https://github.com/${{ github.repository }}/pull/$PR_NUMBER"
             echo ""
-            echo "Changes committed and pushed to main. ✓"
+            echo "Pull request #$PR_NUMBER created: $PR_URL ✓"
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           fi
           echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Poll pull request until merged
+        if: steps.create-pr.outputs.changed == 'true'
+        run: |
+          echo "::group::Polling PR #${{ steps.create-pr.outputs.pr_number }}"
+          PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
+          TIMEOUT=1200
+          INTERVAL=30
+          ELAPSED=0
+
+          while [[ $ELAPSED -lt $TIMEOUT ]]; do
+            if ! STATE=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json state --jq '.state' 2>&1); then
+              echo "::warning::Failed to query PR state (elapsed: ${ELAPSED}s): $STATE"
+            else
+              echo "PR #$PR_NUMBER state: $STATE (elapsed: ${ELAPSED}s / ${TIMEOUT}s)"
+
+              if [[ "$STATE" == "MERGED" ]]; then
+                echo "Pull request #$PR_NUMBER has been merged. ✓"
+                echo "::endgroup::"
+                exit 0
+              fi
+
+              if [[ "$STATE" == "CLOSED" ]]; then
+                echo "::error::Pull request #$PR_NUMBER was closed without merging."
+                echo "::endgroup::"
+                exit 1
+              fi
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "::error::Timed out after ${TIMEOUT}s waiting for pull request #$PR_NUMBER to be merged."
+          echo "::endgroup::"
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create tag
-        if: steps.resolve-ref.outputs.should_create_tag == 'true' && steps.commit.outputs.changed == 'true'
+        if: steps.resolve-ref.outputs.should_create_tag == 'true' && steps.create-pr.outputs.changed == 'true'
         run: |
           echo "::group::Creating Tag"
           cd gh-aw-actions
