@@ -190,14 +190,14 @@ jobs:
           INPUT_REF: ${{ inputs.ref }}
 
       - name: Checkout gh-aw-actions (this repository)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
           path: gh-aw-actions
 
       - name: Checkout gh-aw at resolved ref (actions/ only)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: github/gh-aw
           ref: ${{ steps.resolve-ref.outputs.resolved_ref }}
