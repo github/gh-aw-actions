@@ -1,8 +1,13 @@
 name: Sync Actions from gh-aw
 
 on:
-  repository_dispatch:
-    types: [sync-actions]
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Ref to sync from gh-aw (tag, branch, SHA, or "latest"). Defaults to latest release.'
+        required: false
+        default: 'latest'
+        type: string
   workflow_dispatch:
     inputs:
       ref:
@@ -28,10 +33,10 @@ jobs:
           echo "Ref:         ${{ github.ref }}"
           echo "Run ID:      ${{ github.run_id }}"
           echo "Run number:  ${{ github.run_number }}"
-          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
-            echo "Client payload ref: ${{ github.event.client_payload.ref }}"
+          if [[ "${{ github.event_name }}" == "workflow_call" ]]; then
+            echo "Workflow call input ref: ${{ inputs.ref }}"
           else
-            echo "Workflow dispatch input ref: ${{ github.event.inputs.ref }}"
+            echo "Workflow dispatch input ref: ${{ inputs.ref }}"
           fi
           echo "::endgroup::"
 
@@ -74,11 +79,7 @@ jobs:
           echo "::group::Resolving Ref"
 
           # Determine raw ref from event inputs
-          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
-            RAW_REF="${{ github.event.client_payload.ref }}"
-          else
-            RAW_REF="${{ github.event.inputs.ref }}"
-          fi
+          RAW_REF="${{ inputs.ref }}"
 
           # Default to 'latest' if empty
           if [[ -z "$RAW_REF" ]]; then
