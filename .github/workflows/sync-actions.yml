@@ -187,42 +187,43 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           path: gh-aw-actions
 
-      - name: Checkout gh-aw at resolved ref (actions/ only)
+      - name: Checkout gh-aw at resolved ref (actions/setup only)
         uses: actions/checkout@v4
         with:
           repository: github/gh-aw
           ref: ${{ steps.resolve-ref.outputs.resolved_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           path: gh-aw
-          sparse-checkout: actions
+          sparse-checkout: actions/setup
           sparse-checkout-cone-mode: true
 
       - name: Log source actions directory
         run: |
-          echo "::group::Source — gh-aw/actions/ at ref '${{ steps.resolve-ref.outputs.resolved_ref }}'"
-          find gh-aw/actions -type f | sort
+          echo "::group::Source — gh-aw/actions/setup/ at ref '${{ steps.resolve-ref.outputs.resolved_ref }}'"
+          find gh-aw/actions/setup -type f | sort
           echo "::endgroup::"
 
       - name: Log destination before sync
         run: |
-          echo "::group::Destination — gh-aw-actions/actions/ before sync"
-          find gh-aw-actions/actions -type f 2>/dev/null | sort || echo "(actions/ directory does not exist yet)"
+          echo "::group::Destination — gh-aw-actions/setup/ before sync"
+          find gh-aw-actions/setup -type f 2>/dev/null | sort || echo "(setup/ directory does not exist yet)"
           echo "::endgroup::"
 
-      - name: Sync actions directory (remote wins)
+      - name: Sync setup directory (remote wins, local README preserved)
         run: |
-          echo "::group::Syncing actions/"
-          echo "Source:      gh-aw/actions/"
-          echo "Destination: gh-aw-actions/actions/"
+          echo "::group::Syncing setup/"
+          echo "Source:      gh-aw/actions/setup/"
+          echo "Destination: gh-aw-actions/setup/"
           echo ""
           # --archive preserves permissions/timestamps; --delete removes files absent in source (remote wins)
-          rsync --archive --verbose --delete gh-aw/actions/ gh-aw-actions/actions/
+          # --exclude='README*' preserves any local README files
+          rsync --archive --verbose --delete --exclude='README*' gh-aw/actions/setup/ gh-aw-actions/setup/
           echo "::endgroup::"
 
       - name: Log destination after sync
         run: |
-          echo "::group::Destination — gh-aw-actions/actions/ after sync"
-          find gh-aw-actions/actions -type f | sort
+          echo "::group::Destination — gh-aw-actions/setup/ after sync"
+          find gh-aw-actions/setup -type f | sort
           echo "::endgroup::"
 
       - name: Commit and push changes to main
@@ -234,7 +235,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -A actions/
+          git add -A setup/
 
           if git diff --staged --quiet; then
             echo "No changes detected — nothing to commit."
