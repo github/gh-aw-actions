@@ -35,7 +35,7 @@ jobs:
         run: |
           echo "::group::Workflow Context"
           echo "Repository:  ${{ github.repository }}"
-          echo "Actor:       ${{ github.actor }}"
+          echo "Actor:       $ACTOR"
           echo "Event:       ${{ github.event_name }}"
           echo "Ref:         ${{ github.ref }}"
           echo "Run ID:      ${{ github.run_id }}"
@@ -46,6 +46,8 @@ jobs:
             echo "Workflow dispatch input ref: ${{ inputs.ref }}"
           fi
           echo "::endgroup::"
+        env:
+          ACTOR: ${{ github.actor }}
 
       - name: Check repository is not a fork
         run: |
