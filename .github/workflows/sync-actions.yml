@@ -86,7 +86,7 @@ jobs:
           echo "::group::Resolving Ref"
 
           # Determine raw ref from event inputs
-          RAW_REF="${{ inputs.ref }}"
+          RAW_REF="${INPUT_REF}"
 
           # Default to 'latest' if empty
           if [[ -z "$RAW_REF" ]]; then
@@ -187,6 +187,7 @@ jobs:
           echo "::endgroup::"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.ref }}
 
       - name: Checkout gh-aw-actions (this repository)
         uses: actions/checkout@v4
