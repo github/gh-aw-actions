@@ -1,17 +1,6 @@
 name: Sync Actions from gh-aw
 
 on:
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Ref to sync from gh-aw (tag, branch, SHA, or "latest"). Defaults to latest release.'
-        required: false
-        default: 'latest'
-        type: string
-    outputs:
-      pr_number:
-        description: 'The number of the pull request created for the sync (empty if no changes).'
-        value: ${{ jobs.sync.outputs.pr_number }}
   workflow_dispatch:
     inputs:
       ref:
@@ -27,8 +16,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    outputs:
-      pr_number: ${{ steps.create-pr.outputs.pr_number }}
 
     steps:
       - name: Log workflow context
@@ -40,11 +27,7 @@ jobs:
           echo "Ref:         $GH_REF"
           echo "Run ID:      ${{ github.run_id }}"
           echo "Run number:  ${{ github.run_number }}"
-          if [[ "${{ github.event_name }}" == "workflow_call" ]]; then
-            echo "Workflow call input ref: $INPUT_REF"
-          else
-            echo "Workflow dispatch input ref: $INPUT_REF"
-          fi
+          echo "Workflow dispatch input ref: $INPUT_REF"
           echo "::endgroup::"
         env:
           GH_REF: ${{ github.ref }}
@@ -167,27 +150,34 @@ jobs:
             IS_LONG_SHA="false"
           fi
 
-          if [[ "$IS_LONG_SHA" == "false" && "$RAW_REF" != "latest" ]]; then
+          if [[ "$RAW_REF" =~ $SEMVER_PATTERN ]]; then
+            IS_SEMVER="true"
+            TAG_REF="$RAW_REF"
+          elif [[ "$RAW_REF" == "latest" && "$RESOLVED_REF" =~ $SEMVER_PATTERN ]]; then
+            IS_SEMVER="true"
+            TAG_REF="$RESOLVED_REF"
+          else
+            IS_SEMVER="false"
+            TAG_REF="$RAW_REF"
+          fi
+
+          if [[ "$IS_SEMVER" == "true" ]]; then
             SHOULD_CREATE_TAG="true"
           else
             SHOULD_CREATE_TAG="false"
-          fi
-
-          if [[ "$RAW_REF" =~ $SEMVER_PATTERN ]]; then
-            IS_SEMVER="true"
-          else
-            IS_SEMVER="false"
           fi
 
           echo "Resolved ref:      $RESOLVED_REF"
           echo "Is long SHA:       $IS_LONG_SHA"
           echo "Is semver:         $IS_SEMVER"
           echo "Should create tag: $SHOULD_CREATE_TAG"
+          echo "Tag ref:           $TAG_REF"
 
           echo "resolved_ref=$RESOLVED_REF"    >> "$GITHUB_OUTPUT"
           echo "raw_ref=$RAW_REF"              >> "$GITHUB_OUTPUT"
           echo "should_create_tag=$SHOULD_CREATE_TAG" >> "$GITHUB_OUTPUT"
           echo "is_semver=$IS_SEMVER"          >> "$GITHUB_OUTPUT"
+          echo "tag_ref=$TAG_REF"              >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -342,7 +332,7 @@ jobs:
             git checkout -B main origin/main
           fi
 
-          TAG="${{ steps.resolve-ref.outputs.raw_ref }}"
+          TAG="${{ steps.resolve-ref.outputs.tag_ref }}"
           echo "Creating tag: $TAG"
 
           # If the tag already exists, delete and re-create it so it points to the
