@@ -77,10 +77,14 @@ async function findPullRequestForCurrentBranch() {
 /**
  * Search for or create the parent issue for all agentic workflow failures
  * @param {number|null} previousParentNumber - Previous parent issue number if creating due to limit
+ * @param {string} [ownerOverride] - Repository owner override (from failure-issue-repo config)
+ * @param {string} [repoOverride] - Repository name override (from failure-issue-repo config)
  * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
  */
-async function ensureParentIssue(previousParentNumber = null) {
-  const { owner, repo } = context.repo;
+async function ensureParentIssue(previousParentNumber = null, ownerOverride, repoOverride) {
+  const { owner: contextOwner, repo: contextRepo } = context.repo;
+  const owner = ownerOverride || contextOwner;
+  const repo = repoOverride || contextRepo;
   const parentTitle = "[aw] Failed runs";
   const parentLabel = "agentic-workflows";
 
@@ -307,16 +311,18 @@ function buildForkContextHint() {
  * section with clearer remediation instructions.
  * @param {string} codePushFailureErrors - Newline-separated list of "type:error" entries
  * @param {{number: number, html_url: string, head_sha?: string, mergeable?: boolean | null, mergeable_state?: string, updated_at?: string} | null} pullRequest - PR info if available
+ * @param {string} [runUrl] - URL of the current workflow run, used to provide patch download instructions
  * @returns {string} Formatted context string, or empty string if no failures
  */
-function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null) {
+function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null, runUrl = "") {
   if (!codePushFailureErrors) {
     return "";
   }
 
-  // Split errors into protected-file protection refusals, patch size errors, and other push failures
+  // Split errors into protected-file protection refusals, patch size errors, patch apply failures, and other push failures
   const manifestErrors = [];
   const patchSizeErrors = [];
+  const patchApplyErrors = [];
   const otherErrors = [];
   const errorLines = codePushFailureErrors.split("\n").filter(line => line.trim());
   for (const errorLine of errorLines) {
@@ -328,6 +334,8 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null) 
         manifestErrors.push({ type, error });
       } else if (error.includes("Patch size") && error.includes("exceeds")) {
         patchSizeErrors.push({ type, error });
+      } else if (error.includes("Failed to apply patch")) {
+        patchApplyErrors.push({ type, error });
       } else {
         otherErrors.push({ type, error });
       }
@@ -390,6 +398,56 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null) 
     context += yamlSnippet;
   }
 
+  // Patch apply failure section — shown when the patch could not be applied (e.g. merge conflict)
+  if (patchApplyErrors.length > 0) {
+    context += "\n**🔀 Patch Apply Failed**: The patch could not be applied to the current state of the repository. " + "This is typically caused by a merge conflict between the agent's changes and recent commits on the target branch.\n";
+    if (pullRequest) {
+      context += `\n**Target Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})\n`;
+    }
+    context += "\n**Failed Operations:**\n";
+    for (const { type, error } of patchApplyErrors) {
+      context += `- \`${type}\`: ${error}\n`;
+    }
+
+    // Extract run ID from runUrl for use in the download command
+    let runId = "";
+    if (runUrl) {
+      const runIdMatch = runUrl.match(/\/actions\/runs\/(\d+)/);
+      if (runIdMatch) {
+        runId = runIdMatch[1];
+      }
+    }
+
+    context += "\nTo manually apply the patch:\n\n";
+    if (runId) {
+      context += `\`\`\`sh
+# Download the patch artifact from the workflow run
+gh run download ${runId} -n agent-artifacts -D /tmp/agent-artifacts-${runId}
+
+# List available patches
+ls /tmp/agent-artifacts-${runId}/*.patch
+
+# Create a new branch (adjust as needed)
+git checkout -b aw/manual-apply
+
+# Apply the patch (--3way handles cross-repo patches)
+git am --3way /tmp/agent-artifacts-${runId}/YOUR_PATCH_FILE.patch
+
+# If there are conflicts, resolve them and continue (or abort):
+# git am --continue
+# git am --abort
+
+# Push and create a pull request
+git push origin aw/manual-apply
+gh pr create --head aw/manual-apply
+\`\`\`
+${runUrl ? `\nThe patch artifact is available at: [View run and download artifacts](${runUrl})\n` : ""}`;
+    } else {
+      context += "Download the patch artifact from the workflow run, then apply it with `git am --3way <patch-file>`.\n";
+    }
+    context += "\n";
+  }
+
   // Generic code-push failure section
   if (otherErrors.length > 0) {
     context += "\n**⚠️ Code Push Failed**: A code push safe output failed, and subsequent safe outputs were cancelled.";
@@ -439,8 +497,8 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null) 
       context += `- \`${type}\`: ${error}\n`;
     }
     context += "\n";
-  } else if (manifestErrors.length > 0 || patchSizeErrors.length > 0) {
-    // Only manifest or patch size errors — ensure trailing newline
+  } else if (manifestErrors.length > 0 || patchSizeErrors.length > 0 || patchApplyErrors.length > 0) {
+    // Only manifest, patch size, or patch apply errors — ensure trailing newline
     context += "\n";
   }
 
@@ -696,7 +754,22 @@ async function main() {
       return;
     }
 
-    const { owner, repo } = context.repo;
+    // Determine the failure issue repository destination.
+    // SEC-005: GH_AW_FAILURE_ISSUE_REPO is set in the workflow frontmatter at compile time
+    // and is therefore a trusted compile-time configuration value. No validateTargetRepo
+    // allowlist check is required; the frontmatter trust boundary provides the equivalent
+    // security guarantee.
+    // If GH_AW_FAILURE_ISSUE_REPO is set, use that repo instead of the current repo
+    const failureIssueRepo = process.env.GH_AW_FAILURE_ISSUE_REPO || "";
+    let owner, repo;
+    if (failureIssueRepo && failureIssueRepo.includes("/")) {
+      const parts = failureIssueRepo.split("/");
+      owner = parts[0];
+      repo = parts[1];
+      core.info(`Using configured failure issue repo: ${owner}/${repo}`);
+    } else {
+      ({ owner, repo } = context.repo);
+    }
 
     // Try to find a pull request for the current branch
     const pullRequest = await findPullRequestForCurrentBranch();
@@ -708,7 +781,7 @@ async function main() {
     let parentIssue;
     if (groupReports) {
       try {
-        parentIssue = await ensureParentIssue();
+        parentIssue = await ensureParentIssue(null, owner, repo);
       } catch (error) {
         core.warning(`Could not create parent issue, proceeding without parent: ${getErrorMessage(error)}`);
         // Continue without parent issue
@@ -770,7 +843,7 @@ async function main() {
         const createDiscussionErrorsContext = hasCreateDiscussionErrors ? buildCreateDiscussionErrorsContext(createDiscussionErrors) : "";
 
         // Build code-push failure context
-        const codePushFailureContext = hasCodePushFailures ? buildCodePushFailureContext(codePushFailureErrors, pullRequest) : "";
+        const codePushFailureContext = hasCodePushFailures ? buildCodePushFailureContext(codePushFailureErrors, pullRequest, runUrl) : "";
 
         // Build repo-memory validation errors context
         let repoMemoryValidationContext = "";
@@ -894,7 +967,7 @@ async function main() {
         const createDiscussionErrorsContext = hasCreateDiscussionErrors ? buildCreateDiscussionErrorsContext(createDiscussionErrors) : "";
 
         // Build code-push failure context
-        const codePushFailureContext = hasCodePushFailures ? buildCodePushFailureContext(codePushFailureErrors, pullRequest) : "";
+        const codePushFailureContext = hasCodePushFailures ? buildCodePushFailureContext(codePushFailureErrors, pullRequest, runUrl) : "";
 
         // Build repo-memory validation errors context
         let repoMemoryValidationContext = "";

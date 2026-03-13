@@ -15,6 +15,10 @@ const validateLockdownRequirements = require("./validate_lockdown_requirements.c
  * variables, writes to /tmp/gh-aw/aw_info.json, sets the model output, and
  * prints the agent overview in the step summary.
  *
+ * SEC-005: The `target_repo` field written to aw_info.json is compile-time
+ * metadata sourced from GH_AW_INFO_TARGET_REPO. It is not used for cross-repository
+ * API calls in this handler; no validateTargetRepo allowlist check is required here.
+ *
  * @param {typeof import('@actions/core')} core - GitHub Actions core library
  * @param {object} ctx - GitHub Actions context object
  * @returns {Promise<void>}
@@ -64,6 +68,7 @@ async function main(core, ctx) {
     sha: ctx.sha,
     actor: ctx.actor,
     event_name: ctx.eventName,
+    target_repo: process.env.GH_AW_INFO_TARGET_REPO || "",
     staged: process.env.GH_AW_INFO_STAGED === "true",
     allowed_domains: allowedDomains,
     firewall_enabled: process.env.GH_AW_INFO_FIREWALL_ENABLED === "true",
