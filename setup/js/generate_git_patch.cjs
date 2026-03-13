@@ -1,11 +1,16 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+// SEC-005: This module generates git patches via git CLI commands and does not make
+// GitHub API calls using a user-supplied target repository. The "target repo" references
+// in documentation describe cross-repo checkout scenarios only; no validateTargetRepo
+// allowlist check is required in this handler.
+
 const fs = require("fs");
 const path = require("path");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { execGitSync } = require("./git_helpers.cjs");
+const { execGitSync, getGitAuthEnv } = require("./git_helpers.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
 
 /**
@@ -89,6 +94,8 @@ function getPatchPathForRepo(branchName, repoSlug) {
  *   Use this for multi-repo scenarios where repos are checked out to subdirectories.
  * @param {string} [options.repoSlug] - Repository slug (owner/repo) to include in patch filename for disambiguation.
  *   Required for multi-repo scenarios to prevent patch file collisions.
+ * @param {string} [options.token] - GitHub token for git authentication. Falls back to GITHUB_TOKEN env var.
+ *   Use this for cross-repo scenarios where a custom PAT with access to the target repo is needed.
  * @returns {Promise<Object>} Object with patch info or error
  */
 async function generateGitPatch(branchName, baseBranch, options = {}) {
@@ -143,25 +150,13 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
           // We must explicitly fetch origin/branchName and fail if it doesn't exist.
 
           debugLog(`Strategy 1 (incremental): Fetching origin/${branchName}`);
-          // Configure git authentication using GITHUB_TOKEN and GITHUB_SERVER_URL.
-          // This ensures the fetch works on GitHub Enterprise Server (GHES) where
-          // the default credential helper may not be configured for the enterprise endpoint.
-          // SECURITY: The auth header is passed via GIT_CONFIG_* environment variables so it
-          // is never written to .git/config on disk. This prevents an attacker monitoring file
-          // changes from reading the secret.
-          const githubToken = process.env.GITHUB_TOKEN;
-          const githubServerUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
-          const extraHeaderKey = `http.${githubServerUrl}/.extraheader`;
-
-          // Build environment for the fetch command with git config passed via env vars.
-          const fetchEnv = { ...process.env };
-          if (githubToken) {
-            const tokenBase64 = Buffer.from(`x-access-token:${githubToken}`).toString("base64");
-            fetchEnv.GIT_CONFIG_COUNT = "1";
-            fetchEnv.GIT_CONFIG_KEY_0 = extraHeaderKey;
-            fetchEnv.GIT_CONFIG_VALUE_0 = `Authorization: basic ${tokenBase64}`;
-            debugLog(`Strategy 1 (incremental): Configured git auth for ${githubServerUrl} via environment variables`);
-          }
+          // Configure git authentication via GIT_CONFIG_* environment variables.
+          // This ensures the fetch works when .git/config credentials are unavailable
+          // (e.g. after clean_git_credentials.sh) and on GitHub Enterprise Server (GHES).
+          // Use options.token when provided (cross-repo PAT), falling back to GITHUB_TOKEN.
+          // SECURITY: The auth header is passed via env vars so it is never written to
+          // .git/config on disk, preventing file-monitoring attacks.
+          const fetchEnv = { ...process.env, ...getGitAuthEnv(options.token) };
 
           try {
             // Explicitly fetch origin/branchName to ensure we have the latest
@@ -205,8 +200,15 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
               // origin/<defaultBranch> doesn't exist locally, try to fetch it
               debugLog(`Strategy 1 (full): origin/${defaultBranch} not found locally, attempting fetch`);
               try {
+                // Configure git authentication via GIT_CONFIG_* environment variables.
+                // This ensures the fetch works when .git/config credentials are unavailable
+                // (e.g. after clean_git_credentials.sh) and on GitHub Enterprise Server (GHES).
+                // Use options.token when provided (cross-repo PAT), falling back to GITHUB_TOKEN.
+                // SECURITY: The auth header is passed via env vars so it is never written to
+                // .git/config on disk, preventing file-monitoring attacks.
+                const fullFetchEnv = { ...process.env, ...getGitAuthEnv(options.token) };
                 // Use "--" to prevent branch names starting with "-" from being interpreted as options
-                execGitSync(["fetch", "origin", "--", defaultBranch], { cwd });
+                execGitSync(["fetch", "origin", "--", defaultBranch], { cwd, env: fullFetchEnv });
                 hasLocalDefaultBranch = true;
                 debugLog(`Strategy 1 (full): Successfully fetched origin/${defaultBranch}`);
               } catch (fetchErr) {
