@@ -10,7 +10,7 @@ const HANDLER_TYPE = "dispatch_workflow";
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
-const { resolveTargetRepoConfig, parseRepoSlug } = require("./repo_helpers.cjs");
+const { resolveTargetRepoConfig, parseRepoSlug, validateTargetRepo } = require("./repo_helpers.cjs");
 
 /**
  * Main handler factory for dispatch_workflow
@@ -23,7 +23,7 @@ async function main(config = {}) {
   const maxCount = config.max || 1;
   const workflowFiles = config.workflow_files || {}; // Map of workflow name to file extension
   const githubClient = await createAuthenticatedGitHubClient(config);
-  const { defaultTargetRepo } = resolveTargetRepoConfig(config);
+  const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
 
   // Resolve the dispatch destination repository from target-repo config, falling back to context.repo
   const contextRepoSlug = `${context.repo.owner}/${context.repo.repo}`;
@@ -43,6 +43,21 @@ async function main(config = {}) {
   }
 
   const isCrossRepoDispatch = resolvedRepoSlug !== contextRepoSlug;
+
+  // SEC-005: Enforce cross-repository allowlist per Safe Outputs Specification §3.2.6 (SP6).
+  // Default-deny: cross-repo dispatch is only permitted when an explicit allowlist is configured
+  // and the resolved target repo is present in that list. Uses validateTargetRepo from
+  // repo_helpers.cjs for consistent slug validation and glob-pattern matching (e.g. "org/*").
+  if (isCrossRepoDispatch) {
+    if (allowedRepos.size === 0) {
+      throw new Error(`E004: Cross-repository dispatch to '${resolvedRepoSlug}' is not permitted. No allowlist is configured. Define 'allowed_repos' to enable cross-repository dispatch.`);
+    }
+    const repoValidation = validateTargetRepo(resolvedRepoSlug, contextRepoSlug, allowedRepos);
+    if (!repoValidation.valid) {
+      throw new Error(`E004: ${repoValidation.error}`);
+    }
+    core.info(`Cross-repo allowlist check passed for ${resolvedRepoSlug}`);
+  }
 
   core.info(`Dispatch workflow configuration: max=${maxCount}`);
   if (allowedWorkflows.length > 0) {
