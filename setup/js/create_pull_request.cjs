@@ -6,6 +6,7 @@ const fs = require("fs");
 /** @type {typeof import("crypto")} */
 const crypto = require("crypto");
 const { updateActivationComment } = require("./update_activation_comment.cjs");
+const { pushSignedCommits } = require("./push_signed_commits.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
 const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_title.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
@@ -81,6 +82,7 @@ function enforcePullRequestLimits(patchContent) {
     throw new Error(`E003: Cannot create pull request with more than ${MAX_FILES} files (received ${fileCount})`);
   }
 }
+
 /**
  * Generate a patch preview with max 500 lines and 2000 chars for issue body
  * @param {string} patchContent - The full patch content
@@ -739,7 +741,14 @@ async function main(config = {}) {
           core.info(`Renamed branch to ${branchName}`);
         }
 
-        await exec.exec(`git push origin ${branchName}`);
+        await pushSignedCommits({
+          githubClient,
+          owner: repoParts.owner,
+          repo: repoParts.repo,
+          branch: branchName,
+          baseRef: `origin/${baseBranch}`,
+          cwd: process.cwd(),
+        });
         core.info("Changes pushed to branch");
 
         // Count new commits on PR branch relative to base, used to restrict
@@ -900,7 +909,14 @@ ${patchPreview}`;
             core.info(`Renamed branch to ${branchName}`);
           }
 
-          await exec.exec(`git push origin ${branchName}`);
+          await pushSignedCommits({
+            githubClient,
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            branch: branchName,
+            baseRef: `origin/${baseBranch}`,
+            cwd: process.cwd(),
+          });
           core.info("Empty branch pushed successfully");
 
           // Count new commits (will be 1 from the Initialize commit)
@@ -957,7 +973,7 @@ ${patchPreview}`;
         // Use the push-failed template with artifact download instructions.
         const runId = context.runId;
         const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
-        const pushFailedTemplatePath = "/opt/gh-aw/prompts/manifest_protection_push_failed_fallback.md";
+        const pushFailedTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/manifest_protection_push_failed_fallback.md`;
         const pushFailedTemplate = fs.readFileSync(pushFailedTemplatePath, "utf8");
         fallbackBody = renderTemplate(pushFailedTemplate, {
           body,
@@ -975,7 +991,7 @@ ${patchPreview}`;
         const encodedBase = baseBranch.split("/").map(encodeURIComponent).join("/");
         const encodedHead = branchName.split("/").map(encodeURIComponent).join("/");
         const createPrUrl = `${githubServer}/${repoParts.owner}/${repoParts.repo}/compare/${encodedBase}...${encodedHead}?expand=1&title=${encodeURIComponent(title)}`;
-        const templatePath = "/opt/gh-aw/prompts/manifest_protection_create_pr_fallback.md";
+        const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/manifest_protection_create_pr_fallback.md`;
         const template = fs.readFileSync(templatePath, "utf8");
         fallbackBody = renderTemplate(template, {
           body,

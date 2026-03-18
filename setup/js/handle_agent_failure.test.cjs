@@ -295,4 +295,98 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("max-patch-size: 51200");
     });
   });
+
+  // ──────────────────────────────────────────────────────
+  // buildAppTokenMintingFailedContext
+  // ──────────────────────────────────────────────────────
+
+  describe("buildAppTokenMintingFailedContext", () => {
+    let buildAppTokenMintingFailedContext;
+    const fs = require("fs");
+    const path = require("path");
+    const templateContent = fs.readFileSync(path.join(__dirname, "../md/app_token_minting_failed.md"), "utf8");
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+
+    beforeEach(() => {
+      vi.resetModules();
+      // Stub readFileSync so the runtime path resolves to the source-tree template
+      fs.readFileSync = (filePath, encoding) => {
+        if (typeof filePath === "string" && filePath.includes("app_token_minting_failed.md")) {
+          return templateContent;
+        }
+        return originalReadFileSync(filePath, encoding);
+      };
+      ({ buildAppTokenMintingFailedContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      fs.readFileSync = originalReadFileSync;
+    });
+
+    it("returns empty string when no failure", () => {
+      expect(buildAppTokenMintingFailedContext(false)).toBe("");
+    });
+
+    it("returns formatted error message when app token minting failed", () => {
+      const result = buildAppTokenMintingFailedContext(true);
+      expect(result).toContain("GitHub App Authentication Failed");
+      expect(result).toContain("App ID");
+      expect(result).toContain("private key");
+      expect(result).toContain("installed");
+    });
+
+    it("includes actionable remediation steps", () => {
+      const result = buildAppTokenMintingFailedContext(true);
+      expect(result).toContain("required permissions");
+      expect(result).toContain("https://github.github.com/gh-aw/reference/safe-outputs/");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // buildLockdownCheckFailedContext
+  // ──────────────────────────────────────────────────────
+
+  describe("buildLockdownCheckFailedContext", () => {
+    let buildLockdownCheckFailedContext;
+    const fs = require("fs");
+    const path = require("path");
+    const templateContent = fs.readFileSync(path.join(__dirname, "../md/lockdown_check_failed.md"), "utf8");
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+
+    beforeEach(() => {
+      vi.resetModules();
+      // Stub readFileSync so the runtime path resolves to the source-tree template
+      fs.readFileSync = (filePath, encoding) => {
+        if (typeof filePath === "string" && filePath.includes("lockdown_check_failed.md")) {
+          return templateContent;
+        }
+        return originalReadFileSync(filePath, encoding);
+      };
+      ({ buildLockdownCheckFailedContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      fs.readFileSync = originalReadFileSync;
+    });
+
+    it("returns empty string when no failure", () => {
+      expect(buildLockdownCheckFailedContext(false)).toBe("");
+    });
+
+    it("returns formatted error message when lockdown check failed", () => {
+      const result = buildLockdownCheckFailedContext(true);
+      expect(result).toContain("Lockdown Check Failed");
+    });
+
+    it("includes token configuration guidance", () => {
+      const result = buildLockdownCheckFailedContext(true);
+      expect(result).toContain("GH_AW_GITHUB_TOKEN");
+      expect(result).toContain("gh aw secrets set");
+    });
+
+    it("includes strict mode guidance", () => {
+      const result = buildLockdownCheckFailedContext(true);
+      expect(result).toContain("gh aw compile --strict");
+    });
+  });
 });
