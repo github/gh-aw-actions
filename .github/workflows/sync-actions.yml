@@ -224,7 +224,7 @@ jobs:
           for dir in gh-aw/actions/*/; do
             name=$(basename "$dir")
             echo "Syncing: gh-aw/actions/$name/ -> gh-aw-actions/$name/"
-            rsync --archive --verbose --delete --exclude='README*' "gh-aw/actions/$name/" "gh-aw-actions/$name/"
+            rsync --archive --verbose --delete --exclude='README*' --exclude='*.test.cjs' "gh-aw/actions/$name/" "gh-aw-actions/$name/"
           done
           echo "::endgroup::"
 
