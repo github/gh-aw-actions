@@ -221,11 +221,22 @@ jobs:
           echo "::group::Syncing action folders from gh-aw/actions/ to repo root"
           # --archive preserves permissions/timestamps; --delete removes files absent in source (remote wins)
           # --exclude='README*' preserves any local README files in each destination folder
+          # --exclude='*.test.cjs' prevents test files from being copied into the destination
           for dir in gh-aw/actions/*/; do
             name=$(basename "$dir")
             echo "Syncing: gh-aw/actions/$name/ -> gh-aw-actions/$name/"
-            rsync --archive --verbose --delete --exclude='README*' "gh-aw/actions/$name/" "gh-aw-actions/$name/"
+            rsync --archive --verbose --delete --exclude='README*' --exclude='*.test.cjs' "gh-aw/actions/$name/" "gh-aw-actions/$name/"
           done
+
+          # Explicitly remove any lingering *.test.cjs files from destination folders, since rsync --delete
+          # does not delete files that match an --exclude pattern.
+          for dir in gh-aw/actions/*/; do
+            name=$(basename "$dir")
+            if [ -d "gh-aw-actions/$name" ]; then
+              find "gh-aw-actions/$name" -type f -name '*.test.cjs' -delete 2>/dev/null || true
+            fi
+          done
+
           echo "::endgroup::"
 
       - name: Log destination after sync
