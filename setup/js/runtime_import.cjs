@@ -98,6 +98,7 @@ const ALLOWED_EXPRESSIONS = [
   "github.event.pull_request.head.sha",
   "github.event.pull_request.base.sha",
   "github.actor",
+  "github.event_name",
   "github.job",
   "github.owner",
   "github.repository",
@@ -291,6 +292,7 @@ function evaluateExpression(expr) {
       const evalContext = {
         github: {
           actor: context.actor,
+          event_name: context.eventName,
           job: context.job,
           owner: context.repo.owner,
           repository: `${context.repo.owner}/${context.repo.repo}`,
@@ -646,10 +648,11 @@ function wrapExpressionsInTemplateConditionals(content) {
     }
 
     // Only wrap expressions that look like GitHub Actions expressions
-    // GitHub Actions expressions typically contain dots (e.g., github.actor, github.event.issue.number)
-    // or specific keywords (true, false, null)
+    // GitHub Actions expressions typically start with a letter and contain dots
+    // (e.g., github.actor, github.event.issue.number) or specific keywords (true, false, null).
+    // Expressions starting with non-alphabetic characters (e.g., "...") are NOT GitHub expressions.
     const looksLikeGitHubExpr =
-      trimmed.includes(".") ||
+      (/^[a-zA-Z]/.test(trimmed) && trimmed.includes(".")) ||
       trimmed === "true" ||
       trimmed === "false" ||
       trimmed === "null" ||

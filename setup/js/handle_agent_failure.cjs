@@ -4,7 +4,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateXMLMarker } = require("./messages.cjs");
-const { renderTemplate } = require("./messages_core.cjs");
+const { renderTemplate, renderTemplateFromFile } = require("./messages_core.cjs");
 const { getCurrentBranch } = require("./get_current_branch.cjs");
 const { createExpirationLine, generateFooterWithExpiration } = require("./ephemerals.cjs");
 const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
@@ -369,8 +369,9 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null, 
       yamlSnippet += `  ${yamlKey}:\n    protected-files: fallback-to-issue\n`;
     }
     yamlSnippet += "```\n";
-    context += "\nTo review and apply these changes manually, configure `protected-files: fallback-to-issue` — the agent will create a review issue with instructions instead of blocking:\n";
+    context += "\n<details>\n<summary><b>⚙️ Configure <code>protected-files: fallback-to-issue</code></b></summary>\n\n";
     context += yamlSnippet;
+    context += "</details>\n";
   }
 
   // Patch size exceeded section
@@ -423,16 +424,16 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null, 
     if (runId) {
       context += `\`\`\`sh
 # Download the patch artifact from the workflow run
-gh run download ${runId} -n agent-artifacts -D /tmp/agent-artifacts-${runId}
+gh run download ${runId} -n agent -D /tmp/agent-${runId}
 
 # List available patches
-ls /tmp/agent-artifacts-${runId}/*.patch
+ls /tmp/agent-${runId}/*.patch
 
 # Create a new branch (adjust as needed)
 git checkout -b aw/manual-apply
 
 # Apply the patch (--3way handles cross-repo patches)
-git am --3way /tmp/agent-artifacts-${runId}/YOUR_PATCH_FILE.patch
+git am --3way /tmp/agent-${runId}/YOUR_PATCH_FILE.patch
 
 # If there are conflicts, resolve them and continue (or abort):
 # git am --continue
@@ -608,16 +609,8 @@ function buildTimeoutContext(isTimedOut, timeoutMinutes) {
   const currentMinutes = parseInt(timeoutMinutes || "20", 10);
   const suggestedMinutes = currentMinutes + 10;
 
-  let ctx = "\n**⏱️ Agent Timed Out**: The agent job exceeded the maximum allowed execution time";
-  ctx += ` (${currentMinutes} minutes).`;
-  ctx += "\n\nTo increase the timeout, add or update the `timeout-minutes` setting in your workflow's frontmatter:\n\n";
-  ctx += "```yaml\n";
-  ctx += "---\n";
-  ctx += `timeout-minutes: ${suggestedMinutes}\n`;
-  ctx += "---\n";
-  ctx += "```\n\n";
-
-  return ctx;
+  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/agent_timeout.md`;
+  return "\n" + renderTemplateFromFile(templatePath, { current_minutes: currentMinutes, suggested_minutes: suggestedMinutes });
 }
 
 /**
@@ -646,8 +639,7 @@ function buildAppTokenMintingFailedContext(hasAppTokenMintingFailed) {
   }
 
   const templatePath = "/opt/gh-aw/prompts/app_token_minting_failed.md";
-  const template = fs.readFileSync(templatePath, "utf8");
-  return "\n" + renderTemplate(template, {});
+  return "\n" + renderTemplateFromFile(templatePath, {});
 }
 
 /**
@@ -663,6 +655,35 @@ function buildLockdownCheckFailedContext(hasLockdownCheckFailed) {
   const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/lockdown_check_failed.md`;
   const template = fs.readFileSync(templatePath, "utf8");
   return "\n" + template;
+}
+
+/**
+ * Build a context string when assigning the Copilot coding agent to created issues failed.
+ * @param {boolean} hasAssignCopilotFailures - Whether any copilot assignments failed
+ * @param {string} assignCopilotErrors - Newline-separated list of "issue:number:copilot:error" entries
+ * @returns {string} Formatted context string, or empty string if no failures
+ */
+function buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors) {
+  if (!hasAssignCopilotFailures) {
+    return "";
+  }
+
+  // Build a list of failed issue assignments
+  let issueList = "";
+  if (assignCopilotErrors) {
+    const errorLines = assignCopilotErrors.split("\n").filter(line => line.trim());
+    for (const errorLine of errorLines) {
+      const parts = errorLine.split(":");
+      if (parts.length >= 4) {
+        const number = parts[1];
+        const error = parts.slice(3).join(":"); // Rest is the error message
+        issueList += `- Issue #${number}: ${error}\n`;
+      }
+    }
+  }
+
+  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/assign_copilot_to_created_issues_failure.md`;
+  return "\n" + renderTemplateFromFile(templatePath, { issues: issueList });
 }
 
 /**
@@ -682,6 +703,8 @@ async function main() {
     const secretVerificationResult = process.env.GH_AW_SECRET_VERIFICATION_RESULT || "";
     const assignmentErrors = process.env.GH_AW_ASSIGNMENT_ERRORS || "";
     const assignmentErrorCount = process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0";
+    const assignCopilotErrors = process.env.GH_AW_ASSIGN_COPILOT_ERRORS || "";
+    const assignCopilotFailureCount = process.env.GH_AW_ASSIGN_COPILOT_FAILURE_COUNT || "0";
     const createDiscussionErrors = process.env.GH_AW_CREATE_DISCUSSION_ERRORS || "";
     const createDiscussionErrorCount = process.env.GH_AW_CREATE_DISCUSSION_ERROR_COUNT || "0";
     const codePushFailureErrors = process.env.GH_AW_CODE_PUSH_FAILURE_ERRORS || "";
@@ -727,6 +750,7 @@ async function main() {
     core.info(`Workflow ID: ${workflowID}`);
     core.info(`Secret verification result: ${secretVerificationResult}`);
     core.info(`Assignment error count: ${assignmentErrorCount}`);
+    core.info(`Assign copilot failure count: ${assignCopilotFailureCount}`);
     core.info(`Create discussion error count: ${createDiscussionErrorCount}`);
     core.info(`Code push failure count: ${codePushFailureCount}`);
     core.info(`Checkout PR success: ${checkoutPRSuccess}`);
@@ -740,6 +764,9 @@ async function main() {
 
     // Check if there are assignment errors (regardless of agent job status)
     const hasAssignmentErrors = parseInt(assignmentErrorCount, 10) > 0;
+
+    // Check if there are copilot assignment failures for created issues (regardless of agent job status)
+    const hasAssignCopilotFailures = parseInt(assignCopilotFailureCount, 10) > 0;
 
     // Check if there are create_discussion errors (regardless of agent job status)
     const hasCreateDiscussionErrors = parseInt(createDiscussionErrorCount, 10) > 0;
@@ -772,12 +799,13 @@ async function main() {
 
     // Only proceed if the agent job actually failed OR timed out OR there are assignment errors OR
     // create_discussion errors OR code-push failures OR push_repo_memory failed OR missing safe outputs
-    // OR a GitHub App token minting step failed OR the lockdown check failed.
+    // OR a GitHub App token minting step failed OR the lockdown check failed OR copilot assignment failed.
     // BUT skip if we only have noop outputs (that's a successful no-action scenario)
     if (
       agentConclusion !== "failure" &&
       !isTimedOut &&
       !hasAssignmentErrors &&
+      !hasAssignCopilotFailures &&
       !hasCreateDiscussionErrors &&
       !hasCodePushFailures &&
       !hasPushRepoMemoryFailure &&
@@ -955,6 +983,9 @@ async function main() {
         // Build lockdown check failure context
         const lockdownCheckFailedContext = buildLockdownCheckFailedContext(hasLockdownCheckFailed);
 
+        // Build copilot assignment failure context for created issues
+        const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
+
         // Create template context
         const templateContext = {
           run_url: runUrl,
@@ -968,6 +999,7 @@ async function main() {
               ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
           assignment_errors_context: assignmentErrorsContext,
+          assign_copilot_failure_context: assignCopilotFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
           code_push_failure_context: codePushFailureContext,
           repo_memory_validation_context: repoMemoryValidationContext,
@@ -1088,6 +1120,9 @@ async function main() {
         // Build lockdown check failure context
         const lockdownCheckFailedContext = buildLockdownCheckFailedContext(hasLockdownCheckFailed);
 
+        // Build copilot assignment failure context for created issues
+        const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
+
         // Create template context with sanitized workflow name
         const templateContext = {
           workflow_name: sanitizedWorkflowName,
@@ -1102,6 +1137,7 @@ async function main() {
               ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
           assignment_errors_context: assignmentErrorsContext,
+          assign_copilot_failure_context: assignCopilotFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
           code_push_failure_context: codePushFailureContext,
           repo_memory_validation_context: repoMemoryValidationContext,
@@ -1169,4 +1205,4 @@ async function main() {
   }
 }
 
-module.exports = { main, buildCodePushFailureContext, buildPushRepoMemoryFailureContext, buildAppTokenMintingFailedContext, buildLockdownCheckFailedContext };
+module.exports = { main, buildCodePushFailureContext, buildPushRepoMemoryFailureContext, buildAppTokenMintingFailedContext, buildLockdownCheckFailedContext, buildTimeoutContext, buildAssignCopilotFailureContext };
