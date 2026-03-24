@@ -176,7 +176,6 @@ jobs:
           echo "resolved_ref=$RESOLVED_REF"    >> "$GITHUB_OUTPUT"
           echo "raw_ref=$RAW_REF"              >> "$GITHUB_OUTPUT"
           echo "should_create_tag=$SHOULD_CREATE_TAG" >> "$GITHUB_OUTPUT"
-          echo "is_semver=$IS_SEMVER"          >> "$GITHUB_OUTPUT"
           echo "tag_ref=$TAG_REF"              >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
         env:
@@ -360,25 +359,5 @@ jobs:
           git tag -a "$TAG" -m "Sync from gh-aw@$TAG"
           git push origin "$TAG"
           echo "Tag '$TAG' created and pushed. ✓"
-
-          # If the ref is a semver, also update the vMAJOR and vMAJOR.MINOR floating tags
-          if [[ "${{ steps.resolve-ref.outputs.is_semver }}" == "true" ]]; then
-            # These sed patterns are safe: the format was already validated as vMAJOR.MINOR.PATCH above
-            MAJOR_TAG="v$(echo "$TAG" | sed 's/^v\([0-9]*\)\..*/\1/')"
-            MINOR_TAG="v$(echo "$TAG" | sed 's/^v\([0-9]*\.[0-9]*\)\..*/\1/')"
-
-            for FLOATING_TAG in "$MAJOR_TAG" "$MINOR_TAG"; do
-              echo "Updating floating tag: $FLOATING_TAG"
-              if git tag -d "$FLOATING_TAG" 2>/dev/null; then
-                echo "Deleted existing local tag '$FLOATING_TAG'."
-              fi
-              if git push origin ":refs/tags/$FLOATING_TAG" 2>/dev/null; then
-                echo "Deleted existing remote tag '$FLOATING_TAG'."
-              fi
-              git tag -a "$FLOATING_TAG" -m "Sync from gh-aw@$TAG"
-              git push origin "$FLOATING_TAG"
-              echo "Floating tag '$FLOATING_TAG' updated. ✓"
-            done
-          fi
 
           echo "::endgroup::"
