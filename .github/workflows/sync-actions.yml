@@ -370,10 +370,24 @@ jobs:
           TAG="${{ steps.resolve-ref.outputs.tag_ref }}"
 
           # Delete existing release if present (handles re-runs for the same tag).
-          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          # A "release not found" error is expected; any other failure is surfaced as a warning.
+          if ! gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/tmp/gh_delete_err; then
+            if ! grep -qi "release not found\|not found\|404" /tmp/gh_delete_err; then
+              echo "::warning::Failed to delete existing release '$TAG': $(cat /tmp/gh_delete_err)"
+            fi
+          fi
 
           # Try to reuse the release notes from the source gh-aw release for the same tag.
-          RELEASE_NOTES=$(gh api "repos/github/gh-aw/releases/tags/$TAG" --jq '.body' 2>/dev/null || echo "")
+          # Log a warning if the API call fails (e.g. rate-limit, auth) rather than silently falling back.
+          RELEASE_NOTES=""
+          if RAW_NOTES=$(gh api "repos/github/gh-aw/releases/tags/$TAG" --jq '.body' 2>/tmp/gh_api_err); then
+            # Discard JSON null returned when the upstream release body is empty.
+            if [[ "$RAW_NOTES" != "null" && -n "$RAW_NOTES" ]]; then
+              RELEASE_NOTES="$RAW_NOTES"
+            fi
+          else
+            echo "::warning::Could not fetch release notes from gh-aw for tag $TAG: $(cat /tmp/gh_api_err)"
+          fi
 
           if [[ -n "$RELEASE_NOTES" ]]; then
             echo "Using release notes from gh-aw for tag $TAG"
