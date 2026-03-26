@@ -361,3 +361,18 @@ jobs:
           echo "Tag '$TAG' created and pushed. ✓"
 
           echo "::endgroup::"
+
+      - name: Create release
+        if: steps.resolve-ref.outputs.should_create_tag == 'true'
+        run: |
+          echo "::group::Creating Release"
+          TAG="${{ steps.resolve-ref.outputs.tag_ref }}"
+          echo "Creating GitHub release for tag: $TAG"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "Sync of actions from [gh-aw](https://github.com/github/gh-aw) at \`$TAG\`."
+          echo "Release '$TAG' created. ✓"
+          echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
