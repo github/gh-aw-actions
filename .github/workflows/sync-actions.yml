@@ -371,8 +371,7 @@ jobs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
-            --notes "Sync of actions from [gh-aw](https://github.com/github/gh-aw) at \`$TAG\`." \
-            --latest
+            --notes "Sync of actions from [gh-aw](https://github.com/github/gh-aw) at \`$TAG\`."
           echo "Release '$TAG' created. ✓"
           echo "::endgroup::"
         env:
