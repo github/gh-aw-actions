@@ -176,6 +176,7 @@ jobs:
           echo "resolved_ref=$RESOLVED_REF"    >> "$GITHUB_OUTPUT"
           echo "raw_ref=$RAW_REF"              >> "$GITHUB_OUTPUT"
           echo "should_create_tag=$SHOULD_CREATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "is_semver=$IS_SEMVER"          >> "$GITHUB_OUTPUT"
           echo "tag_ref=$TAG_REF"              >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
         env:
@@ -363,7 +364,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Create release
-        if: steps.resolve-ref.outputs.should_create_tag == 'true'
+        if: steps.resolve-ref.outputs.is_semver == 'true'
         run: |
           echo "::group::Creating Release"
           TAG="${{ steps.resolve-ref.outputs.tag_ref }}"
