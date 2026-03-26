@@ -361,3 +361,35 @@ jobs:
           echo "Tag '$TAG' created and pushed. ✓"
 
           echo "::endgroup::"
+
+      - name: Create release
+        if: steps.resolve-ref.outputs.should_create_tag == 'true'
+        run: |
+          echo "::group::Creating Release"
+
+          TAG="${{ steps.resolve-ref.outputs.tag_ref }}"
+
+          # Delete existing release if present (handles re-runs for the same tag).
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+
+          # Try to reuse the release notes from the source gh-aw release for the same tag.
+          RELEASE_NOTES=$(gh api "repos/github/gh-aw/releases/tags/$TAG" --jq '.body' 2>/dev/null || echo "")
+
+          if [[ -n "$RELEASE_NOTES" ]]; then
+            echo "Using release notes from gh-aw for tag $TAG"
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --notes "$RELEASE_NOTES"
+          else
+            echo "No release notes found in gh-aw for tag $TAG — generating automatically"
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --generate-notes
+          fi
+
+          echo "Release '$TAG' created. ✓"
+          echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
