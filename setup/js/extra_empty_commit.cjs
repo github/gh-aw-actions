@@ -2,6 +2,7 @@
 /// <reference types="@actions/github-script" />
 
 const { validateTargetRepo, parseAllowedRepos, getDefaultTargetRepo } = require("./repo_helpers.cjs");
+const { getErrorMessage } = require("./error_helpers.cjs");
 
 /**
  * @fileoverview Extra Empty Commit Helper
@@ -147,10 +148,11 @@ async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMes
     try {
       await exec.exec("git", ["fetch", "ci-trigger", branchName]);
       await exec.exec("git", ["reset", "--hard", `ci-trigger/${branchName}`]);
-    } catch {
+    } catch (error) {
       // Non-fatal: if fetch/reset fails (e.g. branch not yet on remote), continue
       // with the local HEAD and attempt the push anyway.
-      core.info(`Could not sync local branch with remote ${branchName} - will attempt push with local HEAD`);
+      const syncErrorMessage = getErrorMessage(error);
+      core.warning(`Could not sync local branch with remote ${branchName} - will attempt push with local HEAD. Underlying error: ${syncErrorMessage}`);
     }
 
     // Create and push an empty commit
@@ -169,7 +171,7 @@ async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMes
 
     return { success: true };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorMessage = getErrorMessage(error);
     core.warning(`Failed to push extra empty commit: ${errorMessage}`);
 
     // Clean up the temporary remote on failure
