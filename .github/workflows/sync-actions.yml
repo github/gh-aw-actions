@@ -201,8 +201,10 @@ jobs:
           sparse-checkout-cone-mode: true
 
       - name: Log source actions directory
+        env:
+          RESOLVED_REF: ${{ steps.resolve-ref.outputs.resolved_ref }}
         run: |
-          echo "::group::Source — gh-aw/actions/ at ref '${{ steps.resolve-ref.outputs.resolved_ref }}'"
+          echo "::group::Source — gh-aw/actions/ at ref '$RESOLVED_REF'"
           find gh-aw/actions -type f | sort
           echo "::endgroup::"
 
