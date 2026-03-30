@@ -196,6 +196,7 @@ jobs:
           ref: ${{ steps.resolve-ref.outputs.resolved_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           path: gh-aw
+          persist-credentials: false
           sparse-checkout: actions
           sparse-checkout-cone-mode: true
 
