@@ -271,14 +271,14 @@ jobs:
             echo "Changes staged for commit:"
             git diff --staged --stat
             echo ""
-            BRANCH="sync/gh-aw-${{ steps.resolve-ref.outputs.resolved_ref }}"
+            BRANCH="sync/gh-aw-$RESOLVED_REF"
             git checkout -b "$BRANCH"
-            COMMIT_MSG="chore: sync actions from gh-aw@${{ steps.resolve-ref.outputs.resolved_ref }}"
+            COMMIT_MSG="chore: sync actions from gh-aw@$RESOLVED_REF"
             git commit -m "$COMMIT_MSG"
             git push origin "$BRANCH"
             PR_URL=$(gh pr create \
               --title "$COMMIT_MSG" \
-              --body "Automated sync of actions from [gh-aw](https://github.com/github/gh-aw) at \`${{ steps.resolve-ref.outputs.resolved_ref }}\`." \
+              --body "Automated sync of actions from [gh-aw](https://github.com/github/gh-aw) at \`$RESOLVED_REF\`." \
               --base main \
               --head "$BRANCH")
             PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
@@ -290,6 +290,7 @@ jobs:
           echo "::endgroup::"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESOLVED_REF: ${{ steps.resolve-ref.outputs.resolved_ref }}
 
       - name: Poll pull request until merged
         if: steps.create-pr.outputs.changed == 'true'
