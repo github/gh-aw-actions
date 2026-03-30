@@ -366,7 +366,7 @@ jobs:
         if: steps.resolve-ref.outputs.should_create_tag == 'true'
         run: |
           echo "::group::Creating Release"
-          TAG="${{ steps.resolve-ref.outputs.tag_ref }}"
+          TAG="$TAG_REF"
           echo "Creating GitHub release for tag: $TAG"
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
@@ -376,3 +376,4 @@ jobs:
           echo "::endgroup::"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_REF: ${{ steps.resolve-ref.outputs.tag_ref }}
