@@ -346,7 +346,7 @@ jobs:
             git checkout -B main origin/main
           fi
 
-          TAG="${{ steps.resolve-ref.outputs.tag_ref }}"
+          TAG="$TAG_REF"
           echo "Creating tag: $TAG"
 
           # If the tag already exists, delete and re-create it so it points to the
@@ -365,6 +365,8 @@ jobs:
           echo "Tag '$TAG' created and pushed. ✓"
 
           echo "::endgroup::"
+        env:
+          TAG_REF: ${{ steps.resolve-ref.outputs.tag_ref }}
 
       - name: Create release
         if: steps.resolve-ref.outputs.should_create_tag == 'true'
