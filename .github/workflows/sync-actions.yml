@@ -294,14 +294,13 @@ jobs:
       - name: Poll pull request until merged
         if: steps.create-pr.outputs.changed == 'true'
         run: |
-          echo "::group::Polling PR #${{ steps.create-pr.outputs.pr_number }}"
-          PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
+          echo "::group::Polling PR #$PR_NUMBER"
           TIMEOUT=1200
           INTERVAL=30
           ELAPSED=0
 
           while [[ $ELAPSED -lt $TIMEOUT ]]; do
-            if ! STATE=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json state --jq '.state' 2>&1); then
+            if ! STATE=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq '.state' 2>&1); then
               echo "::warning::Failed to query PR state (elapsed: ${ELAPSED}s): $STATE"
             else
               echo "PR #$PR_NUMBER state: $STATE (elapsed: ${ELAPSED}s / ${TIMEOUT}s)"
@@ -328,6 +327,7 @@ jobs:
           exit 1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
 
       - name: Create tag
         if: steps.resolve-ref.outputs.should_create_tag == 'true'
