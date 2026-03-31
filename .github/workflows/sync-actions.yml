@@ -368,8 +368,6 @@ jobs:
           echo "Tag '$TAG' created and pushed. ✓"
 
           echo "::endgroup::"
-        env:
-          TAG_REF: ${{ steps.resolve-ref.outputs.tag_ref }}
 
       - name: Create release
         if: steps.resolve-ref.outputs.should_create_tag == 'true'
