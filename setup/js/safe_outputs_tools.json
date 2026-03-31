@@ -486,7 +486,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Label names to add (e.g., ['bug', 'priority-high']). Labels must exist in the repository."
+          "description": "Label names to add (e.g., ['bug', 'priority-high']). Labels must exist in the repository. This field is required — omitting it will cause a validation error."
         },
         "item_number": {
           "type": "number",
@@ -501,6 +501,7 @@
           "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
         }
       },
+      "required": ["labels"],
       "additionalProperties": false
     }
   },
