@@ -334,13 +334,16 @@ jobs:
 
       - name: Create tag
         if: steps.resolve-ref.outputs.should_create_tag == 'true'
+        env:
+          PR_CHANGED: ${{ steps.create-pr.outputs.changed }}
+          TAG_REF: ${{ steps.resolve-ref.outputs.tag_ref }}
         run: |
           echo "::group::Creating Tag"
           cd gh-aw-actions
 
           # When a PR was created and merged, we need to pull the merge commit from main
           # because the working directory is still on the sync branch.
-          if [[ "${{ steps.create-pr.outputs.changed }}" == "true" ]]; then
+          if [[ "$PR_CHANGED" == "true" ]]; then
             echo "PR was merged — fetching main to tag the merge commit..."
             git fetch origin main
             git checkout -B main origin/main
