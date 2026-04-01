@@ -384,24 +384,47 @@ async function main() {
   }
 
   // Validate total patch size before committing
+  // Only additions (new content) are counted toward the patch size limit.
+  // Deletions are ignored since removing content is acceptable and does not
+  // contribute to the size of the content being pushed.
   try {
     const patchContent = execGitSync(["diff", "--cached"], { stdio: "pipe" });
-    const patchSizeBytes = Buffer.byteLength(patchContent, "utf8");
+    // Count only added lines (starting with '+', excluding '+++' file-header lines)
+    const addedSizeBytes = patchContent
+      .split("\n")
+      .filter(line => line.startsWith("+") && !line.startsWith("+++"))
+      .reduce((sum, line) => sum + Buffer.byteLength(line + "\n", "utf8"), 0);
+    const patchSizeBytes = addedSizeBytes;
     const patchSizeKb = Math.ceil(patchSizeBytes / 1024);
     const maxPatchSizeKb = Math.floor(maxPatchSize / 1024);
     // Allow 20% overhead to account for git diff format (headers, context lines, etc.)
     const effectiveMaxPatchSize = Math.floor(maxPatchSize * 1.2);
     const effectiveMaxPatchSizeKb = Math.floor(effectiveMaxPatchSize / 1024);
-    core.info(`Patch size: ${patchSizeKb} KB (${patchSizeBytes} bytes) (configured limit: ${maxPatchSizeKb} KB (${maxPatchSize} bytes), effective with 20% overhead: ${effectiveMaxPatchSizeKb} KB (${effectiveMaxPatchSize} bytes))`);
+    const patchSizeMessage = `Patch additions size: ${patchSizeKb} KB (${patchSizeBytes} bytes) (configured limit: ${maxPatchSizeKb} KB (${maxPatchSize} bytes), effective with 20% overhead: ${effectiveMaxPatchSizeKb} KB (${effectiveMaxPatchSize} bytes))`;
     if (patchSizeBytes > effectiveMaxPatchSize) {
+      // Warn at warning level so the size is visible even without verbose mode
+      core.warning(patchSizeMessage);
+      // Add per-file diff stats to diagnose what's causing the large patch
+      // (e.g. a full rewrite of an accumulated history file shows old + new content in the diff)
+      try {
+        const diffStat = execGitSync(["diff", "--cached", "--stat"], { stdio: "pipe" });
+        core.warning(`Patch content breakdown (git diff --stat):\n${diffStat}`);
+      } catch (statError) {
+        core.warning(`Could not retrieve diff stat: ${getErrorMessage(statError)}`);
+      }
       core.setOutput("patch_size_exceeded", "true");
       core.setFailed(
-        `Patch size (${patchSizeKb} KB, ${patchSizeBytes} bytes) exceeds maximum allowed size (${effectiveMaxPatchSizeKb} KB, ${effectiveMaxPatchSize} bytes, configured limit: ${maxPatchSizeKb} KB with 20% overhead allowance). Reduce the number or size of changes, or increase max-patch-size.`
+        `Patch additions size (${patchSizeKb} KB, ${patchSizeBytes} bytes) exceeds maximum allowed size (${effectiveMaxPatchSizeKb} KB, ${effectiveMaxPatchSize} bytes, configured limit: ${maxPatchSizeKb} KB with 20% overhead allowance). Reduce the number or size of changes, or increase max-patch-size.`
       );
       return;
+    } else if (patchSizeBytes > maxPatchSize) {
+      // Within the 20% overhead window — still log as a warning so it's visible
+      core.warning(patchSizeMessage);
+    } else {
+      core.info(patchSizeMessage);
     }
   } catch (error) {
-    core.setFailed(`Failed to compute patch size: ${getErrorMessage(error)}`);
+    core.setFailed(`Failed to compute patch additions size: ${getErrorMessage(error)}`);
     return;
   }
 
