@@ -30,8 +30,48 @@ async function main() {
   core.info(`  Source: ${workflowMdPath}`);
   core.info(`  Lock file: ${lockFilePath}`);
 
-  const { owner, repo } = context.repo;
-  const ref = context.sha;
+  // Determine workflow source repository from GITHUB_WORKFLOW_REF for cross-repo support.
+  // GITHUB_WORKFLOW_REF format: owner/repo/.github/workflows/file.yml@ref
+  // This env var always reflects the repo where the workflow file is defined,
+  // not the repo where the triggering event occurred (context.repo).
+  // When running cross-repo via org rulesets, context.repo points to the target
+  // repository, not the repository that defines the workflow files.
+  const workflowEnvRef = process.env.GITHUB_WORKFLOW_REF || "";
+  const currentRepo = process.env.GITHUB_REPOSITORY || `${context.repo.owner}/${context.repo.repo}`;
+
+  // Parse owner, repo, and optional ref from GITHUB_WORKFLOW_REF as a single unit so that
+  // repo and ref are always consistent with each other.  The @ref segment may be absent (e.g.
+  // when the env var was set without a ref suffix), so treat it as optional.
+  const workflowRefMatch = workflowEnvRef.match(/^([^/]+)\/([^/]+)\/.+?(?:@(.+))?$/);
+
+  // Use the workflow source repo if parseable, otherwise fall back to context.repo
+  const owner = workflowRefMatch ? workflowRefMatch[1] : context.repo.owner;
+  const repo = workflowRefMatch ? workflowRefMatch[2] : context.repo.repo;
+  const workflowRepo = `${owner}/${repo}`;
+
+  // Determine ref in a way that keeps repo+ref consistent:
+  //   - If a ref is present in GITHUB_WORKFLOW_REF, use it.
+  //   - For same-repo runs without a parsed ref, fall back to context.sha (existing behavior).
+  //   - For cross-repo runs without a parsed ref, omit ref so the API uses the default branch
+  //     (avoids mixing source repo owner/name with a SHA that only exists in the triggering repo).
+  let ref;
+  if (workflowRefMatch && workflowRefMatch[3]) {
+    ref = workflowRefMatch[3];
+  } else if (workflowRepo === currentRepo) {
+    ref = context.sha;
+  } else {
+    ref = undefined;
+  }
+
+  core.info(`GITHUB_WORKFLOW_REF: ${workflowEnvRef || "(not set)"}`);
+  core.info(`GITHUB_REPOSITORY: ${currentRepo}`);
+  core.info(`Resolved source repo: ${owner}/${repo} @ ${ref || "(default branch)"}`);
+
+  if (workflowRepo !== currentRepo) {
+    core.info(`Cross-repo invocation detected: workflow source is "${workflowRepo}", current repo is "${currentRepo}"`);
+  } else {
+    core.info(`Same-repo invocation: checking out ${workflowRepo} @ ${ref}`);
+  }
 
   // Helper function to compute and compare frontmatter hashes
   // Returns: { match: boolean, storedHash: string, recomputedHash: string } or null on error
