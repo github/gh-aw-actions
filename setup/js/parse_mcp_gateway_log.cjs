@@ -5,6 +5,7 @@ const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { displayDirectories } = require("./display_file_helpers.cjs");
 const { ERR_PARSE } = require("./error_codes.cjs");
+const { computeEffectiveTokens, getTokenClassWeights, formatET } = require("./effective_tokens.cjs");
 
 /**
  * Parses MCP gateway logs and creates a step summary
@@ -13,7 +14,192 @@ const { ERR_PARSE } = require("./error_codes.cjs");
  *  - /tmp/gh-aw/mcp-logs/gateway.md (markdown summary from gateway, preferred for general content)
  *  - /tmp/gh-aw/mcp-logs/gateway.log (main gateway log, fallback)
  *  - /tmp/gh-aw/mcp-logs/stderr.log (stderr output, fallback)
+ *  - /tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl (token usage from firewall proxy)
  */
+
+const TOKEN_USAGE_PATH = "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl";
+
+/**
+ * Formats milliseconds as a human-readable duration string.
+ * @param {number} ms - Duration in milliseconds
+ * @returns {string} Formatted duration (e.g. "500ms", "2.5s", "1m30s")
+ */
+function formatDurationMs(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const secs = Math.round(seconds % 60);
+  return `${minutes}m${secs}s`;
+}
+
+/**
+ * Parses token-usage.jsonl content and returns an aggregated summary.
+ * Computes effective tokens (ET) per model using the GH_AW_MODEL_MULTIPLIERS env var.
+ * @param {string} jsonlContent - The token-usage.jsonl file content
+ * @returns {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, cacheEfficiency: number, totalEffectiveTokens: number, byModel: Object} | null}
+ */
+function parseTokenUsageJsonl(jsonlContent) {
+  const summary = {
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalCacheReadTokens: 0,
+    totalCacheWriteTokens: 0,
+    totalRequests: 0,
+    totalDurationMs: 0,
+    cacheEfficiency: 0,
+    totalEffectiveTokens: 0,
+    byModel: {},
+  };
+
+  const lines = jsonlContent.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed);
+      if (!entry || typeof entry !== "object") continue;
+
+      const inputTokens = entry.input_tokens || 0;
+      const outputTokens = entry.output_tokens || 0;
+      const cacheReadTokens = entry.cache_read_tokens || 0;
+      const cacheWriteTokens = entry.cache_write_tokens || 0;
+
+      summary.totalInputTokens += inputTokens;
+      summary.totalOutputTokens += outputTokens;
+      summary.totalCacheReadTokens += cacheReadTokens;
+      summary.totalCacheWriteTokens += cacheWriteTokens;
+      summary.totalRequests++;
+      summary.totalDurationMs += entry.duration_ms || 0;
+
+      const model = entry.model || "unknown";
+      summary.byModel[model] ??= {
+        provider: entry.provider || "",
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        requests: 0,
+        durationMs: 0,
+        effectiveTokens: 0,
+      };
+      const m = summary.byModel[model];
+      m.inputTokens += inputTokens;
+      m.outputTokens += outputTokens;
+      m.cacheReadTokens += cacheReadTokens;
+      m.cacheWriteTokens += cacheWriteTokens;
+      m.requests++;
+      m.durationMs += entry.duration_ms || 0;
+    } catch {
+      // skip malformed lines
+    }
+  }
+
+  if (summary.totalRequests === 0) return null;
+
+  const totalInputPlusCacheRead = summary.totalInputTokens + summary.totalCacheReadTokens;
+  if (totalInputPlusCacheRead > 0) {
+    summary.cacheEfficiency = summary.totalCacheReadTokens / totalInputPlusCacheRead;
+  }
+
+  // Compute effective tokens per model and aggregate total
+  let totalEffectiveTokens = 0;
+  for (const [model, usage] of Object.entries(summary.byModel)) {
+    const et = computeEffectiveTokens(model, usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheWriteTokens);
+    usage.effectiveTokens = et;
+    totalEffectiveTokens += et;
+  }
+  summary.totalEffectiveTokens = totalEffectiveTokens;
+
+  return summary;
+}
+
+/**
+ * Generates a markdown summary section for token usage data.
+ * Includes an Effective Tokens (ET) column per model and a ● ET summary line.
+ * @param {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, cacheEfficiency: number, totalEffectiveTokens: number, byModel: Object} | null} summary
+ * @returns {string} Markdown section, or empty string if no data
+ */
+function generateTokenUsageSummary(summary) {
+  if (!summary || summary.totalRequests === 0) return "";
+
+  const lines = [];
+  lines.push("### 📊 Token Usage\n");
+  lines.push("| Model | Input | Output | Cache Read | Cache Write | ET | Requests | Duration |");
+  lines.push("|-------|------:|-------:|-----------:|------------:|---:|---------:|---------:|");
+
+  // Sort models by total tokens descending
+  const models = Object.entries(summary.byModel).sort(([, a], [, b]) => {
+    const aTotal = a.inputTokens + a.outputTokens + a.cacheReadTokens + a.cacheWriteTokens;
+    const bTotal = b.inputTokens + b.outputTokens + b.cacheReadTokens + b.cacheWriteTokens;
+    return bTotal - aTotal;
+  });
+
+  for (const [model, usage] of models) {
+    const et = formatET(Math.round(usage.effectiveTokens || 0));
+    lines.push(
+      `| ${model} | ${usage.inputTokens.toLocaleString()} | ${usage.outputTokens.toLocaleString()} | ${usage.cacheReadTokens.toLocaleString()} | ${usage.cacheWriteTokens.toLocaleString()} | ${et} | ${usage.requests} | ${formatDurationMs(usage.durationMs)} |`
+    );
+  }
+
+  const totalET = formatET(Math.round(summary.totalEffectiveTokens || 0));
+  lines.push(
+    `| **Total** | **${summary.totalInputTokens.toLocaleString()}** | **${summary.totalOutputTokens.toLocaleString()}** | **${summary.totalCacheReadTokens.toLocaleString()}** | **${summary.totalCacheWriteTokens.toLocaleString()}** | **${totalET}** | **${summary.totalRequests}** | **${formatDurationMs(summary.totalDurationMs)}** |`
+  );
+
+  // Footer line with ET summary using ● symbol and optional cache efficiency
+  const footerParts = [];
+  if (summary.totalEffectiveTokens > 0) {
+    footerParts.push(`● ${formatET(Math.round(summary.totalEffectiveTokens))}`);
+  }
+  if (summary.cacheEfficiency > 0) {
+    footerParts.push(`Cache efficiency: ${(summary.cacheEfficiency * 100).toFixed(1)}%`);
+  }
+  if (footerParts.length > 0) {
+    lines.push(`\n_${footerParts.join(" · ")}_`);
+    // Disclose the token class weights used to compute ET (required by the ET spec)
+    const w = getTokenClassWeights();
+    lines.push(`<sub>ET weights: input=${w.input} · cached_input=${w.cached_input} · output=${w.output} · reasoning=${w.reasoning} · cache_write=${w.cache_write}</sub>`);
+  }
+
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Appends the token usage section to the step summary if data is present, then writes it.
+ * Also exports GH_AW_EFFECTIVE_TOKENS as a GitHub Actions environment variable so
+ * subsequent steps can display the ET value in generated footers.
+ * This is the final call in each main() exit path — it consolidates the summary write
+ * so callers don't need to chain addRaw() + write() themselves.
+ * @param {typeof import('@actions/core')} coreObj - The GitHub Actions core object
+ */
+function writeStepSummaryWithTokenUsage(coreObj) {
+  if (!fs.existsSync(TOKEN_USAGE_PATH)) {
+    coreObj.debug(`No token-usage.jsonl found at: ${TOKEN_USAGE_PATH}`);
+  } else {
+    const content = fs.readFileSync(TOKEN_USAGE_PATH, "utf8");
+    if (content?.trim()) {
+      coreObj.info(`Found token-usage.jsonl (${content.length} bytes)`);
+      const parsedSummary = parseTokenUsageJsonl(content);
+      const markdown = generateTokenUsageSummary(parsedSummary);
+      if (markdown.length > 0) {
+        coreObj.summary.addRaw(markdown);
+      }
+      // Export total effective tokens as a GitHub Actions env var for use in
+      // generated footers (GH_AW_EFFECTIVE_TOKENS is read by messages_footer.cjs)
+      if (parsedSummary && parsedSummary.totalEffectiveTokens > 0) {
+        const roundedET = Math.round(parsedSummary.totalEffectiveTokens);
+        coreObj.exportVariable("GH_AW_EFFECTIVE_TOKENS", String(roundedET));
+        // Also set as a step output so the value can flow to the safe_outputs job
+        // via the agent job's effective_tokens output (job-level env vars are not
+        // inherited by downstream jobs — only job outputs are).
+        coreObj.setOutput("effective_tokens", String(roundedET));
+        coreObj.info(`Effective tokens: ${roundedET}`);
+      }
+    }
+  }
+  coreObj.summary.write();
+}
 
 /**
  * Prints all gateway-related files to core.info for debugging
@@ -250,7 +436,7 @@ async function main() {
           core.summary.addRaw(difcSummary);
         }
 
-        core.summary.write();
+        writeStepSummaryWithTokenUsage(core);
         return;
       }
     } else {
@@ -268,11 +454,12 @@ async function main() {
       if (totalMessages > 0 || difcFilteredEvents.length > 0) {
         const rpcSummary = generateRpcMessagesSummary(rpcEntries, difcFilteredEvents);
         if (rpcSummary.length > 0) {
-          core.summary.addRaw(rpcSummary).write();
+          core.summary.addRaw(rpcSummary);
         }
       } else {
         core.info("rpc-messages.jsonl is present but contains no renderable messages");
       }
+      writeStepSummaryWithTokenUsage(core);
       return;
     }
 
@@ -296,9 +483,10 @@ async function main() {
       core.info(`No stderr.log found at: ${stderrLogPath}`);
     }
 
-    // If no legacy log content and no DIFC events, nothing to do
+    // If no legacy log content and no DIFC events, check if token usage is available
     if ((!gatewayLogContent || gatewayLogContent.trim().length === 0) && (!stderrLogContent || stderrLogContent.trim().length === 0) && difcFilteredEvents.length === 0) {
       core.info("MCP gateway log files are empty or missing");
+      writeStepSummaryWithTokenUsage(core);
       return;
     }
 
@@ -314,8 +502,9 @@ async function main() {
     const fullSummary = [legacySummary, difcSummary].filter(s => s.length > 0).join("\n");
 
     if (fullSummary.length > 0) {
-      core.summary.addRaw(fullSummary).write();
+      core.summary.addRaw(fullSummary);
     }
+    writeStepSummaryWithTokenUsage(core);
   } catch (error) {
     core.setFailed(`${ERR_PARSE}: ${getErrorMessage(error)}`);
   }
@@ -436,6 +625,9 @@ if (typeof module !== "undefined" && module.exports) {
     getRpcRequestLabel,
     generateRpcMessagesSummary,
     printAllGatewayFiles,
+    parseTokenUsageJsonl,
+    generateTokenUsageSummary,
+    formatDurationMs,
   };
 }
 

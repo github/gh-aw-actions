@@ -142,6 +142,19 @@ fi
 
 echo "Successfully copied ${FILE_COUNT} files to ${DESTINATION}"
 
+# Export model multipliers JSON as GH_AW_MODEL_MULTIPLIERS environment variable.
+# This makes the per-model effective token multipliers available to JavaScript
+# actions running in subsequent steps so they can compute Effective Tokens (ET).
+MODEL_MULTIPLIERS_FILE="${DESTINATION}/model_multipliers.json"
+if [ -f "${MODEL_MULTIPLIERS_FILE}" ] && [ -n "${GITHUB_ENV:-}" ]; then
+  {
+    echo "GH_AW_MODEL_MULTIPLIERS<<EOF_MODEL_MULTIPLIERS"
+    cat "${MODEL_MULTIPLIERS_FILE}"
+    echo "EOF_MODEL_MULTIPLIERS"
+  } >> "${GITHUB_ENV}"
+  echo "Exported GH_AW_MODEL_MULTIPLIERS from ${MODEL_MULTIPLIERS_FILE}"
+fi
+
 # Copy prompt markdown files to their expected directory
 PROMPTS_DEST="${GH_AW_ROOT}/prompts"
 echo "Copying prompt markdown files to ${PROMPTS_DEST}"
@@ -249,6 +262,7 @@ SAFE_OUTPUTS_FILES=(
   "messages_run_status.cjs"
   "messages_staged.cjs"
   "messages_close_discussion.cjs"
+  "effective_tokens.cjs"
   "estimate_tokens.cjs"
   "generate_git_patch.cjs"
   "generate_git_bundle.cjs"
