@@ -11,7 +11,7 @@ const { getTrackerID } = require("./get_tracker_id.cjs");
 const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_title.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { replaceTemporaryIdReferences, isTemporaryId } = require("./temporary_id.cjs");
+const { replaceTemporaryIdReferences, getOrGenerateTemporaryId } = require("./temporary_id.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { addExpirationToFooter } = require("./ephemerals.cjs");
 const { generateWorkflowIdMarker } = require("./generate_footer.cjs");
@@ -247,31 +247,12 @@ async function main(config = {}) {
 
     const pullRequestItem = message;
 
-    let temporaryId;
-    if (pullRequestItem.temporary_id !== undefined && pullRequestItem.temporary_id !== null) {
-      if (typeof pullRequestItem.temporary_id !== "string") {
-        core.warning(`Skipping create_pull_request: temporary_id must be a string (got ${typeof pullRequestItem.temporary_id})`);
-        return {
-          success: false,
-          error: `temporary_id must be a string (got ${typeof pullRequestItem.temporary_id})`,
-        };
-      }
-
-      const rawTemporaryId = pullRequestItem.temporary_id.trim();
-      const normalized = rawTemporaryId.startsWith("#") ? rawTemporaryId.substring(1).trim() : rawTemporaryId;
-
-      if (!isTemporaryId(normalized)) {
-        core.warning(
-          `Skipping create_pull_request: Invalid temporary_id format: '${pullRequestItem.temporary_id}'. Temporary IDs must be in format 'aw_' followed by 3 to 12 alphanumeric characters (A-Za-z0-9). Example: 'aw_abc' or 'aw_Test123'`
-        );
-        return {
-          success: false,
-          error: `Invalid temporary_id format: '${pullRequestItem.temporary_id}'. Temporary IDs must be in format 'aw_' followed by 3 to 12 alphanumeric characters (A-Za-z0-9). Example: 'aw_abc' or 'aw_Test123'`,
-        };
-      }
-
-      temporaryId = normalized.toLowerCase();
+    const tempIdResult = getOrGenerateTemporaryId(pullRequestItem, "pull request");
+    if (tempIdResult.error) {
+      core.warning(`Skipping create_pull_request: ${tempIdResult.error}`);
+      return { success: false, error: tempIdResult.error };
     }
+    const temporaryId = tempIdResult.temporaryId;
 
     core.info(`Processing create_pull_request: title=${pullRequestItem.title || "No title"}, bodyLength=${pullRequestItem.body?.length || 0}`);
 
@@ -913,6 +894,16 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo
               core.warning("No base_commit recorded in safe output entry - fallback not possible");
             } else {
               core.info(`Original base commit from patch generation: ${originalBaseCommit}`);
+
+              // In shallow clones (fetch-depth: 1) the base commit may not be locally available.
+              // Attempt to fetch it explicitly before checking whether it exists.
+              try {
+                await exec.exec("git", ["fetch", "origin", originalBaseCommit, "--depth=1"]);
+              } catch (fetchError) {
+                // Non-fatal: the commit may already be available, or the server may not support
+                // fetching individual SHAs (e.g. some GHE configurations). Log for troubleshooting.
+                core.info(`Note: could not fetch base commit ${originalBaseCommit} explicitly (${fetchError instanceof Error ? fetchError.message : String(fetchError)}); will verify local availability next`);
+              }
 
               // Verify the base commit is available in this repo (may not exist cross-repo)
               await exec.exec("git", ["cat-file", "-e", originalBaseCommit]);

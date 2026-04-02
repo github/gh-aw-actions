@@ -6,7 +6,7 @@
  */
 
 const { generateFooterWithMessages, generateXMLMarker } = require("./messages_footer.cjs");
-const { generateWorkflowCallIdMarker } = require("./generate_footer.cjs");
+const { generateWorkflowCallIdMarker, matchesWorkflowId } = require("./generate_footer.cjs");
 const { getRepositoryUrl } = require("./get_repository_url.cjs");
 const { replaceTemporaryIdReferences, loadTemporaryIdMapFromResolved, resolveRepoIssueTarget } = require("./temporary_id.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
@@ -19,6 +19,7 @@ const { getMissingInfoSections } = require("./missing_messages_helper.cjs");
 const { getMessages } = require("./messages_core.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { MAX_COMMENT_LENGTH, MAX_MENTIONS, MAX_LINKS, enforceCommentLimits } = require("./comment_limit_helpers.cjs");
+const { resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { ERR_NOT_FOUND } = require("./error_codes.cjs");
 const { isPayloadUserBot } = require("./resolve_mentions.cjs");
@@ -28,7 +29,6 @@ const { generateHistoryUrl } = require("./generate_history_link.cjs");
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "add_comment";
 
-// Copy helper functions from original file
 async function minimizeComment(github, nodeId, reason = "outdated") {
   const query = /* GraphQL */ `
     mutation ($nodeId: ID!, $classifier: ReportedContentClassifiers!) {
@@ -76,19 +76,7 @@ async function findCommentsWithTrackerId(github, owner, repo, issueNumber, workf
       break;
     }
 
-    // Filter comments that contain the workflow-id and are NOT reaction comments.
-    // Supports both the standalone marker format (<!-- gh-aw-workflow-id: value -->)
-    // and the combined XML marker format (<!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->).
-    const filteredComments = data
-      .filter(comment => {
-        if (!comment.body || comment.body.includes(`<!-- gh-aw-comment-type: reaction -->`)) return false;
-        // Standalone marker: <!-- gh-aw-workflow-id: value -->
-        if (comment.body.includes(`<!-- gh-aw-workflow-id: ${workflowId} -->`)) return true;
-        // Combined XML marker: <!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->
-        if (comment.body.includes(`<!-- gh-aw-agentic-workflow:`) && (comment.body.includes(`workflow_id: ${workflowId},`) || comment.body.includes(`workflow_id: ${workflowId} -->`))) return true;
-        return false;
-      })
-      .map(({ id, node_id, body }) => ({ id, node_id, body }));
+    const filteredComments = data.filter(comment => matchesWorkflowId(comment.body, workflowId)).map(({ id, node_id, body }) => ({ id, node_id, body }));
 
     comments.push(...filteredComments);
 
@@ -141,16 +129,7 @@ async function findDiscussionCommentsWithTrackerId(github, owner, repo, discussi
       break;
     }
 
-    const filteredComments = result.repository.discussion.comments.nodes
-      .filter(comment => {
-        if (!comment.body || comment.body.includes(`<!-- gh-aw-comment-type: reaction -->`)) return false;
-        // Standalone marker: <!-- gh-aw-workflow-id: value -->
-        if (comment.body.includes(`<!-- gh-aw-workflow-id: ${workflowId} -->`)) return true;
-        // Combined XML marker: <!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->
-        if (comment.body.includes(`<!-- gh-aw-agentic-workflow:`) && (comment.body.includes(`workflow_id: ${workflowId},`) || comment.body.includes(`workflow_id: ${workflowId} -->`))) return true;
-        return false;
-      })
-      .map(({ id, body }) => ({ id, body }));
+    const filteredComments = result.repository.discussion.comments.nodes.filter(comment => matchesWorkflowId(comment.body, workflowId)).map(({ id, body }) => ({ id, body }));
 
     comments.push(...filteredComments);
 
@@ -260,28 +239,28 @@ async function commentOnDiscussion(github, owner, repo, discussionNumber, messag
 
   // 2. Add comment (with optional replyToId for threading)
   const mutation = replyToId
-    ? `mutation($dId: ID!, $body: String!, $replyToId: ID!) {
-        addDiscussionComment(input: { discussionId: $dId, body: $body, replyToId: $replyToId }) {
-          comment { 
-            id 
-            body 
-            createdAt 
-            url
+    ? /* GraphQL */ `
+        mutation ($dId: ID!, $body: String!, $replyToId: ID!) {
+          addDiscussionComment(input: { discussionId: $dId, body: $body, replyToId: $replyToId }) {
+            comment {
+              id
+              url
+            }
           }
         }
-      }`
-    : `mutation($dId: ID!, $body: String!) {
-        addDiscussionComment(input: { discussionId: $dId, body: $body }) {
-          comment { 
-            id 
-            body 
-            createdAt 
-            url
+      `
+    : /* GraphQL */ `
+        mutation ($dId: ID!, $body: String!) {
+          addDiscussionComment(input: { discussionId: $dId, body: $body }) {
+            comment {
+              id
+              url
+            }
           }
         }
-      }`;
+      `;
 
-  const variables = replyToId ? { dId: discussionId, body: message, replyToId } : { dId: discussionId, body: message };
+  const variables = { dId: discussionId, body: message, ...(replyToId ? { replyToId } : {}) };
 
   const result = await github.graphql(mutation, variables);
 
@@ -351,6 +330,7 @@ async function main(config = {}) {
       core.warning(`Skipping add_comment: max count of ${maxCount} reached`);
       return {
         success: false,
+        skipped: true,
         error: `Max count of ${maxCount} reached`,
       };
     }
@@ -358,12 +338,8 @@ async function main(config = {}) {
     processedCount++;
 
     // Merge resolved temp IDs
-    if (resolvedTemporaryIds) {
-      for (const [tempId, resolved] of Object.entries(resolvedTemporaryIds)) {
-        if (!temporaryIdMap.has(tempId)) {
-          temporaryIdMap.set(tempId, resolved);
-        }
-      }
+    for (const [tempId, resolved] of Object.entries(resolvedTemporaryIds ?? {})) {
+      if (!temporaryIdMap.has(tempId)) temporaryIdMap.set(tempId, resolved);
     }
 
     // Resolve and validate target repository
@@ -439,11 +415,21 @@ async function main(config = {}) {
         });
 
         if (!targetResult.success) {
-          core.warning(targetResult.error);
-          return {
-            success: false,
-            error: targetResult.error,
-          };
+          if (targetResult.shouldFail) {
+            core.warning(targetResult.error);
+            return {
+              success: false,
+              error: targetResult.error,
+            };
+          } else {
+            // No triggering context (e.g. schedule run) — silently skip rather than fail
+            core.info(targetResult.error);
+            return {
+              success: false,
+              skipped: true,
+              error: targetResult.error,
+            };
+          }
         }
 
         itemNumber = targetResult.number;
@@ -601,8 +587,10 @@ async function main(config = {}) {
       if (isDiscussion) {
         // When triggered by a discussion_comment event (without explicit item_number),
         // reply as a threaded comment to the triggering comment instead of posting top-level.
+        // GitHub Discussions only supports two nesting levels, so if the triggering comment is
+        // itself a reply, we resolve the top-level parent's node ID to use as replyToId.
         const hasExplicitItemNumber = message.item_number !== undefined && message.item_number !== null;
-        const replyToId = context.eventName === "discussion_comment" && !hasExplicitItemNumber ? context.payload?.comment?.node_id : null;
+        const replyToId = context.eventName === "discussion_comment" && !hasExplicitItemNumber ? await resolveTopLevelDiscussionCommentId(githubClient, context.payload?.comment?.node_id) : null;
         if (replyToId) {
           core.info(`Replying as threaded comment to discussion comment node ID: ${replyToId}`);
         }
@@ -624,7 +612,6 @@ async function main(config = {}) {
       const errorMessage = getErrorMessage(error);
 
       // Check if this is a 404 error (discussion/issue was deleted or wrong type)
-      // @ts-expect-error - Error handling with optional chaining
       const is404 = error?.status === 404 || errorMessage.includes("404") || errorMessage.toLowerCase().includes("not found");
 
       // If 404 and item_number was explicitly provided and we tried as issue/PR,
@@ -640,7 +627,6 @@ async function main(config = {}) {
           return recordComment(comment, true);
         } catch (discussionError) {
           const discussionErrorMessage = getErrorMessage(discussionError);
-          // @ts-expect-error - Error handling with optional chaining
           const isDiscussion404 = discussionError?.status === 404 || discussionErrorMessage.toLowerCase().includes("not found");
 
           if (isDiscussion404) {
