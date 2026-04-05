@@ -995,6 +995,63 @@ function formatToolCallAsDetails(options) {
 }
 
 /**
+ * Formats a tool result content into a preview string showing the first 2 non-empty lines.
+ * Uses tree-branch characters (├, └) for visual hierarchy in copilot-cli style.
+ *
+ * Examples:
+ *   1 line:  "   └ result text"
+ *   2 lines: "   ├ line 1\n   └ line 2"
+ *   3+ lines: "   ├ line 1\n   └ line 2 (+ 1 more)"
+ *
+ * @param {string} resultText - The result text to preview
+ * @param {number} [maxLineLength=80] - Maximum characters per preview line
+ * @returns {string} Formatted preview string, or empty string if no content
+ */
+function formatResultPreview(resultText, maxLineLength = 80) {
+  if (!resultText) return "";
+
+  // Scan line-by-line to avoid building a full array for large outputs.
+  // Normalize CRLF by stripping trailing \r from each line.
+  let firstLine = "";
+  let secondLine = "";
+  let nonEmptyLineCount = 0;
+  let start = 0;
+
+  while (start <= resultText.length) {
+    const newlineIndex = resultText.indexOf("\n", start);
+    const end = newlineIndex === -1 ? resultText.length : newlineIndex;
+    // Strip trailing \r to handle Windows CRLF line endings
+    const rawLine = resultText.substring(start, end).replace(/\r$/, "");
+
+    if (rawLine.trim()) {
+      nonEmptyLineCount += 1;
+      if (nonEmptyLineCount === 1) {
+        const truncated = rawLine.substring(0, maxLineLength);
+        firstLine = rawLine.length > maxLineLength ? truncated + "..." : truncated;
+      } else if (nonEmptyLineCount === 2) {
+        const truncated = rawLine.substring(0, maxLineLength);
+        secondLine = rawLine.length > maxLineLength ? truncated + "..." : truncated;
+      }
+    }
+
+    if (newlineIndex === -1) {
+      break;
+    }
+    start = newlineIndex + 1;
+  }
+
+  if (nonEmptyLineCount === 0) return "";
+  if (nonEmptyLineCount === 1) {
+    return `   └ ${firstLine}`;
+  }
+  if (nonEmptyLineCount === 2) {
+    return `   ├ ${firstLine}\n   └ ${secondLine}`;
+  }
+
+  return `   ├ ${firstLine}\n   └ ${secondLine} (+ ${nonEmptyLineCount - 2} more)`;
+}
+
+/**
  * Generates a lightweight plain text summary optimized for raw text rendering.
  * This is designed for console output (core.info) instead of markdown step summaries.
  *
@@ -1065,14 +1122,15 @@ function generatePlainTextSummary(logEntries, options = {}) {
               displayText = displayText.substring(0, MAX_AGENT_TEXT_LENGTH) + `... [truncated: showing first ${MAX_AGENT_TEXT_LENGTH} of ${text.length} chars]`;
             }
 
-            // Split into lines and add Agent prefix
+            // Split into lines: first line gets "◆ " prefix, continuation lines are indented
             const textLines = displayText.split("\n");
-            for (const line of textLines) {
+            for (let i = 0; i < textLines.length; i++) {
               if (conversationLineCount >= MAX_CONVERSATION_LINES) {
                 conversationTruncated = true;
                 break;
               }
-              lines.push(`Agent: ${line}`);
+              const prefix = i === 0 ? "◆ " : "  ";
+              lines.push(`${prefix}${textLines[i]}`);
               conversationLineCount++;
             }
             lines.push(""); // Add blank line after agent response
@@ -1100,38 +1158,28 @@ function generatePlainTextSummary(logEntries, options = {}) {
             const cmd = formatBashCommand(input.command || "");
             displayName = `$ ${cmd}`;
 
-            // Show result preview if available
+            // Show first 2 lines of result using copilot-cli tree-branch style
             if (toolResult && toolResult.content) {
               const resultText = typeof toolResult.content === "string" ? toolResult.content : String(toolResult.content);
-              const resultLines = resultText.split("\n").filter(l => l.trim());
-              if (resultLines.length > 0) {
-                const previewLine = resultLines[0].substring(0, 80);
-                if (resultLines.length > 1) {
-                  resultPreview = `   └ ${resultLines.length} lines...`;
-                } else if (previewLine) {
-                  resultPreview = `   └ ${previewLine}`;
-                }
-              }
+              resultPreview = formatResultPreview(resultText);
             }
           } else if (toolName.startsWith("mcp__")) {
             // Format MCP tool names like github-list_pull_requests
             const formattedName = formatMcpName(toolName).replace("::", "-");
             displayName = formatToolDisplayName(formattedName, input);
 
-            // Show result preview if available
+            // Show first 2 lines of result using copilot-cli tree-branch style
             if (toolResult && toolResult.content) {
               const resultText = typeof toolResult.content === "string" ? toolResult.content : JSON.stringify(toolResult.content);
-              const truncated = resultText.length > 80 ? resultText.substring(0, 80) + "..." : resultText;
-              resultPreview = `   └ ${truncated}`;
+              resultPreview = formatResultPreview(resultText);
             }
           } else {
             displayName = formatToolDisplayName(toolName, input);
 
-            // Show result preview if available
+            // Show first 2 lines of result using copilot-cli tree-branch style
             if (toolResult && toolResult.content) {
               const resultText = typeof toolResult.content === "string" ? toolResult.content : String(toolResult.content);
-              const truncated = resultText.length > 80 ? resultText.substring(0, 80) + "..." : resultText;
-              resultPreview = `   └ ${truncated}`;
+              resultPreview = formatResultPreview(resultText);
             }
           }
 
@@ -1140,7 +1188,7 @@ function generatePlainTextSummary(logEntries, options = {}) {
 
           if (resultPreview) {
             lines.push(resultPreview);
-            conversationLineCount++;
+            conversationLineCount += resultPreview.split("\n").length;
           }
 
           lines.push(""); // Add blank line after tool execution
@@ -1279,14 +1327,15 @@ function generateCopilotCliStyleSummary(logEntries, options = {}) {
               displayText = displayText.substring(0, MAX_AGENT_TEXT_LENGTH) + `... [truncated: showing first ${MAX_AGENT_TEXT_LENGTH} of ${text.length} chars]`;
             }
 
-            // Split into lines and add Agent prefix
+            // Split into lines: first line gets "◆ " prefix, continuation lines are indented
             const textLines = displayText.split("\n");
-            for (const line of textLines) {
+            for (let i = 0; i < textLines.length; i++) {
               if (conversationLineCount >= MAX_CONVERSATION_LINES) {
                 conversationTruncated = true;
                 break;
               }
-              lines.push(`Agent: ${line}`);
+              const prefix = i === 0 ? "◆ " : "  ";
+              lines.push(`${prefix}${textLines[i]}`);
               conversationLineCount++;
             }
             lines.push(""); // Add blank line after agent response
@@ -1314,38 +1363,28 @@ function generateCopilotCliStyleSummary(logEntries, options = {}) {
             const cmd = formatBashCommand(input.command || "");
             displayName = `$ ${cmd}`;
 
-            // Show result preview if available
+            // Show first 2 lines of result using copilot-cli tree-branch style
             if (toolResult && toolResult.content) {
               const resultText = typeof toolResult.content === "string" ? toolResult.content : String(toolResult.content);
-              const resultLines = resultText.split("\n").filter(l => l.trim());
-              if (resultLines.length > 0) {
-                const previewLine = resultLines[0].substring(0, 80);
-                if (resultLines.length > 1) {
-                  resultPreview = `   └ ${resultLines.length} lines...`;
-                } else if (previewLine) {
-                  resultPreview = `   └ ${previewLine}`;
-                }
-              }
+              resultPreview = formatResultPreview(resultText);
             }
           } else if (toolName.startsWith("mcp__")) {
             // Format MCP tool names like github-list_pull_requests
             const formattedName = formatMcpName(toolName).replace("::", "-");
             displayName = formatToolDisplayName(formattedName, input);
 
-            // Show result preview if available
+            // Show first 2 lines of result using copilot-cli tree-branch style
             if (toolResult && toolResult.content) {
               const resultText = typeof toolResult.content === "string" ? toolResult.content : JSON.stringify(toolResult.content);
-              const truncated = resultText.length > 80 ? resultText.substring(0, 80) + "..." : resultText;
-              resultPreview = `   └ ${truncated}`;
+              resultPreview = formatResultPreview(resultText);
             }
           } else {
             displayName = formatToolDisplayName(toolName, input);
 
-            // Show result preview if available
+            // Show first 2 lines of result using copilot-cli tree-branch style
             if (toolResult && toolResult.content) {
               const resultText = typeof toolResult.content === "string" ? toolResult.content : String(toolResult.content);
-              const truncated = resultText.length > 80 ? resultText.substring(0, 80) + "..." : resultText;
-              resultPreview = `   └ ${truncated}`;
+              resultPreview = formatResultPreview(resultText);
             }
           }
 
@@ -1354,7 +1393,7 @@ function generateCopilotCliStyleSummary(logEntries, options = {}) {
 
           if (resultPreview) {
             lines.push(resultPreview);
-            conversationLineCount++;
+            conversationLineCount += resultPreview.split("\n").length;
           }
 
           lines.push(""); // Add blank line after tool execution
@@ -1628,6 +1667,7 @@ module.exports = {
   formatToolUse,
   parseLogEntries,
   formatToolCallAsDetails,
+  formatResultPreview,
   generatePlainTextSummary,
   generateCopilotCliStyleSummary,
   wrapAgentLogInSection,

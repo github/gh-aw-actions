@@ -370,7 +370,7 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null, 
       yamlSnippet += `  ${yamlKey}:\n    protected-files: fallback-to-issue\n`;
     }
     yamlSnippet += "```\n";
-    context += "\n<details>\n<summary><b>⚙️ Configure <code>protected-files: fallback-to-issue</code></b></summary>\n\n";
+    context += "\n<details>\n<summary>⚙️ Configure <code>protected-files: fallback-to-issue</code></summary>\n\n";
     context += yamlSnippet;
     context += "</details>\n";
   }
@@ -421,7 +421,7 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null, 
       }
     }
 
-    context += "\n<details>\n<summary><b>📋 Apply the patch manually</b></summary>\n\n";
+    context += "\n<details>\n<summary>📋 Apply the patch manually</summary>\n\n";
     if (runId) {
       context += `\`\`\`sh
 # Download the patch artifact from the workflow run
@@ -756,6 +756,19 @@ function buildEngineFailureContext() {
 
     if (errorMessages.size > 0) {
       core.info(`Found ${errorMessages.size} engine error message(s) in agent-stdio.log`);
+
+      // Check for cyber_policy_violation specifically and return a dedicated message
+      const hasCyberPolicyViolation = Array.from(errorMessages).some(msg => msg.includes("cyber_policy_violation"));
+      if (hasCyberPolicyViolation) {
+        core.info("Detected cyber_policy_violation error — using dedicated context message");
+        const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/cyber_policy_violation.md`;
+        try {
+          return "\n" + renderTemplateFromFile(templatePath, {});
+        } catch {
+          // Template not available — fall through to generic engine failure message
+          core.info(`cyber_policy_violation template not found at ${templatePath}, using generic message`);
+        }
+      }
 
       let context = `\n**⚠️ Engine Failure**: The${engineLabel} engine terminated before producing output.\n\n**Error details:**\n`;
       for (const message of errorMessages) {
