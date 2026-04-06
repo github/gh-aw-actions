@@ -4,8 +4,8 @@
 /**
  * action_conclusion_otlp.cjs
  *
- * Sends a gh-aw.job.conclusion OTLP span (or a span named after the current
- * job).  Used by both:
+ * Sends a `gh-aw.<jobName>.conclusion` OTLP span (or `gh-aw.job.conclusion`
+ * when no job name is configured).  Used by both:
  *
  *   - actions/setup/post.js   (dev/release/action mode)
  *   - actions/setup/clean.sh  (script mode)
@@ -14,14 +14,22 @@
  *
  * Environment variables read:
  *   INPUT_JOB_NAME – job name from the `job-name` action input; when set the
- *                    span is named "gh-aw.job.<name>", otherwise
+ *                    span is named "gh-aw.<name>.conclusion", otherwise
  *                    "gh-aw.job.conclusion".
+ *   GH_AW_AGENT_CONCLUSION        – agent job result passed from the agent job
+ *                                   ("success", "failure", "timed_out", etc.);
+ *                                   "failure" and "timed_out" set the span
+ *                                   status to STATUS_CODE_ERROR.
+ *   GITHUB_AW_OTEL_JOB_START_MS   – epoch ms written by action_setup_otlp.cjs when
+ *                                   setup finished; used as the span startMs so the
+ *                                   conclusion span duration covers the actual job
+ *                                   execution window rather than this step's overhead.
  *   GITHUB_AW_OTEL_TRACE_ID       – parent trace ID (set by action_setup_otlp.cjs)
  *   GITHUB_AW_OTEL_PARENT_SPAN_ID – parent span ID (set by action_setup_otlp.cjs)
  *   OTEL_EXPORTER_OTLP_ENDPOINT   – OTLP endpoint (no-op when not set)
  */
 
-const path = require("path");
+const sendOtlpSpan = require("./send_otlp_span.cjs");
 
 /**
  * Send the OTLP job-conclusion span.  Non-fatal: all errors are silently
@@ -35,11 +43,18 @@ async function run() {
     return;
   }
 
-  const spanName = process.env.INPUT_JOB_NAME ? `gh-aw.job.${process.env.INPUT_JOB_NAME}` : "gh-aw.job.conclusion";
+  // Read the job-start timestamp written by action_setup_otlp so the conclusion
+  // span duration covers the actual job execution window, not just this step's overhead.
+  const rawJobStartMs = parseInt(process.env.GITHUB_AW_OTEL_JOB_START_MS || "0", 10);
+  const startMs = rawJobStartMs > 0 ? rawJobStartMs : undefined;
+
+  // Normalize job-name input: handle both INPUT_JOB_NAME (underscore, standard)
+  // and INPUT_JOB-NAME (hyphen, used by some runner versions).
+  const jobName = (process.env.INPUT_JOB_NAME || process.env["INPUT_JOB-NAME"] || "").trim();
+  const spanName = jobName ? `gh-aw.${jobName}.conclusion` : "gh-aw.job.conclusion";
   console.log(`[otlp] sending conclusion span "${spanName}" to ${endpoint}`);
 
-  const { sendJobConclusionSpan } = require(path.join(__dirname, "send_otlp_span.cjs"));
-  await sendJobConclusionSpan(spanName);
+  await sendOtlpSpan.sendJobConclusionSpan(spanName, { startMs });
   console.log(`[otlp] conclusion span sent`);
 }
 

@@ -4,7 +4,7 @@
 /**
  * action_setup_otlp.cjs
  *
- * Sends a gh-aw.job.setup OTLP span and writes the trace/span IDs to
+ * Sends a `gh-aw.<jobName>.setup` OTLP span and writes the trace/span IDs to
  * GITHUB_OUTPUT and GITHUB_ENV.  Used by both:
  *
  *   - actions/setup/index.js  (dev/release/action mode)
@@ -17,10 +17,17 @@
  *   GITHUB_OUTPUT   – path to the GitHub Actions output file
  *   GITHUB_ENV      – path to the GitHub Actions env file
  *   INPUT_*         – standard GitHub Actions input env vars (read by sendJobSetupSpan)
+ *
+ * Environment variables written:
+ *   GITHUB_AW_OTEL_TRACE_ID        – resolved trace ID (for cross-job correlation)
+ *   GITHUB_AW_OTEL_PARENT_SPAN_ID  – setup span ID (links conclusion span as child)
+ *   GITHUB_AW_OTEL_JOB_START_MS    – epoch ms when setup finished (used by conclusion
+ *                                     span to measure actual job execution duration)
  */
 
 const path = require("path");
 const { appendFileSync } = require("fs");
+const { nowMs } = require("./performance_now.cjs");
 
 /**
  * Send the OTLP job-setup span and propagate trace context via GITHUB_OUTPUT /
@@ -48,6 +55,18 @@ async function run() {
     console.log(`[otlp] INPUT_TRACE_ID=${inputTraceId} (will reuse activation trace)`);
   } else {
     console.log("[otlp] INPUT_TRACE_ID not set, a new trace ID will be generated");
+  }
+
+  // Normalize job-name input: handle both INPUT_JOB_NAME (underscore, standard)
+  // and INPUT_JOB-NAME (hyphen, used by some runner versions).  Mirror the same
+  // two-key lookup that INPUT_TRACE_ID uses above so script-mode invocations
+  // (setup.sh → node action_setup_otlp.cjs) always resolve the job name even
+  // when the runner preserves the original hyphen in the env var name.
+  const inputJobName = (process.env.INPUT_JOB_NAME || process.env["INPUT_JOB-NAME"] || "").trim();
+  if (inputJobName) {
+    // Normalise to the canonical underscore form so sendJobSetupSpan (which
+    // reads process.env.INPUT_JOB_NAME) always finds the value.
+    process.env.INPUT_JOB_NAME = inputJobName;
   }
 
   if (!endpoint) {
@@ -83,6 +102,11 @@ async function run() {
       appendFileSync(process.env.GITHUB_ENV, `GITHUB_AW_OTEL_PARENT_SPAN_ID=${spanId}\n`);
       console.log(`[otlp] GITHUB_AW_OTEL_PARENT_SPAN_ID written to GITHUB_ENV`);
     }
+    // Propagate setup-end timestamp so the conclusion span can measure actual
+    // job execution duration (setup-end → conclusion-start).
+    const setupEndMs = Math.round(nowMs());
+    appendFileSync(process.env.GITHUB_ENV, `GITHUB_AW_OTEL_JOB_START_MS=${setupEndMs}\n`);
+    console.log(`[otlp] GITHUB_AW_OTEL_JOB_START_MS written to GITHUB_ENV`);
   }
 }
 

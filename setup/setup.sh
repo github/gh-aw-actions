@@ -216,6 +216,7 @@ MCP_SCRIPTS_FILES=(
   "read_buffer.cjs"
   "generate_mcp_scripts_config.cjs"
   "setup_globals.cjs"
+  "github_rate_limit_logger.cjs"
   "error_helpers.cjs"
   "error_codes.cjs"
   "constants.cjs"
@@ -288,6 +289,7 @@ SAFE_OUTPUTS_FILES=(
   "write_large_content_to_file.cjs"
   "generate_compact_schema.cjs"
   "setup_globals.cjs"
+  "github_rate_limit_logger.cjs"
   "error_helpers.cjs"
   "error_codes.cjs"
   "constants.cjs"
@@ -405,7 +407,7 @@ fi
 # Skipped when GH_AW_SKIP_SETUP_OTLP=1 because index.js will send the span itself.
 if [ -z "${GH_AW_SKIP_SETUP_OTLP}" ] && command -v node &>/dev/null && [ -f "${DESTINATION}/action_setup_otlp.cjs" ]; then
   debug_log "Sending OTLP setup span..."
-  SETUP_START_MS="${SETUP_START_MS}" INPUT_TRACE_ID="${INPUT_TRACE_ID:-}" node "${DESTINATION}/action_setup_otlp.cjs" || true
+  SETUP_START_MS="${SETUP_START_MS}" INPUT_TRACE_ID="${INPUT_TRACE_ID:-}" INPUT_JOB_NAME="${INPUT_JOB_NAME:-}" node "${DESTINATION}/action_setup_otlp.cjs" || true
   debug_log "OTLP setup span step complete"
 fi
 
