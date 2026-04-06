@@ -60,7 +60,7 @@ function collectObservabilityData() {
   const agentOutput = readJSONIfExists(AGENT_OUTPUT_PATH) || { items: [], errors: [] };
   const items = Array.isArray(agentOutput.items) ? agentOutput.items : [];
   const errors = Array.isArray(agentOutput.errors) ? agentOutput.errors : [];
-  const traceId = awInfo.context && typeof awInfo.context.workflow_call_id === "string" ? awInfo.context.workflow_call_id : "";
+  const traceId = awInfo.context ? awInfo.context.otel_trace_id || awInfo.context.workflow_call_id || "" : "";
 
   return {
     workflowName: awInfo.workflow_name || "",
@@ -114,12 +114,6 @@ function buildObservabilitySummary(data) {
 }
 
 async function main(core) {
-  const mode = process.env.GH_AW_OBSERVABILITY_JOB_SUMMARY || "";
-  if (mode !== "on") {
-    core.info(`Skipping observability summary: mode=${mode || "unset"}`);
-    return;
-  }
-
   const data = collectObservabilityData();
   const markdown = buildObservabilitySummary(data);
   await core.summary.addRaw(markdown).write();

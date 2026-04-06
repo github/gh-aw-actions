@@ -2,6 +2,7 @@
 /// <reference types="@actions/github-script" />
 
 const { ERR_API, ERR_CONFIG, ERR_VALIDATION } = require("./error_codes.cjs");
+const { writeDenialSummary } = require("./pre_activation_summary.cjs");
 
 /**
  * Check if command is the first word in the triggering text
@@ -100,6 +101,10 @@ async function main() {
       core.warning(`⚠️ None of the commands [${expectedCommands}] matched the first word (found: '${firstWord}'). Workflow will be skipped.`);
       core.setOutput("command_position_ok", "false");
       core.setOutput("matched_command", "");
+      await writeDenialSummary(
+        `The trigger comment did not start with a required command. Expected one of: ${expectedCommands}. Found: \`${firstWord}\`.`,
+        "Make sure the trigger comment starts with the required command defined in `on.command:` in the workflow frontmatter."
+      );
     }
   } catch (error) {
     core.setFailed(`${ERR_API}: ${getErrorMessage(error)}`);
