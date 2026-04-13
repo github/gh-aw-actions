@@ -10,6 +10,7 @@ const { sanitizeContent } = require("./sanitize_content.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
+const { validateTargetRepo, resolveTargetRepoConfig } = require("./repo_helpers.cjs");
 
 /**
  * @typedef {'issue' | 'pull_request'} EntityType
@@ -205,9 +206,10 @@ function escapeMarkdownTitle(title) {
 
 /**
  * @typedef {Object} CloseEntityHandlerCallbacks
- * @property {(item: Object, config: Object) => ({success: true, entityNumber: number, owner: string, repo: string, entityRepo?: string} | {success: false, error: string})} resolveTarget
+ * @property {(item: Object, config: Object, resolvedTemporaryIds?: any) => ({success: true, entityNumber: number, owner: string, repo: string, entityRepo?: string} | {success: false, error: string, deferred?: boolean})} resolveTarget
  *   Resolves the entity number and target repository from the message and handler config.
- *   The factory passes both `item` and `config`; implementations may ignore `config` if not needed.
+ *   The factory passes `item`, `config`, and `resolvedTemporaryIds`; implementations may ignore
+ *   `config` or `resolvedTemporaryIds` if not needed.
  * @property {(github: any, owner: string, repo: string, entityNumber: number) => Promise<{number: number, title: string, labels: Array<{name: string}>, html_url: string, state: string}>} getDetails
  *   Fetches entity details from the GitHub API.
  * @property {(entity: Object, entityNumber: number, requiredLabels: string[]) => {valid: true} | {valid: false, warning?: string, error: string}} validateLabels
@@ -262,6 +264,7 @@ function createCloseEntityHandler(config, entityConfig, callbacks, githubClient)
   const maxCount = config.max || 10;
   const comment = config.comment || "";
   const isStaged = isStagedMode(config);
+  const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
 
   let processedCount = 0;
 
@@ -308,14 +311,22 @@ function createCloseEntityHandler(config, entityConfig, callbacks, githubClient)
     commentToPost = sanitizeContent(commentToPost);
 
     // 4. Target repository / entity number resolution
-    const targetResult = callbacks.resolveTarget(item, config);
+    const targetResult = callbacks.resolveTarget(item, config, resolvedTemporaryIds);
     if (!targetResult.success) {
       core.warning(`Skipping ${entityConfig.itemType}: ${targetResult.error}`);
-      return { success: false, error: targetResult.error };
+      return { success: false, deferred: targetResult.deferred || false, error: targetResult.error };
     }
     const { entityNumber, owner, repo: repoName, entityRepo } = targetResult;
     if (entityRepo) {
       core.info(`Target repository: ${entityRepo}`);
+    }
+
+    // 4b. Cross-repository allowlist validation (SEC-005)
+    const resolvedRepo = `${owner}/${repoName}`;
+    const repoValidation = validateTargetRepo(resolvedRepo, defaultTargetRepo, allowedRepos);
+    if (!repoValidation.valid) {
+      core.warning(`Skipping ${entityConfig.itemType}: cross-repo check failed for "${resolvedRepo}": ${repoValidation.error}`);
+      return { success: false, error: repoValidation.error };
     }
 
     try {
