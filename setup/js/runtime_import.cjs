@@ -270,10 +270,13 @@ function evaluateExpression(expr) {
     return evaluateExpression(rightExpr);
   }
 
-  // Check if this is a needs.* or steps.* expression that should be looked up from environment variables
+  // Check if this is a needs.*, steps.*, or inputs.* expression that should be looked up from environment variables
   // The compiler extracts these expressions and makes them available as GH_AW_* environment variables
   // For example: needs.search_issues.outputs.issue_list → GH_AW_NEEDS_SEARCH_ISSUES_OUTPUTS_ISSUE_LIST
-  if (trimmed.startsWith("needs.") || trimmed.startsWith("steps.")) {
+  // For inputs: inputs.errors → GH_AW_INPUTS_ERRORS
+  // This is required for workflow_call where inputs are not in context.payload.inputs;
+  // for workflow_dispatch, context.payload.inputs is populated but the env var lookup takes precedence.
+  if (trimmed.startsWith("needs.") || trimmed.startsWith("steps.") || trimmed.startsWith("inputs.")) {
     // Convert expression to environment variable name
     // e.g., "needs.search_issues.outputs.issue_list" → "GH_AW_NEEDS_SEARCH_ISSUES_OUTPUTS_ISSUE_LIST"
     const envVarName = "GH_AW_" + trimmed.toUpperCase().replace(/\./g, "_");
@@ -647,20 +650,20 @@ function wrapExpressionsInTemplateConditionals(content) {
       return match;
     }
 
+    // Boolean/null literals are self-evaluating — the template renderer's isTruthy()
+    // handles them directly. Wrapping them would create __GH_AW_TRUE__/__GH_AW_FALSE__/__GH_AW_NULL__
+    // placeholders that cannot be resolved at runtime (no corresponding env var is set),
+    // causing the placeholder validator to flag them as unsubstituted.
+    if (trimmed === "true" || trimmed === "false" || trimmed === "null") {
+      return match;
+    }
+
     // Only wrap expressions that look like GitHub Actions expressions
     // GitHub Actions expressions typically start with a letter and contain dots
-    // (e.g., github.actor, github.event.issue.number) or specific keywords (true, false, null).
+    // (e.g., github.actor, github.event.issue.number).
     // Expressions starting with non-alphabetic characters (e.g., "...") are NOT GitHub expressions.
     const looksLikeGitHubExpr =
-      (/^[a-zA-Z]/.test(trimmed) && trimmed.includes(".")) ||
-      trimmed === "true" ||
-      trimmed === "false" ||
-      trimmed === "null" ||
-      trimmed.startsWith("github.") ||
-      trimmed.startsWith("needs.") ||
-      trimmed.startsWith("steps.") ||
-      trimmed.startsWith("env.") ||
-      trimmed.startsWith("inputs.");
+      (/^[a-zA-Z]/.test(trimmed) && trimmed.includes(".")) || trimmed.startsWith("github.") || trimmed.startsWith("needs.") || trimmed.startsWith("steps.") || trimmed.startsWith("env.") || trimmed.startsWith("inputs.");
 
     if (!looksLikeGitHubExpr) {
       // Not a GitHub Actions expression, leave as-is

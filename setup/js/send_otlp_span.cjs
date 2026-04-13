@@ -104,6 +104,7 @@ const SPAN_KIND_CONSUMER = 5;
  * @property {number} [statusCode]      - OTLP status code: 0=UNSET, 1=OK, 2=ERROR (defaults to 1)
  * @property {string} [statusMessage]   - Human-readable status message (included when statusCode is 2)
  * @property {number} [kind]            - OTLP SpanKind: use SPAN_KIND_* constants. Defaults to SPAN_KIND_INTERNAL (1).
+ * @property {Array<{timeUnixNano: string, name: string, attributes: Array<{key: string, value: object}>}>} [events] - Span events following the OTel events spec (e.g. exception events).
  */
 
 /**
@@ -112,7 +113,7 @@ const SPAN_KIND_CONSUMER = 5;
  * @param {OTLPSpanOptions} opts
  * @returns {object} - Ready to be serialised as JSON and POSTed to `/v1/traces`
  */
-function buildOTLPPayload({ traceId, spanId, parentSpanId, spanName, startMs, endMs, serviceName, scopeVersion, attributes, resourceAttributes, statusCode, statusMessage, kind = SPAN_KIND_INTERNAL }) {
+function buildOTLPPayload({ traceId, spanId, parentSpanId, spanName, startMs, endMs, serviceName, scopeVersion, attributes, resourceAttributes, statusCode, statusMessage, kind = SPAN_KIND_INTERNAL, events }) {
   const code = typeof statusCode === "number" ? statusCode : 1; // STATUS_CODE_OK
   /** @type {{ code: number, message?: string }} */
   const status = { code };
@@ -144,6 +145,7 @@ function buildOTLPPayload({ traceId, spanId, parentSpanId, spanName, startMs, en
                 endTimeUnixNano: toNanoString(endMs),
                 status,
                 attributes,
+                ...(events && events.length > 0 ? { events } : {}),
               },
             ],
           },
@@ -270,8 +272,9 @@ function sanitizeAttrs(attrs) {
 /**
  * Sanitize an OTLP traces payload before sending it over the wire.
  *
- * Walks the `resourceSpans[].resource.attributes` and
- * `resourceSpans[].scopeSpans[].spans[].attributes` arrays and applies
+ * Walks the `resourceSpans[].resource.attributes`,
+ * `resourceSpans[].scopeSpans[].spans[].attributes`, and
+ * `resourceSpans[].scopeSpans[].spans[].events[].attributes` arrays and applies
  * {@link sanitizeAttrs} to each, redacting values for sensitive keys and
  * truncating excessively long string values.
  *
@@ -290,7 +293,13 @@ function sanitizeOTLPPayload(payload) {
       scopeSpans: Array.isArray(rs.scopeSpans)
         ? rs.scopeSpans.map(ss => ({
             ...ss,
-            spans: Array.isArray(ss.spans) ? ss.spans.map(span => ({ ...span, attributes: sanitizeAttrs(span.attributes) })) : ss.spans,
+            spans: Array.isArray(ss.spans)
+              ? ss.spans.map(span => ({
+                  ...span,
+                  attributes: sanitizeAttrs(span.attributes),
+                  events: Array.isArray(span.events) ? span.events.map(ev => ({ ...ev, attributes: sanitizeAttrs(ev.attributes) })) : span.events,
+                }))
+              : ss.spans,
           }))
         : rs.scopeSpans,
     })),
@@ -310,12 +319,16 @@ function sanitizeOTLPPayload(payload) {
  *
  * @param {string} endpoint  - OTLP base URL (e.g. https://traces.example.com:4317)
  * @param {object} payload   - Serialisable OTLP JSON object
- * @param {{ maxRetries?: number, baseDelayMs?: number }} [opts]
+ * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean }} [opts]
  * @returns {Promise<void>}
  */
-async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 100 } = {}) {
+async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 100, skipJSONL = false } = {}) {
   // Mirror payload locally so it survives even when the collector is unreachable.
-  appendToOTLPJSONL(payload);
+  // Callers that already wrote the JSONL mirror pass skipJSONL: true to avoid a
+  // duplicate line.
+  if (!skipJSONL) {
+    appendToOTLPJSONL(payload);
+  }
 
   const url = endpoint.replace(/\/$/, "") + "/v1/traces";
   const extraHeaders = parseOTLPHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS || "");
@@ -463,11 +476,8 @@ async function sendJobSetupSpan(options = {}) {
   // scripts to establish the correct parent span context.
   const spanId = generateSpanId();
 
-  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "";
-  if (!endpoint) {
-    return { traceId, spanId };
-  }
-
+  // Build the full payload unconditionally so the JSONL mirror is always written,
+  // enabling artifact-based debugging even without a live OTLP collector.
   const startMs = options.startMs ?? nowMs();
   const endMs = nowMs();
 
@@ -494,6 +504,9 @@ async function sendJobSetupSpan(options = {}) {
 
   if (engineId) {
     attributes.push(buildAttr("gh-aw.engine.id", engineId));
+  }
+  if (eventName) {
+    attributes.push(buildAttr("gh-aw.event_name", eventName));
   }
 
   const resourceAttributes = [buildAttr("github.repository", repository), buildAttr("github.run_id", runId)];
@@ -525,7 +538,16 @@ async function sendJobSetupSpan(options = {}) {
     resourceAttributes,
   });
 
-  await sendOTLPSpan(endpoint, payload);
+  // Always mirror to JSONL — the artifact is useful even without a live collector.
+  appendToOTLPJSONL(payload);
+
+  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "";
+  if (!endpoint) {
+    return { traceId, spanId };
+  }
+
+  // Pass skipJSONL: true so sendOTLPSpan doesn't double-write the mirror.
+  await sendOTLPSpan(endpoint, payload, { skipJSONL: true });
   return { traceId, spanId };
 }
 
@@ -595,8 +617,11 @@ function readLastRateLimitEntry() {
  * setup action.  The span carries workflow metadata read from `aw_info.json`
  * and the effective token count from `GH_AW_EFFECTIVE_TOKENS`.
  *
- * This is a no-op when `OTEL_EXPORTER_OTLP_ENDPOINT` is not set.  All errors
- * are surfaced as `console.warn` messages and never re-thrown.
+ * The span payload is always built and mirrored to the local JSONL file so
+ * that it can be inspected via GitHub Actions artifacts without needing a live
+ * collector.  The HTTP export to the OTLP endpoint is skipped when
+ * `OTEL_EXPORTER_OTLP_ENDPOINT` is not set.  All errors are surfaced as
+ * `console.warn` messages and never re-thrown.
  *
  * Environment variables consumed:
  * - `OTEL_EXPORTER_OTLP_ENDPOINT`  – collector endpoint
@@ -623,11 +648,6 @@ function readLastRateLimitEntry() {
  * @returns {Promise<void>}
  */
 async function sendJobConclusionSpan(spanName, options = {}) {
-  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "";
-  if (!endpoint) {
-    return;
-  }
-
   const startMs = options.startMs ?? nowMs();
 
   // Read workflow metadata from aw_info.json (written by the agent job setup step).
@@ -699,6 +719,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   if (jobName) attributes.push(buildAttr("gh-aw.job.name", jobName));
   if (engineId) attributes.push(buildAttr("gh-aw.engine.id", engineId));
   if (model) attributes.push(buildAttr("gh-aw.model", model));
+  if (eventName) attributes.push(buildAttr("gh-aw.event_name", eventName));
   attributes.push(buildAttr("gh-aw.staged", staged));
   if (!isNaN(effectiveTokens) && effectiveTokens > 0) {
     attributes.push(buildAttr("gh-aw.effective_tokens", effectiveTokens));
@@ -750,6 +771,31 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   }
   resourceAttributes.push(buildAttr("deployment.environment", staged ? "staging" : "production"));
 
+  // Build OTel exception span events — one per error — following the
+  // OpenTelemetry semantic convention for exceptions.  Each event has
+  // name="exception" with "exception.type" and "exception.message" attributes,
+  // making individual errors queryable and classifiable in backends like
+  // Grafana Tempo, Honeycomb, and Datadog.
+  const errorTimeNano = toNanoString(nowMs());
+  const spanEvents = isAgentFailure
+    ? outputErrors
+        .map(e => (e && typeof e.message === "string" ? e.message : String(e)))
+        .filter(Boolean)
+        .map(msg => {
+          // Extract colon-prefixed type when available ("push_to_pull_request_branch:...")
+          const colonIdx = msg.indexOf(":");
+          const prefix = msg.slice(0, colonIdx);
+          const hasValidPrefix = colonIdx > 0 && colonIdx < 64 && /^[a-z_][a-z0-9_.]*$/i.test(prefix);
+          const exceptionType = hasValidPrefix ? `gh-aw.${prefix.toLowerCase()}` : "gh-aw.AgentError";
+          const exceptionMessage = (hasValidPrefix ? msg.slice(colonIdx + 1).trim() : msg).slice(0, MAX_ATTR_VALUE_LENGTH);
+          return {
+            timeUnixNano: errorTimeNano,
+            name: "exception",
+            attributes: [buildAttr("exception.type", exceptionType), buildAttr("exception.message", exceptionMessage)],
+          };
+        })
+    : [];
+
   const payload = buildOTLPPayload({
     traceId,
     spanId: generateSpanId(),
@@ -763,9 +809,19 @@ async function sendJobConclusionSpan(spanName, options = {}) {
     resourceAttributes,
     statusCode,
     statusMessage,
+    events: spanEvents,
   });
 
-  await sendOTLPSpan(endpoint, payload);
+  // Always mirror to JSONL — the artifact is useful even without a live collector.
+  appendToOTLPJSONL(payload);
+
+  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "";
+  if (!endpoint) {
+    return;
+  }
+
+  // Pass skipJSONL: true so sendOTLPSpan doesn't double-write the mirror.
+  await sendOTLPSpan(endpoint, payload, { skipJSONL: true });
 }
 
 module.exports = {
