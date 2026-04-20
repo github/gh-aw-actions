@@ -66,9 +66,9 @@ function shellEscapeDoubleQuoted(str) {
 /**
  * Rewrite a raw gateway manifest URL to use the container-accessible domain.
  *
- * The manifest stores raw gateway-output URLs (e.g., http://0.0.0.0:80/mcp/server)
+ * The manifest stores raw gateway-output URLs (e.g., http://0.0.0.0:8080/mcp/server)
  * that work from the host. Inside the AWF sandbox the gateway is reachable via
- * MCP_GATEWAY_DOMAIN:MCP_GATEWAY_PORT (typically host.docker.internal:80).
+ * MCP_GATEWAY_DOMAIN:MCP_GATEWAY_PORT (typically host.docker.internal:8080).
  *
  * @param {string} rawUrl - URL from the manifest (host-accessible)
  * @returns {string} URL suitable for use inside AWF containers
@@ -147,6 +147,53 @@ function httpPostJSON(urlStr, headers, body, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS
 }
 
 /**
+ * Parse an MCP response body that may be JSON or Server-Sent Events (SSE).
+ *
+ * Some MCP gateway responses are streamed as SSE and contain lines like:
+ *   data: {"jsonrpc":"2.0","id":3,"result":{...}}
+ *
+ * @param {unknown} body - Parsed response body from httpPostJSON
+ * @returns {unknown}
+ */
+function parseMCPResponseBody(body) {
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    return body;
+  }
+  if (typeof body !== "string") {
+    return null;
+  }
+
+  const trimmed = body.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Fall through to SSE parsing.
+  }
+
+  /** @type {unknown} */
+  let lastDataMessage = null;
+  for (const line of trimmed.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) {
+      continue;
+    }
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") {
+      continue;
+    }
+    try {
+      lastDataMessage = JSON.parse(payload);
+    } catch {
+      // Ignore non-JSON SSE data lines.
+    }
+  }
+  return lastDataMessage;
+}
+
+/**
  * Query the tools list from an MCP server via JSON-RPC.
  * Follows the standard MCP handshake: initialize → notifications/initialized → tools/list.
  *
@@ -196,7 +243,7 @@ async function fetchMCPTools(serverUrl, apiKey, core) {
   // Step 3: tools/list – get the available tool definitions
   try {
     const listResp = await httpPostJSON(serverUrl, { ...authHeaders, ...sessionHeader }, { jsonrpc: "2.0", id: 2, method: "tools/list" }, DEFAULT_HTTP_TIMEOUT_MS);
-    const respBody = listResp.body;
+    const respBody = parseMCPResponseBody(listResp.body);
     if (respBody && typeof respBody === "object" && "result" in respBody && respBody.result && typeof respBody.result === "object") {
       const result = respBody.result;
       if ("tools" in result && Array.isArray(result.tools)) {
@@ -338,7 +385,7 @@ async function main() {
       skippedServers.push(name);
       continue;
     }
-    // The manifest URL is the host-accessible raw gateway address (e.g., http://0.0.0.0:80/mcp/server).
+    // The manifest URL is the host-accessible raw gateway address (e.g., http://0.0.0.0:8080/mcp/server).
     // Rewrite it to the container-accessible URL for the generated CLI wrapper scripts,
     // which run inside the AWF sandbox where the gateway is reached via MCP_GATEWAY_DOMAIN.
     const containerUrl = toContainerUrl(url);
@@ -396,4 +443,4 @@ async function main() {
   core.setOutput("mounted-servers", mountedServers.join(","));
 }
 
-module.exports = { main, fetchMCPTools, generateCLIWrapperScript, isValidServerName, shellEscapeDoubleQuoted };
+module.exports = { main, fetchMCPTools, generateCLIWrapperScript, isValidServerName, shellEscapeDoubleQuoted, parseMCPResponseBody };

@@ -82,6 +82,7 @@ interface CreatePullRequestConfig extends SafeOutputConfig {
   "title-prefix"?: string;
   labels?: string[];
   reviewers?: string | string[];
+  "team-reviewers"?: string | string[];
   assignees?: string | string[];
   draft?: boolean;
   "if-no-changes"?: string;
@@ -161,6 +162,7 @@ interface AddLabelsConfig extends SafeOutputConfig {
  */
 interface AddReviewerConfig extends SafeOutputConfig {
   reviewers?: string[];
+  "team-reviewers"?: string[];
   target?: string;
 }
 
@@ -202,6 +204,17 @@ interface PushToPullRequestBranchConfig extends SafeOutputConfig {
   "title-prefix"?: string;
   labels?: string[];
   "if-no-changes"?: string;
+}
+
+/**
+ * Configuration for merging pull requests with policy checks.
+ */
+interface MergePullRequestConfig extends SafeOutputConfig {
+  "required-labels"?: string[];
+  "allowed-labels"?: string[];
+  "allowed-branches"?: string[];
+  "allowed-files"?: string[];
+  "protected-files"?: string[];
 }
 
 /**
@@ -333,6 +346,7 @@ type SpecificSafeOutputConfig =
   | AddReviewerConfig
   | UpdateIssueConfig
   | UpdatePullRequestConfig
+  | MergePullRequestConfig
   | PushToPullRequestBranchConfig
   | UploadAssetConfig
   | AssignMilestoneConfig
@@ -369,6 +383,7 @@ export {
   AddReviewerConfig,
   UpdateIssueConfig,
   UpdatePullRequestConfig,
+  MergePullRequestConfig,
   PushToPullRequestBranchConfig,
   UploadAssetConfig,
   AssignMilestoneConfig,
