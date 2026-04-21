@@ -239,8 +239,8 @@ jobs:
             fi
           done
 
-          # setup/js/package-lock.json is generated from local npm installs and is not a source file
-          # for this repository, so remove it after each sync to keep the destination clean.
+          # gh-aw-actions mirrors runtime action scripts only; JS dependency management (including
+          # package-lock.json) stays in github/gh-aw, so remove this generated lockfile after sync.
           rm -f "gh-aw-actions/setup/js/package-lock.json"
 
           echo "::endgroup::"
