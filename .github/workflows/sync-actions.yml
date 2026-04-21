@@ -239,6 +239,9 @@ jobs:
             fi
           done
 
+          # package-lock.json should not be tracked in this repository's setup/js action folder.
+          rm -f "gh-aw-actions/setup/js/package-lock.json"
+
           echo "::endgroup::"
 
       - name: Log destination after sync
