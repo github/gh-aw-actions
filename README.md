@@ -4,4 +4,4 @@ This repository contains custom GitHub Actions for the gh-aw project. These acti
 
 The version tags in this repository are aligned with the main gh-aw repository.
 
-See https://github.com/github/gh-aw for all other details.
+See https://github.com/github/gh-aw for all other details, issues or feature requests.
