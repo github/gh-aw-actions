@@ -555,6 +555,7 @@ async function main(config = {}) {
     // token on multi-commit branches where workflow files may have been modified).
     let newCommitCount = 0;
     let remoteHeadBeforePatch = "";
+    let pushedCommitSha = "";
     if (hasChanges) {
       // Capture HEAD before applying changes to compute new-commit count later
       try {
@@ -736,7 +737,7 @@ async function main(config = {}) {
 
       // Push the applied commits to the branch using signed GraphQL commits (outside patch try/catch so push failures are not misattributed)
       try {
-        await pushSignedCommits({
+        const pushedSha = await pushSignedCommits({
           githubClient,
           owner: repoParts.owner,
           repo: repoParts.repo,
@@ -745,6 +746,10 @@ async function main(config = {}) {
           cwd: process.cwd(),
           gitAuthEnv,
         });
+        if (pushedSha) {
+          pushedCommitSha = pushedSha;
+          core.info(`pushSignedCommits returned pushed SHA: ${pushedSha}`);
+        }
         core.info(`Changes committed and pushed to branch: ${branchName}`);
       } catch (pushError) {
         const pushErrorMessage = getErrorMessage(pushError);
@@ -856,12 +861,16 @@ async function main(config = {}) {
       }
     }
 
-    // Get commit SHA and push URL
-    const commitShaRes = await exec.getExecOutput("git", ["rev-parse", "HEAD"]);
-    if (commitShaRes.exitCode !== 0) {
-      return { success: false, error: "Failed to get commit SHA" };
+    // The signed-push helper returns the commit SHA that landed on the branch.
+    // Fall back to local HEAD only if the helper did not return one.
+    let commitSha = pushedCommitSha;
+    if (!commitSha) {
+      const commitShaRes = await exec.getExecOutput("git", ["rev-parse", "HEAD"]);
+      if (commitShaRes.exitCode !== 0) {
+        return { success: false, error: "Failed to get commit SHA" };
+      }
+      commitSha = commitShaRes.stdout.trim();
     }
-    const commitSha = commitShaRes.stdout.trim();
 
     // Get repository base URL and construct URLs
     // For cross-repo scenarios, use repoParts (the target repo) not context.repo (the workflow repo)

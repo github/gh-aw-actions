@@ -486,10 +486,37 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // Get base branch for the resolved target repository
     const baseBranch = await getBaseBranch(repoParts);
 
+    // Determine the working directory for git operations
+    // If repo is specified, find where it's checked out
+    let repoCwd = null;
+    if (entry.repo && entry.repo.trim()) {
+      const repoSlug = repoResult.repo;
+      const checkoutResult = findRepoCheckout(repoSlug);
+      if (!checkoutResult.success) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "error",
+                error:
+                  `Repository checkout not found for ${repoSlug}. Ensure the repository is checked out in this workflow using actions/checkout. ` +
+                  "If checking out multiple repositories, use the 'path' input so the checkout can be located.",
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      repoCwd = checkoutResult.path;
+      entry.repo_cwd = repoCwd;
+      server.debug(`Selected checkout folder for ${repoSlug}: ${repoCwd}`);
+    }
+
     // If branch is not provided, is empty, or equals the base branch, use the current branch from git
     // This handles cases where the agent incorrectly passes the base branch instead of the working branch
     if (!entry.branch || entry.branch.trim() === "" || entry.branch === baseBranch) {
-      const detectedBranch = getCurrentBranch();
+      const detectedBranch = getCurrentBranch(repoCwd);
 
       if (entry.branch === baseBranch) {
         server.debug(`Branch equals base branch (${baseBranch}), detecting actual working branch: ${detectedBranch}`);
@@ -507,6 +534,10 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
     // Build common options for both patch and bundle generation
     const pushTransportOptions = { mode: "incremental" };
+    if (repoCwd) {
+      pushTransportOptions.cwd = repoCwd;
+      pushTransportOptions.repoSlug = repoResult.repo;
+    }
     // Pass per-handler token so cross-repo PATs are used for git fetch when configured.
     // Falls back to GITHUB_TOKEN if not set.
     if (pushConfig["github-token"]) {

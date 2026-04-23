@@ -492,6 +492,8 @@ async function sendJobSetupSpan(options = {}) {
   const repository = process.env.GITHUB_REPOSITORY || "";
   const eventName = process.env.GITHUB_EVENT_NAME || "";
   const ref = process.env.GITHUB_REF || "";
+  const refName = process.env.GITHUB_REF_NAME || "";
+  const headRef = process.env.GITHUB_HEAD_REF || "";
   const sha = process.env.GITHUB_SHA || "";
 
   const attributes = [
@@ -521,6 +523,12 @@ async function sendJobSetupSpan(options = {}) {
   }
   if (ref) {
     resourceAttributes.push(buildAttr("github.ref", ref));
+  }
+  if (refName) {
+    resourceAttributes.push(buildAttr("github.ref_name", refName));
+  }
+  if (headRef) {
+    resourceAttributes.push(buildAttr("github.head_ref", headRef));
   }
   if (sha) {
     resourceAttributes.push(buildAttr("github.sha", sha));
@@ -694,17 +702,26 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const repository = process.env.GITHUB_REPOSITORY || "";
   const eventName = process.env.GITHUB_EVENT_NAME || "";
   const ref = process.env.GITHUB_REF || "";
+  const refName = process.env.GITHUB_REF_NAME || "";
+  const headRef = process.env.GITHUB_HEAD_REF || "";
   const sha = process.env.GITHUB_SHA || "";
 
   // Agent conclusion is passed to downstream jobs via GH_AW_AGENT_CONCLUSION.
   // Values: "success", "failure", "timed_out", "cancelled", "skipped".
   const agentConclusion = process.env.GH_AW_AGENT_CONCLUSION || "";
 
-  // Mark the span as an error when the agent job failed or timed out.
+  // Mark the span as an error when the agent job failed, timed out, or was cancelled.
   const isAgentFailure = agentConclusion === "failure" || agentConclusion === "timed_out";
+  const isAgentCancelled = agentConclusion === "cancelled";
+  const isAgentNonOK = isAgentFailure || isAgentCancelled;
   // STATUS_CODE_ERROR = 2, STATUS_CODE_OK = 1
-  const statusCode = isAgentFailure ? 2 : 1;
-  let statusMessage = isAgentFailure ? `agent ${agentConclusion}` : undefined;
+  const statusCode = isAgentNonOK ? 2 : 1;
+  let statusMessage;
+  if (isAgentFailure) {
+    statusMessage = `agent ${agentConclusion}`;
+  } else if (isAgentCancelled) {
+    statusMessage = "agent cancelled";
+  }
 
   // Always read agent_output.json so output metrics are available on all outcomes.
   const agentOutput = readJSONIfExists("/tmp/gh-aw/agent_output.json") || {};
@@ -748,7 +765,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   if (agentConclusion) {
     attributes.push(buildAttr("gh-aw.agent.conclusion", agentConclusion));
   }
-  if (isAgentFailure && errorMessages.length > 0) {
+  if (errorMessages.length > 0) {
     attributes.push(buildAttr("gh-aw.error.count", outputErrors.length));
     attributes.push(buildAttr("gh-aw.error.messages", errorMessages.join(" | ")));
   }
@@ -793,6 +810,12 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   if (ref) {
     resourceAttributes.push(buildAttr("github.ref", ref));
   }
+  if (refName) {
+    resourceAttributes.push(buildAttr("github.ref_name", refName));
+  }
+  if (headRef) {
+    resourceAttributes.push(buildAttr("github.head_ref", headRef));
+  }
   if (sha) {
     resourceAttributes.push(buildAttr("github.sha", sha));
   }
@@ -804,7 +827,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // making individual errors queryable and classifiable in backends like
   // Grafana Tempo, Honeycomb, and Datadog.
   const buildSpanEvents = eventTimeMs => {
-    if (!isAgentFailure) {
+    if (outputErrors.length === 0) {
       return [];
     }
     const errorTimeNano = toNanoString(eventTimeMs);
