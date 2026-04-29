@@ -435,7 +435,8 @@ async function main(config = {}) {
 
     // Check if item_number or issue_number was explicitly provided in the message.
     // item_number takes precedence over issue_number when both are present.
-    const explicitItemNumber = message.item_number != null ? message.item_number : message.issue_number != null ? message.issue_number : undefined;
+    // pr-number is accepted as an alias for item_number for robustness.
+    const explicitItemNumber = message.item_number ?? message.issue_number ?? message["pr-number"] ?? undefined;
 
     if (explicitItemNumber !== undefined) {
       // Resolve temporary IDs if present
@@ -453,16 +454,16 @@ async function main(config = {}) {
 
       // Check for other resolution errors (including null resolved)
       if (resolvedTarget.errorMessage || !resolvedTarget.resolved) {
-        core.warning(`Invalid item_number/issue_number specified: ${explicitItemNumber}`);
+        core.warning(`Invalid explicit target number specified: ${explicitItemNumber}`);
         return {
           success: false,
-          error: `Invalid item_number/issue_number specified: ${explicitItemNumber}`,
+          error: `Invalid explicit target number specified: ${explicitItemNumber}`,
         };
       }
 
       // Use the resolved issue number (safe to access because we checked above)
       itemNumber = resolvedTarget.resolved.number;
-      core.info(`Using explicitly provided item_number: #${itemNumber}`);
+      core.info(`Using explicitly provided target number (item_number/issue_number/pr-number): #${itemNumber}`);
     } else {
       // Check if this is a discussion context
       const isDiscussionContext = effectiveContext.eventName === "discussion" || effectiveContext.eventName === "discussion_comment";

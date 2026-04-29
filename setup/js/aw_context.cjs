@@ -107,8 +107,11 @@ function resolveItemContext(payload) {
  *   item_number: string,
  *   comment_id: string,
  *   comment_node_id: string,
+ *   deployment_state: string,
+ *   workflow_run_conclusion: string,
  *   otel_trace_id: string,
- *   otel_parent_span_id: string
+ *   otel_parent_span_id: string,
+ *   trigger_label: string
  * }}
  * Properties:
  *   - item_type: Kind of entity that triggered the workflow (issue, pull_request,
@@ -122,6 +125,14 @@ function resolveItemContext(payload) {
  *     Only populated for discussion/discussion_comment events. Can be passed
  *     as reply_to_id in add_comment to thread responses under the triggering
  *     comment when a dispatched specialist workflow replies to a discussion.
+ *   - deployment_state: The deployment status state value (e.g. "failure", "error",
+ *     "success") when the workflow was triggered by a deployment_status event.
+ *     Empty string for all other event types. Propagated to child workflows via
+ *     workflow_call so they can identify which state triggered the parent.
+ *   - workflow_run_conclusion: The conclusion of the triggering workflow_run
+ *     (e.g. "failure", "success", "cancelled", "timed_out") when the workflow was
+ *     triggered by a workflow_run event. Empty string for all other event types.
+ *     Propagated to child workflows via workflow_call.
  *   - otel_trace_id: OTLP trace ID from the parent workflow's setup span.
  *     Empty string when OTLP is not configured or the parent setup step has
  *     not yet run.  Used by child workflow setup steps to continue the same
@@ -130,6 +141,9 @@ function resolveItemContext(payload) {
  *     Empty string when OTLP is not configured or the parent setup step has
  *     not yet run.  Used by child workflow setup steps to link their setup
  *     span as a child of the parent's setup span for proper trace hierarchy.
+ *   - trigger_label: Name of the label that triggered the workflow for labeled/unlabeled
+ *     events (e.g. pull_request_target, issues, pull_request with labeled type).
+ *     Empty string for events that do not carry label information.
  */
 function buildAwContext() {
   const { item_type, item_number, comment_id, comment_node_id } = resolveItemContext(context.payload);
@@ -150,6 +164,14 @@ function buildAwContext() {
     item_number,
     comment_id,
     comment_node_id,
+    // deployment_state carries the GitHub deployment_status state value when the
+    // triggering event is deployment_status. Empty string for all other events.
+    // Propagated to called workflows so they can access the deployment state.
+    deployment_state: context.eventName === "deployment_status" ? (context.payload?.deployment_status?.state ?? "") : "",
+    // workflow_run_conclusion carries the conclusion of the triggering workflow_run
+    // when the event is workflow_run. Empty string for all other events.
+    // Propagated to called workflows so they can access the workflow run conclusion.
+    workflow_run_conclusion: context.eventName === "workflow_run" ? (context.payload?.workflow_run?.conclusion ?? "") : "",
     // Propagate the current OTLP trace ID to dispatched child workflows so that
     // composite actions share the same trace as their parent.  Empty string when
     // OTLP is not configured or the parent setup step has not run yet.
@@ -158,6 +180,10 @@ function buildAwContext() {
     // can link their setup span as a child of this span for proper trace hierarchy.
     // Empty string when OTLP is not configured or the parent setup step has not run yet.
     otel_parent_span_id: process.env.GITHUB_AW_OTEL_PARENT_SPAN_ID || "",
+    // trigger_label is the label name from labeled/unlabeled events (pull_request_target,
+    // issues, pull_request, etc.). Empty string for events without label data such as
+    // workflow_dispatch, push, or schedule.
+    trigger_label: context.payload?.label?.name ?? "",
   };
 }
 
