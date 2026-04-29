@@ -17,7 +17,7 @@ const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_help
 const { addExpirationToFooter } = require("./ephemerals.cjs");
 const { generateWorkflowIdMarker } = require("./generate_footer.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
-const { generateFooterWithMessages } = require("./messages_footer.cjs");
+const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { normalizeBranchName } = require("./normalize_branch_name.cjs");
 const { pushExtraEmptyCommit } = require("./extra_empty_commit.cjs");
@@ -26,7 +26,7 @@ const { getBaseBranch } = require("./get_base_branch.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { checkFileProtection } = require("./manifest_file_helpers.cjs");
-const { renderTemplateFromFile, buildProtectedFileList, encodePathSegments } = require("./messages_core.cjs");
+const { renderTemplateFromFile, buildProtectedFileList, encodePathSegments, getPromptPath } = require("./messages_core.cjs");
 const { COPILOT_REVIEWER_BOT, FAQ_CREATE_PR_PERMISSIONS_URL, MAX_ASSIGNEES } = require("./constants.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { withRetry, isTransientError } = require("./error_recovery.cjs");
@@ -86,9 +86,11 @@ function isLabelTransientError(error) {
 }
 
 /** @type {number} Number of retry attempts for label operations */
-const LABEL_MAX_RETRIES = 3;
-/** @type {number} Initial delay in ms before the first label retry (3 seconds) */
+const LABEL_MAX_RETRIES = 5;
+/** @type {number} Base delay in ms used to calculate label retry backoff (3 seconds) */
 const LABEL_INITIAL_DELAY_MS = 3000;
+/** @type {number} Maximum delay in ms between label retries (30 seconds) */
+const LABEL_MAX_DELAY_MS = 30000;
 
 /**
  * Parse allowed base branch patterns from config value (array or comma-separated string)
@@ -232,28 +234,165 @@ async function createFallbackIssue(githubClient, repoParts, title, body, labels,
  * Maximum limits for pull request parameters to prevent resource exhaustion.
  * These limits align with GitHub's API constraints and security best practices.
  */
-/** @type {number} Maximum number of files allowed per pull request */
+/** @type {number} Default maximum number of unique files allowed per pull request.
+ * Can be overridden via the `max-patch-files` safe-outputs config option. */
 const MAX_FILES = 100;
+
+/**
+ * Parses a single `diff --git` header line and returns the post-image (`b/`)
+ * path, the pre-image (`a/`) path, or `null` if the header could not be
+ * parsed. Handles both unquoted paths and C-style quoted paths emitted by
+ * git when filenames contain unusual characters (e.g. backslash-escaped
+ * quotes, control characters, or non-ASCII bytes when `core.quotepath=true`).
+ *
+ * Examples of supported forms:
+ *   diff --git a/foo.txt b/foo.txt
+ *   diff --git a/dir/with space/x b/dir/with space/x
+ *   diff --git "a/foo\"bar" "b/foo\"bar"
+ *   diff --git "a/foo\\bar" "b/foo\\bar"
+ *
+ * @param {string} headerLine - The full header line (must start with `diff --git `)
+ * @returns {string|null} The extracted file path, or null if parsing failed.
+ */
+function parseDiffGitHeader(headerLine) {
+  // Strip the `diff --git ` prefix.
+  const rest = headerLine.replace(/^diff --git /, "");
+  if (rest === headerLine) {
+    return null;
+  }
+
+  // Walk the string and pull out the two pathspecs. Each is either:
+  //   - A quoted C-style string ("..."), where backslash escapes any character
+  //     including embedded quotes and backslashes.
+  //   - An unquoted run of non-space characters.
+  // We don't actually need to unescape the contents; the raw token is fine
+  // for use as a Set key (uniqueness is preserved). All we need is to
+  // correctly delimit the two path tokens.
+  /** @type {string[]} */
+  const tokens = [];
+  let i = 0;
+  while (i < rest.length && tokens.length < 2) {
+    // Skip leading whitespace between tokens.
+    while (i < rest.length && rest[i] === " ") {
+      i++;
+    }
+    if (i >= rest.length) {
+      break;
+    }
+    let token = "";
+    if (rest[i] === '"') {
+      // Quoted form: consume until the matching unescaped quote.
+      token += rest[i++];
+      while (i < rest.length) {
+        const ch = rest[i++];
+        token += ch;
+        if (ch === "\\" && i < rest.length) {
+          // Escaped char: consume the next character verbatim.
+          token += rest[i++];
+        } else if (ch === '"') {
+          break;
+        }
+      }
+    } else {
+      // Unquoted form: consume up to the next space.
+      while (i < rest.length && rest[i] !== " ") {
+        token += rest[i++];
+      }
+    }
+    tokens.push(token);
+  }
+
+  if (tokens.length < 2) {
+    return null;
+  }
+
+  // Prefer the "b/" (post-image) token, falling back to "a/" if needed.
+  // The leading "a/" or "b/" prefix is preserved in the returned key so
+  // that quoted vs. unquoted forms of the same path don't collide
+  // accidentally with unrelated files; uniqueness is the only invariant
+  // that matters here.
+  const stripPrefix = tok => {
+    if (tok.startsWith('"a/') || tok.startsWith('"b/')) {
+      return tok.slice(3, tok.endsWith('"') ? -1 : undefined);
+    }
+    if (tok.startsWith("a/") || tok.startsWith("b/")) {
+      return tok.slice(2);
+    }
+    return tok;
+  };
+  const bPath = stripPrefix(tokens[1]);
+  if (bPath) {
+    return bPath;
+  }
+  const aPath = stripPrefix(tokens[0]);
+  return aPath || null;
+}
+
+/**
+ * Counts the number of unique file paths touched by a git patch.
+ *
+ * `git format-patch` emits one `diff --git` header per (commit, file), so the
+ * same file modified across multiple commits will appear multiple times. The
+ * file-count safety limit counts unique files (i.e. how many distinct files
+ * this push touches), not raw header occurrences.
+ *
+ * Headers whose paths cannot be parsed contribute one *synthetic* entry each
+ * to the unique-file set, so a malformed or quoted-with-escapes header line
+ * can never silently bypass the limit (we conservatively over-count rather
+ * than under-count when in doubt).
+ *
+ * @param {string} patchContent - Patch content to inspect (may be empty)
+ * @returns {number} Number of unique file paths referenced in the patch
+ */
+function countUniquePatchFiles(patchContent) {
+  if (!patchContent || !patchContent.trim()) {
+    return 0;
+  }
+  const files = new Set();
+  // Find all `diff --git` headers (start of line). Each header corresponds
+  // to one file diff; we try to extract its path and fall back to a unique
+  // synthetic key per unparseable header so the file is still counted in
+  // the limit. This is a conservative choice: it never undercounts, so a
+  // single malformed header cannot bypass the safety limit.
+  const headerRe = /^diff --git .*$/gm;
+  let match;
+  let unparseableIdx = 0;
+  while ((match = headerRe.exec(patchContent)) !== null) {
+    const path = parseDiffGitHeader(match[0]);
+    if (path) {
+      files.add(path);
+    } else {
+      // Use the byte offset of the header to ensure uniqueness across
+      // multiple unparseable headers, so each is counted exactly once.
+      files.add(`__unparseable_header_${match.index}_${unparseableIdx++}`);
+    }
+  }
+  return files.size;
+}
 
 /**
  * Enforces maximum limits on pull request parameters to prevent resource exhaustion attacks.
  * Per Safe Outputs specification requirement SEC-003, limits must be enforced before API calls.
  *
+ * The file-count check measures the number of *unique* files in the patch (not
+ * the number of `diff --git` headers, which can be inflated when the patch
+ * contains multiple commits touching the same file).
+ *
  * @param {string} patchContent - Patch content to validate
+ * @param {number} [maxFiles=MAX_FILES] - Maximum number of unique files allowed
  * @throws {Error} When any limit is exceeded, with error code E003 and details
  */
-function enforcePullRequestLimits(patchContent) {
+function enforcePullRequestLimits(patchContent, maxFiles = MAX_FILES) {
   if (!patchContent || !patchContent.trim()) {
     return;
   }
 
-  // Count files in patch by looking for "diff --git" lines
-  const fileMatches = patchContent.match(/^diff --git /gm);
-  const fileCount = fileMatches ? fileMatches.length : 0;
+  const limit = Number.isFinite(maxFiles) && maxFiles > 0 ? maxFiles : MAX_FILES;
+  const fileCount = countUniquePatchFiles(patchContent);
 
   // Check file count - max limit exceeded check
-  if (fileCount > MAX_FILES) {
-    throw new Error(`E003: Cannot create pull request with more than ${MAX_FILES} files (received ${fileCount})`);
+  if (fileCount > limit) {
+    throw new Error(`E003: Cannot create pull request with more than ${limit} files (received ${fileCount})`);
   }
 }
 
@@ -352,6 +491,7 @@ async function main(config = {}) {
   const expiresHours = config.expires ? parseInt(String(config.expires), 10) : 0;
   const maxCount = config.max || 1; // PRs are typically limited to 1
   const maxSizeKb = config.max_patch_size ? parseInt(String(config.max_patch_size), 10) : 1024;
+  const maxFiles = config.max_patch_files ? parseInt(String(config.max_patch_files), 10) : MAX_FILES;
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const allowedBaseBranches = parseAllowedBaseBranches(config.allowed_base_branches);
   const githubClient = await createAuthenticatedGitHubClient(config);
@@ -484,6 +624,7 @@ async function main(config = {}) {
   }
   core.info(`Max count: ${maxCount}`);
   core.info(`Max patch size: ${maxSizeKb} KB`);
+  core.info(`Max patch files: ${maxFiles}`);
 
   // Track how many items we've processed for max limit
   let processedCount = 0;
@@ -558,46 +699,53 @@ async function main(config = {}) {
     let baseBranch = configBaseBranch || (await getBaseBranch(repoParts));
 
     // Optional agent-provided base branch override.
-    // This is only allowed when allowed_base_branches is configured.
+    // The default base branch is always implicitly allowed even without allowed_base_branches.
+    // Overriding to a different branch requires allowed_base_branches to be configured.
     if (typeof pullRequestItem.base === "string" && pullRequestItem.base.trim() !== "") {
       const requestedBaseBranchRaw = pullRequestItem.base.trim();
       const requestedBaseBranchForLog = JSON.stringify(requestedBaseBranchRaw);
       core.info(`Base branch override requested: ${requestedBaseBranchForLog}`);
-      if (allowedBaseBranches.size === 0) {
-        core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: allowed-base-branches is not configured`);
-        return {
-          success: false,
-          error: "Base branch override is not allowed. Configure safe-outputs.create-pull-request.allowed-base-branches to allow per-run base overrides.",
-        };
-      }
+      if (requestedBaseBranchRaw === baseBranch && allowedBaseBranches.size === 0) {
+        // The agent explicitly specified the current base branch with no allowlist configured —
+        // this is a no-op, not a true override, so no allowlist check is needed.
+        core.info(`Base branch ${requestedBaseBranchForLog} matches the default base branch, no override needed`);
+      } else {
+        if (allowedBaseBranches.size === 0) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: allowed-base-branches is not configured`);
+          return {
+            success: false,
+            error: "Base branch override is not allowed. Configure safe-outputs.create-pull-request.allowed-base-branches to allow per-run base overrides.",
+          };
+        }
 
-      const requestedBaseBranch = normalizeBranchName(requestedBaseBranchRaw);
-      if (!requestedBaseBranch) {
-        core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitization resulted in empty branch name`);
-        return {
-          success: false,
-          error: `Invalid base branch override: sanitization resulted in empty string (original: "${requestedBaseBranchRaw}")`,
-        };
-      }
-      if (requestedBaseBranchRaw !== requestedBaseBranch) {
-        core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitized value '${requestedBaseBranch}' does not match original`);
-        return {
-          success: false,
-          error: `Invalid base branch override: contains invalid characters (original: "${requestedBaseBranchRaw}", normalized: "${requestedBaseBranch}")`,
-        };
-      }
-      const requestedBaseBranchSafeForLog = JSON.stringify(requestedBaseBranch);
-      if (!isBaseBranchAllowed(requestedBaseBranch, allowedBaseBranches)) {
-        core.warning(`Rejecting base branch override ${requestedBaseBranchSafeForLog}: does not match allowed patterns (${Array.from(allowedBaseBranches).join(", ")})`);
-        return {
-          success: false,
-          error: `Base branch override '${requestedBaseBranch}' is not allowed. Allowed patterns: ${Array.from(allowedBaseBranches).join(", ")}`,
-        };
-      }
+        const requestedBaseBranch = normalizeBranchName(requestedBaseBranchRaw);
+        if (!requestedBaseBranch) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitization resulted in empty branch name`);
+          return {
+            success: false,
+            error: `Invalid base branch override: sanitization resulted in empty string (original: "${requestedBaseBranchRaw}")`,
+          };
+        }
+        if (requestedBaseBranchRaw !== requestedBaseBranch) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitized value '${requestedBaseBranch}' does not match original`);
+          return {
+            success: false,
+            error: `Invalid base branch override: contains invalid characters (original: "${requestedBaseBranchRaw}", normalized: "${requestedBaseBranch}")`,
+          };
+        }
+        const requestedBaseBranchSafeForLog = JSON.stringify(requestedBaseBranch);
+        if (!isBaseBranchAllowed(requestedBaseBranch, allowedBaseBranches)) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchSafeForLog}: does not match allowed patterns (${Array.from(allowedBaseBranches).join(", ")})`);
+          return {
+            success: false,
+            error: `Base branch override '${requestedBaseBranch}' is not allowed. Allowed patterns: ${Array.from(allowedBaseBranches).join(", ")}`,
+          };
+        }
 
-      core.info(`Base branch override accepted: ${requestedBaseBranchSafeForLog}`);
-      baseBranch = requestedBaseBranch;
-      core.info(`Using agent-provided base branch override: ${baseBranch}`);
+        core.info(`Base branch override accepted: ${requestedBaseBranchSafeForLog}`);
+        baseBranch = requestedBaseBranch;
+        core.info(`Using agent-provided base branch override: ${baseBranch}`);
+      }
     }
 
     // Multi-repo support: Switch checkout to target repo if different from current
@@ -682,7 +830,7 @@ async function main(config = {}) {
 
     // Enforce max limits on patch before processing
     try {
-      enforcePullRequestLimits(patchContent);
+      enforcePullRequestLimits(patchContent, maxFiles);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       core.warning(`Pull request limit exceeded: ${errorMessage}`);
@@ -919,6 +1067,16 @@ async function main(config = {}) {
     const triggeringPRNumber = context.payload.pull_request?.number;
     const triggeringDiscussionNumber = context.payload.discussion?.number;
 
+    // Prepend threat detection caution alert at the very top of the PR body so it is
+    // immediately visible to reviewers. The caution is omitted from the footer to
+    // avoid duplication (skipDetectionCaution is passed to generateFooterWithMessages).
+    const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+    if (detectionCaution) {
+      // unshift(caution, "", "") places the caution alert at index 0 and two blank
+      // separator lines so the main body content follows after a full empty line.
+      bodyLines.unshift(detectionCaution, "", "");
+    }
+
     // Add fingerprint comment if present
     const trackerIDComment = getTrackerID("markdown");
     if (trackerIDComment) {
@@ -941,7 +1099,9 @@ async function main(config = {}) {
         workflowId,
         serverUrl: context.serverUrl,
       });
-      let footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl).trimEnd();
+      // Pass skipDetectionCaution so the caution alert is not duplicated in the footer
+      // (it was already prepended to the top of the body above).
+      let footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, { skipDetectionCaution: true }).trimEnd();
       footer = addExpirationToFooter(footer, expiresHours, "Pull Request");
       if (expiresHours > 0) {
         footer += "\n\n<!-- gh-aw-expires-type: pull-request -->";
@@ -976,6 +1136,10 @@ async function main(config = {}) {
       .filter(label => !!label)
       .map(label => String(label).trim())
       .filter(label => label);
+    // Add agentic-threat-detected label when threat detection produced a warning
+    if (detectionCaution && !labels.includes("agentic-threat-detected")) {
+      labels.push("agentic-threat-detected");
+    }
     // Use explicitly configured fallback labels when present; otherwise preserve
     // existing behavior by reusing pull request labels for fallback issues.
     const effectiveFallbackLabels = configFallbackLabels.length > 0 ? configFallbackLabels : labels;
@@ -1462,7 +1626,7 @@ ${patchPreview}`;
         // Use the push-failed template with artifact download instructions.
         const runId = context.runId;
         const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
-        const pushFailedTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/manifest_protection_push_failed_fallback.md`;
+        const pushFailedTemplatePath = getPromptPath("manifest_protection_push_failed_fallback.md");
         fallbackBody = renderTemplateFromFile(pushFailedTemplatePath, {
           main_body: mainBodyContent,
           footer: footerContent,
@@ -1479,7 +1643,7 @@ ${patchPreview}`;
         const encodedBase = encodePathSegments(baseBranch);
         const encodedHead = encodePathSegments(branchName);
         const createPrUrl = `${githubServer}/${repoParts.owner}/${repoParts.repo}/compare/${encodedBase}...${encodedHead}?expand=1&title=${encodeURIComponent(title)}`;
-        const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/manifest_protection_create_pr_fallback.md`;
+        const templatePath = getPromptPath("manifest_protection_create_pr_fallback.md");
         fallbackBody = renderTemplateFromFile(templatePath, {
           main_body: mainBodyContent,
           footer: footerContent,
@@ -1539,6 +1703,7 @@ ${patchPreview}`;
             {
               maxRetries: LABEL_MAX_RETRIES,
               initialDelayMs: LABEL_INITIAL_DELAY_MS,
+              maxDelayMs: LABEL_MAX_DELAY_MS,
               backoffMultiplier: 2,
               shouldRetry: isLabelTransientError,
             },
@@ -1549,6 +1714,8 @@ ${patchPreview}`;
           // Label addition is non-critical - warn but don't fail the PR creation.
           // GitHub's API may transiently fail to resolve the PR node ID immediately
           // after creation, which causes label operations to fail with an unprocessable error.
+          // If this warning appears, repository checks that require labels on the opened event
+          // may fail transiently; consider triggering required-label checks on the labeled event instead.
           core.warning(`Failed to add labels to PR #${pullRequest.number}: ${labelError instanceof Error ? labelError.message : String(labelError)}`);
         }
       }
@@ -1679,7 +1846,7 @@ ${patchPreview}`;
           patchPreview = generatePatchPreview(patchContent);
         }
 
-        const fallbackTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/pr_permission_denied_fallback.md`;
+        const fallbackTemplatePath = getPromptPath("pr_permission_denied_fallback.md");
         const fallbackBody = renderTemplateFromFile(fallbackTemplatePath, {
           body,
           branch_name: branchName,
@@ -1786,4 +1953,4 @@ ${patchPreview}`;
   }; // End of handleCreatePullRequest
 } // End of main
 
-module.exports = { main, enforcePullRequestLimits };
+module.exports = { main, enforcePullRequestLimits, countUniquePatchFiles, parseDiffGitHeader };

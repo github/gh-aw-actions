@@ -4,7 +4,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getDetectionCautionAlert, getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateXMLMarker } = require("./messages.cjs");
-const { renderTemplate, renderTemplateFromFile } = require("./messages_core.cjs");
+const { renderTemplate, renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
 const { getCurrentBranch } = require("./get_current_branch.cjs");
 const { createExpirationLine, generateFooterWithExpiration } = require("./ephemerals.cjs");
 const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
@@ -571,10 +571,10 @@ function loadMissingDataMessages() {
     const missingDataMessages = [];
     for (const item of agentOutputResult.items) {
       if (item.type === "missing_data") {
-        // Extract the fields we need
-        if (item.data_type && item.reason) {
+        // Accept items with at least a reason; data_type may be absent for cache-miss signals
+        if (item.reason) {
           missingDataMessages.push({
-            data_type: item.data_type,
+            data_type: item.data_type || "",
             reason: item.reason,
             context: item.context || null,
             alternatives: item.alternatives || null,
@@ -591,10 +591,13 @@ function loadMissingDataMessages() {
 }
 
 /**
- * Build missing_data context string for display in failure issues/comments
+ * Build missing_data context string for display in failure issues/comments.
+ * When cache-memory is enabled and a cache_miss is detected, appends a
+ * configuration-problem warning to the context.
+ * @param {boolean} cacheMemoryEnabled - Whether cache-memory is configured for this workflow
  * @returns {string} Formatted missing data context
  */
-function buildMissingDataContext() {
+function buildMissingDataContext(cacheMemoryEnabled) {
   const missingDataMessages = loadMissingDataMessages();
 
   if (missingDataMessages.length === 0) {
@@ -609,6 +612,15 @@ function buildMissingDataContext() {
   let context = "\n**⚠️ Missing Data Reported**: The agent reported missing data during execution.\n\n**Missing Data:**\n";
   context += formattedList;
   context += "\n\n";
+
+  // Detect cache_miss: if cache-memory is available and the agent reported a cache miss,
+  // this indicates the prompt is referencing an incorrect file path within the cache directory.
+  const hasCacheMiss = missingDataMessages.some(m => m.reason === "cache_memory_miss");
+  if (cacheMemoryEnabled && hasCacheMiss) {
+    core.info("Cache-miss detected despite cache-memory being available — likely a configuration problem");
+    const templatePath = getPromptPath("cache_memory_miss.md");
+    context += "\n" + renderTemplateFromFile(templatePath, {}) + "\n";
+  }
 
   return context;
 }
@@ -685,7 +697,7 @@ function buildTimeoutContext(isTimedOut, timeoutMinutes) {
   const currentMinutes = parseInt(timeoutMinutes || "20", 10);
   const suggestedMinutes = currentMinutes + 10;
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/agent_timeout.md`;
+  const templatePath = getPromptPath("agent_timeout.md");
   return "\n" + renderTemplateFromFile(templatePath, { current_minutes: currentMinutes, suggested_minutes: suggestedMinutes });
 }
 
@@ -699,7 +711,7 @@ function buildInferenceAccessErrorContext(hasInferenceAccessError) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/inference_access_error.md`;
+  const templatePath = getPromptPath("inference_access_error.md");
   const template = fs.readFileSync(templatePath, "utf8");
   return "\n" + template;
 }
@@ -715,7 +727,7 @@ function buildMCPPolicyErrorContext(hasMCPPolicyError) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/mcp_policy_error.md`;
+  const templatePath = getPromptPath("mcp_policy_error.md");
   try {
     const template = fs.readFileSync(templatePath, "utf8");
     return "\n" + template;
@@ -740,7 +752,7 @@ function buildModelNotSupportedErrorContext(hasModelNotSupportedError) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/model_not_supported_error.md`;
+  const templatePath = getPromptPath("model_not_supported_error.md");
   try {
     const template = fs.readFileSync(templatePath, "utf8");
     return "\n" + template;
@@ -778,7 +790,7 @@ function buildLockdownCheckFailedContext(hasLockdownCheckFailed) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/lockdown_check_failed.md`;
+  const templatePath = getPromptPath("lockdown_check_failed.md");
   const template = fs.readFileSync(templatePath, "utf8");
   return "\n" + template;
 }
@@ -795,11 +807,187 @@ function buildStaleLockFileFailedContext(hasStaleLockFileFailed) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/stale_lock_file_failed.md`;
+  const templatePath = getPromptPath("stale_lock_file_failed.md");
   const template = fs.readFileSync(templatePath, "utf8");
   return "\n" + template;
 }
 
+// Maps engine ID (GH_AW_ENGINE_ID) to credential name for use with GH_AW_ENGINE_API_HOSTS.
+const ENGINE_ID_TO_CREDENTIAL = /** @type {Record<string, string>} */ {
+  copilot: "`COPILOT_GITHUB_TOKEN`",
+  claude: "`ANTHROPIC_API_KEY`",
+  codex: "`CODEX_API_KEY` / `OPENAI_API_KEY`",
+  gemini: "`GEMINI_API_KEY`",
+};
+
+// Maps engine ID to a human-readable provider label.
+const ENGINE_ID_TO_LABEL = /** @type {Record<string, string>} */ {
+  copilot: "GitHub Copilot",
+  claude: "Anthropic Claude",
+  codex: "OpenAI Codex",
+  gemini: "Google Gemini",
+};
+
+// Hardcoded fallback provider hosts for when GH_AW_ENGINE_API_HOSTS is not set.
+// The host patterns are matched against the "host" field in audit.jsonl entries.
+const FIREWALL_AUTH_PROVIDER_HOSTS = /** @type {Array<{provider: string, pattern: RegExp, credential: string}>} */ [
+  { provider: "GitHub Copilot", pattern: /\.githubcopilot\.com/i, credential: "`COPILOT_GITHUB_TOKEN`" },
+  { provider: "OpenAI Codex", pattern: /^api\.openai\.com/i, credential: "`CODEX_API_KEY` / `OPENAI_API_KEY`" },
+  { provider: "Anthropic Claude", pattern: /^api\.anthropic\.com/i, credential: "`ANTHROPIC_API_KEY`" },
+  { provider: "Google Gemini", pattern: /^generativelanguage\.googleapis\.com/i, credential: "`GEMINI_API_KEY`" },
+];
+
+/**
+ * Build the list of registered provider entries from the GH_AW_ENGINE_API_HOSTS and
+ * GH_AW_ENGINE_ID environment variables. Falls back to the hardcoded
+ * FIREWALL_AUTH_PROVIDER_HOSTS list when the env var is not set.
+ *
+ * @returns {Array<{provider: string, credential: string, hosts?: string[], pattern?: RegExp}>} Provider entries
+ */
+function buildRegisteredProviderEntries() {
+  const engineApiHosts = process.env.GH_AW_ENGINE_API_HOSTS;
+  const engineId = (process.env.GH_AW_ENGINE_ID || "").toLowerCase();
+
+  if (engineApiHosts) {
+    const hosts = engineApiHosts
+      .split(",")
+      .map(h => h.trim().toLowerCase())
+      .filter(Boolean);
+    if (hosts.length > 0) {
+      const provider = ENGINE_ID_TO_LABEL[engineId] || engineId || "Engine";
+      const credential = ENGINE_ID_TO_CREDENTIAL[engineId] || "`API_KEY`";
+      return [{ provider, credential, hosts }];
+    }
+  }
+
+  // Fallback: use hardcoded patterns, converting to the same shape.
+  return FIREWALL_AUTH_PROVIDER_HOSTS.map(({ provider, pattern, credential }) => ({
+    provider,
+    credential,
+    hosts: /** @type {string[]} */ [],
+    pattern,
+  }));
+}
+
+/**
+ * Parse the firewall audit.jsonl for authentication rejection entries.
+ *
+ * Performance strategy for large JSONL files (three-pass approach):
+ *   1. Quick file-level regex pre-scan: bail early if no 401/403 status codes appear at all.
+ *   2. Per-line regex pre-filter: skip lines without a 401/403 status pattern before JSON.parse.
+ *   3. Full JSON parse: only for lines that pass both pre-filters.
+ *
+ * Providers are resolved dynamically from GH_AW_ENGINE_API_HOSTS / GH_AW_ENGINE_ID env vars
+ * (set by the workflow compiler for the current engine). Falls back to a hardcoded list of
+ * known public provider API hosts when the env var is not available.
+ *
+ * @param {string} auditJsonlPath - Path to audit.jsonl
+ * @returns {Array<{provider: string, credential: string}>} Unique providers with auth rejections
+ */
+function parseFirewallAuthErrors(auditJsonlPath) {
+  try {
+    if (!fs.existsSync(auditJsonlPath)) {
+      return [];
+    }
+
+    const content = fs.readFileSync(auditJsonlPath, "utf8");
+    if (!content.trim()) {
+      return [];
+    }
+
+    // Pass 1 — file-level pre-scan: bail early when no 401 or 403 appears anywhere.
+    // The audit.jsonl format uses `"status":401` or `"status": 401` (compact or spaced).
+    // `40[13]` matches digits 1 and 3 only, covering status codes 401 and 403.
+    if (!/"status"\s*:\s*40[13]/.test(content)) {
+      return [];
+    }
+
+    // Build the provider list from env vars (or fallback to hardcoded patterns).
+    const providerEntries = buildRegisteredProviderEntries();
+    const seenProviders = new Set();
+    const results = [];
+
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed[0] !== "{") continue;
+
+      // Pass 2 — per-line regex pre-filter: skip lines that cannot have a 401/403 status.
+      // This avoids the JSON.parse overhead on the majority of non-auth-failure lines.
+      if (!/"status"\s*:\s*40[13]/.test(trimmed)) continue;
+
+      let entry;
+      try {
+        entry = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+
+      const status = entry.status;
+      if (status !== 401 && status !== 403) continue;
+
+      const host = typeof entry.host === "string" ? entry.host : "";
+      if (!host) continue;
+      // Strip port from host for matching (e.g. "api.openai.com:443" → "api.openai.com")
+      const hostWithoutPort = host.replace(/:\d+$/, "").toLowerCase();
+
+      for (const providerEntry of providerEntries) {
+        const { provider, credential } = providerEntry;
+        if (seenProviders.has(provider)) continue;
+
+        // Dynamic matching: check if the host is in the registered hosts list.
+        let matched = false;
+        if (providerEntry.hosts && providerEntry.hosts.length > 0) {
+          matched = providerEntry.hosts.some(h => hostWithoutPort === h || hostWithoutPort.endsWith("." + h));
+        } else if (providerEntry.pattern) {
+          // Fallback: use the pattern from the hardcoded list.
+          matched = providerEntry.pattern.test(hostWithoutPort);
+        }
+
+        if (matched) {
+          seenProviders.add(provider);
+          results.push({ provider, credential });
+          break;
+        }
+      }
+
+      // Early exit: all providers have been matched, no need to scan remaining lines.
+      if (seenProviders.size === providerEntries.length) break;
+    }
+
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build a context string when the firewall audit log shows authentication rejections
+ * from AI provider endpoints (expired or missing API credentials).
+ *
+ * Reads audit.jsonl from the known path relative to GH_AW_AGENT_OUTPUT and surfaces
+ * a remediation hint for each affected provider in the failure issue/comment.
+ *
+ * @param {string} [auditJsonlPathOverride] - Path override for testing
+ * @returns {string} Formatted context string, or empty string if no auth errors
+ */
+function buildCredentialAuthErrorContext(auditJsonlPathOverride) {
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const defaultAuditPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "sandbox", "firewall", "audit", "audit.jsonl") : "/tmp/gh-aw/sandbox/firewall/audit/audit.jsonl";
+  const auditJsonlPath = auditJsonlPathOverride || defaultAuditPath;
+
+  const authErrors = parseFirewallAuthErrors(auditJsonlPath);
+
+  if (authErrors.length === 0) {
+    return "";
+  }
+
+  core.info(`Firewall audit log: detected ${authErrors.length} credential auth rejection(s) for: ${authErrors.map(e => e.provider).join(", ")}`);
+
+  const providersList = authErrors.map(e => `- ${e.provider} (${e.credential})`).join("\n");
+
+  const templatePath = getPromptPath("credential_auth_error.md");
+  return "\n" + renderTemplateFromFile(templatePath, { providers: providersList });
+}
 /**
  * Build a context string when assigning the Copilot coding agent to created issues failed.
  * @param {boolean} hasAssignCopilotFailures - Whether any copilot assignments failed
@@ -825,8 +1013,41 @@ function buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilo
     }
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/assign_copilot_to_created_issues_failure.md`;
+  const templatePath = getPromptPath("assign_copilot_to_created_issues_failure.md");
   return "\n" + renderTemplateFromFile(templatePath, { issues: issueList });
+}
+
+/**
+ * Check whether agent-stdio.log contains a terminal_reason: "completed" result entry,
+ * indicating the agent finished its task successfully despite a non-zero job exit code.
+ * Log lines may be prefixed with a timestamp (e.g. "2026-04-27T21:45:00.080Z  {JSON}").
+ *
+ * Lazy strategy: tests a single regex against the entire file content in one pass and
+ * returns immediately on the first match, avoiding line splitting and JSON parsing.
+ * The pattern is specific enough (`"terminal_reason"` key with `"completed"` value,
+ * 0 or 1 literal space around the colon) that false positives from unrelated content
+ * are negligible in practice.
+ *
+ * @returns {boolean} true if terminal_reason: "completed" was found in the log
+ */
+function hasAgentTerminalReasonCompleted() {
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
+  try {
+    if (!fs.existsSync(stdioLogPath)) {
+      return false;
+    }
+    const logContent = fs.readFileSync(stdioLogPath, "utf8");
+    // Single-pass scan: "terminal_reason" key with 0 or 1 literal space around
+    // the colon and "completed" value. JSON uses either compact ("key":"val") or
+    // single-spaced ("key" : "val") formatting. `[ ]?` matches only a space
+    // character (not tabs or newlines). Returns on first match without splitting
+    // lines or parsing JSON.
+    return /"terminal_reason"[ ]?:[ ]?"completed"/.test(logContent);
+  } catch {
+    // IO error — assume not completed
+  }
+  return false;
 }
 
 /**
@@ -858,6 +1079,16 @@ function buildEngineFailureContext() {
     }
 
     const lines = logContent.split("\n");
+
+    // Guard: if the agent completed successfully (terminal_reason: "completed"), the job
+    // failure was caused by something other than the agent itself (e.g., post-processing
+    // or infrastructure). Suppress the engine failure context to avoid false positive labels.
+    // Use the already-loaded logContent directly to avoid a redundant file read.
+    if (/"terminal_reason"[ ]?:[ ]?"completed"/.test(logContent)) {
+      core.info("Agent completed successfully (terminal_reason: completed) — suppressing engine failure context");
+      return "";
+    }
+
     const errorMessages = new Set();
 
     for (const line of lines) {
@@ -903,7 +1134,7 @@ function buildEngineFailureContext() {
       const hasCyberPolicyViolation = Array.from(errorMessages).some(msg => msg.includes("cyber_policy_violation"));
       if (hasCyberPolicyViolation) {
         core.info("Detected cyber_policy_violation error — using dedicated context message");
-        const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/cyber_policy_violation.md`;
+        const templatePath = getPromptPath("cyber_policy_violation.md");
         try {
           return "\n" + renderTemplateFromFile(templatePath, {});
         } catch {
@@ -1010,6 +1241,9 @@ async function main() {
     // stored in the compiled .lock.yml no longer matches the source .md file.
     // The agent is skipped in this case; the conclusion job runs to surface remediation guidance.
     const hasStaleLockFileFailed = process.env.GH_AW_STALE_LOCK_FILE_FAILED === "true";
+    // Cache-memory availability flag — set when cache-memory is configured for the workflow.
+    // Used to detect cache-miss misconfigurations reported by the agent.
+    const cacheMemoryEnabled = process.env.GH_AW_CACHE_MEMORY_ENABLED === "true";
 
     // Collect repo-memory validation errors from all memory configurations
     const repoMemoryValidationErrors = [];
@@ -1049,6 +1283,7 @@ async function main() {
     core.info(`App token minting failed (safe_outputs/conclusion/activation): ${safeOutputsAppTokenMintingFailed}/${conclusionAppTokenMintingFailed}/${activationAppTokenMintingFailed}`);
     core.info(`Lockdown check failed: ${hasLockdownCheckFailed}`);
     core.info(`Stale lock file check failed: ${hasStaleLockFileFailed}`);
+    core.info(`Cache memory enabled: ${cacheMemoryEnabled}`);
 
     // Check if the agent timed out.
     // A job-level timeout sets agentConclusion to "timed_out".
@@ -1076,6 +1311,11 @@ async function main() {
     let hasMissingSafeOutputs = false;
     let hasOnlyNoopOutputs = false;
     let hasReportIncomplete = false;
+    // Tracks the case where agentConclusion is "failure" but the agent completed its work
+    // successfully (terminal_reason: completed) and produced valid non-noop safe outputs.
+    // This is a false-positive failure caused by a transient error after the agent's task
+    // was done (e.g., post-processing step or AI model server returning a spurious error).
+    let hasCompletedDespiteJobFailure = false;
     const { loadAgentOutput } = require("./load_agent_output.cjs");
     const agentOutputResult = loadAgentOutput();
 
@@ -1101,6 +1341,15 @@ async function main() {
         if (nonNoopItems.length === 0) {
           hasOnlyNoopOutputs = true;
           core.info("Agent failed with exit code 1 but produced only noop outputs - treating as successful no-action (transient AI model error)");
+        } else if (!nonNoopItems.some(item => item.type === "report_incomplete")) {
+          // The agent produced valid non-noop safe outputs (e.g. create_discussion) but the
+          // job exit code is non-zero. If terminal_reason: completed is present in the log,
+          // the failure was a transient error after the agent finished its task — do not report
+          // a failure issue.
+          if (hasAgentTerminalReasonCompleted()) {
+            hasCompletedDespiteJobFailure = true;
+            core.info("Agent failed with exit code 1 but completed successfully (terminal_reason: completed) with valid safe outputs — treating as completed (transient AI model error)");
+          }
         }
       }
     }
@@ -1121,10 +1370,25 @@ async function main() {
       }
     }
 
+    // Detect cache-miss misconfiguration: the agent reported a missing_data with reason
+    // "cache_memory_miss" while cache-memory was configured and available.  This indicates the
+    // prompt is referencing an incorrect path inside the cache directory.
+    // Check for items regardless of agentOutputResult.success so that cache-miss signals
+    // emitted alongside other output are not missed when the agent job also fails.
+    let hasCacheMissMisconfiguration = false;
+    if (cacheMemoryEnabled && agentOutputResult.items) {
+      const cacheMissItems = agentOutputResult.items.filter(item => item.type === "missing_data" && item.reason === "cache_memory_miss");
+      if (cacheMissItems.length > 0) {
+        hasCacheMissMisconfiguration = true;
+        core.info(`Cache-miss misconfiguration detected: ${cacheMissItems.length} missing_data item(s) with reason "cache_memory_miss" despite cache-memory being available`);
+      }
+    }
+
     // Only proceed if the agent job actually failed OR timed out OR there are assignment errors OR
     // create_discussion errors OR code-push failures OR push_repo_memory failed OR missing safe outputs
     // OR a GitHub App token minting step failed OR the lockdown check failed OR copilot assignment failed
-    // OR the stale lock file check failed OR the agent reported task incompletion via report_incomplete.
+    // OR the stale lock file check failed OR the agent reported task incompletion via report_incomplete
+    // OR a cache-miss was detected despite cache-memory being available (configuration problem).
     // BUT skip if we only have noop outputs (that's a successful no-action scenario)
     if (
       agentConclusion !== "failure" &&
@@ -1138,15 +1402,28 @@ async function main() {
       !hasAppTokenMintingFailed &&
       !hasLockdownCheckFailed &&
       !hasStaleLockFileFailed &&
-      !hasReportIncomplete
+      !hasReportIncomplete &&
+      !hasCacheMissMisconfiguration
     ) {
-      core.info(`Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/stale-lock-file/report-incomplete errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`);
+      core.info(
+        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/stale-lock-file/report-incomplete/cache-miss errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
+      );
       return;
     }
 
-    // If we only have noop outputs (and no report_incomplete), skip failure handling - this is a successful no-action scenario
-    if (hasOnlyNoopOutputs && !hasReportIncomplete) {
+    // If we only have noop outputs (and no report_incomplete or cache-miss), skip failure handling
+    if (hasOnlyNoopOutputs && !hasReportIncomplete && !hasCacheMissMisconfiguration) {
       core.info("Agent completed with only noop outputs - skipping failure handling");
+      return;
+    }
+
+    // If the agent completed its work successfully (terminal_reason: completed) and produced
+    // valid non-noop safe outputs despite the job's non-zero exit code, skip failure handling.
+    // This prevents false-positive failure issues when a transient AI model error occurs
+    // after the agent has already finished its task (e.g., create_discussion produced but
+    // the server returned a spurious error on teardown).
+    if (hasCompletedDespiteJobFailure && !hasReportIncomplete && !hasCacheMissMisconfiguration) {
+      core.info("Agent completed with valid safe outputs despite job failure (terminal_reason: completed) — skipping failure handling");
       return;
     }
 
@@ -1229,7 +1506,7 @@ async function main() {
         core.info(`Found existing issue #${existingIssue.number}: ${existingIssue.html_url}`);
 
         // Read comment template
-        const commentTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/agent_failure_comment.md`;
+        const commentTemplatePath = getPromptPath("agent_failure_comment.md");
         const commentTemplate = fs.readFileSync(commentTemplatePath, "utf8");
 
         // Extract run ID from URL (e.g., https://github.com/owner/repo/actions/runs/123 -> "123")
@@ -1281,7 +1558,7 @@ async function main() {
         const pushRepoMemoryFailureContext = buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryPatchSizeExceededIDs, runUrl);
 
         // Build missing_data context
-        const missingDataContext = buildMissingDataContext();
+        const missingDataContext = buildMissingDataContext(cacheMemoryEnabled);
 
         // Build report_incomplete context
         const reportIncompleteContext = buildReportIncompleteContext();
@@ -1329,6 +1606,9 @@ async function main() {
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
 
+        // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
+        const credentialAuthErrorContext = buildCredentialAuthErrorContext();
+
         // Create template context
         const templateContext = {
           run_url: runUrl,
@@ -1341,6 +1621,7 @@ async function main() {
             secretVerificationResult === "failed"
               ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
+          credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
@@ -1394,7 +1675,7 @@ async function main() {
         core.info("No existing issue found, creating a new one");
 
         // Read issue template
-        const issueTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/agent_failure_issue.md`;
+        const issueTemplatePath = getPromptPath("agent_failure_issue.md");
         const issueTemplate = fs.readFileSync(issueTemplatePath, "utf8");
 
         // Get current branch information
@@ -1442,7 +1723,7 @@ async function main() {
         const pushRepoMemoryFailureContext = buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryPatchSizeExceededIDs, runUrl);
 
         // Build missing_data context
-        const missingDataContext = buildMissingDataContext();
+        const missingDataContext = buildMissingDataContext(cacheMemoryEnabled);
 
         // Build report_incomplete context
         const reportIncompleteContext = buildReportIncompleteContext();
@@ -1490,6 +1771,9 @@ async function main() {
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
 
+        // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
+        const credentialAuthErrorContext = buildCredentialAuthErrorContext();
+
         // Create template context with sanitized workflow name
         const templateContext = {
           workflow_name: sanitizedWorkflowName,
@@ -1503,6 +1787,7 @@ async function main() {
             secretVerificationResult === "failed"
               ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
+          credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
@@ -1593,5 +1878,9 @@ module.exports = {
   buildReportIncompleteContext,
   buildMCPPolicyErrorContext,
   buildModelNotSupportedErrorContext,
+  buildMissingDataContext,
+  buildCredentialAuthErrorContext,
+  parseFirewallAuthErrors,
   getActionFailureIssueExpiresHours,
+  hasAgentTerminalReasonCompleted,
 };
