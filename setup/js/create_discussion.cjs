@@ -17,7 +17,7 @@ const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_titl
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { createExpirationLine, generateFooterWithExpiration, addExpirationToFooter } = require("./ephemerals.cjs");
-const { generateFooterWithMessages } = require("./messages_footer.cjs");
+const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { sanitizeLabelContent } = require("./sanitize_label_content.cjs");
@@ -222,14 +222,15 @@ async function applyLabelsToDiscussion(githubClient, discussionId, labelIds) {
  * @returns {boolean} True if the error is permissions-related
  */
 function isPermissionsError(errorMessage) {
+  const msg = errorMessage.toLowerCase();
   return (
-    errorMessage.includes("Resource not accessible") ||
-    errorMessage.includes("Insufficient permissions") ||
-    errorMessage.includes("Bad credentials") ||
-    errorMessage.includes("Not Authenticated") ||
-    errorMessage.includes("requires authentication") ||
-    errorMessage.includes("Discussions not enabled") ||
-    errorMessage.includes("Failed to fetch repository information")
+    msg.includes("resource not accessible") ||
+    msg.includes("insufficient permissions") ||
+    msg.includes("bad credentials") ||
+    msg.includes("not authenticated") ||
+    msg.includes("requires authentication") ||
+    msg.includes("discussions not enabled") ||
+    msg.includes("failed to fetch repository information")
   );
 }
 
@@ -514,6 +515,12 @@ async function main(config = {}) {
     const callerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID || "";
     const runUrl = buildWorkflowRunUrl(context, context.repo);
 
+    // Inject CAUTION at top of body if threat detection warning was raised
+    const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+    if (detectionCaution) {
+      bodyLines.unshift(...detectionCaution.split("\n"), "");
+    }
+
     // Generate footer with expiration using helper
     // When footer is disabled, only add XML markers (no visible footer content)
     if (includeFooter) {
@@ -531,7 +538,7 @@ async function main(config = {}) {
       const triggeringPRNumber = context.payload?.pull_request?.number || (context.payload?.issue?.pull_request ? context.payload.issue.number : undefined);
       const triggeringDiscussionNumber = context.payload?.discussion?.number;
       const footer = addExpirationToFooter(
-        generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl).trimEnd(),
+        generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, { skipDetectionCaution: true }).trimEnd(),
         expiresHours,
         "Discussion"
       );
