@@ -116,6 +116,14 @@ function buildWorkflowCallId(runId, runAttempt, workflowRef) {
 }
 
 /**
+ * @param {unknown} value
+ * @returns {value is Record<string, unknown>}
+ */
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
  * Parse inbound aw_context from workflow inputs or repository_dispatch payload.
  *
  * Callers may deliver aw_context as a JSON string (workflow_call/workflow_dispatch)
@@ -135,7 +143,7 @@ function parseInboundAwContext(raw) {
     }
     try {
       const parsed = JSON.parse(trimmed);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (isRecord(parsed)) {
         return parsed;
       }
     } catch {
@@ -143,8 +151,8 @@ function parseInboundAwContext(raw) {
     }
     return null;
   }
-  if (typeof raw === "object" && !Array.isArray(raw)) {
-    return /** @type {Record<string, unknown>} */ raw;
+  if (isRecord(raw)) {
+    return raw;
   }
   return null;
 }
@@ -191,7 +199,8 @@ function readInboundAwContext(payload) {
  *   otel_trace_id: string,
  *   otel_parent_span_id: string,
  *   trigger_label: string,
- *   experiments: string
+ *   experiments: string,
+ *   allow_bot_authored_trigger_comment: boolean
  * }}
  * Properties:
  *   - item_type: Kind of entity that triggered the workflow (issue, pull_request,
@@ -229,6 +238,12 @@ function readInboundAwContext(payload) {
  *     Empty string when no experiments are declared or the assignments file cannot be read.
  *     Propagated to dispatched child workflows so they can identify which variants the
  *     parent workflow was running.
+ *   - allow_bot_authored_trigger_comment: Set to `true` when the triggering event is
+ *     an `issue_comment` with action `edited` and the comment was authored by a
+ *     different account than `github.actor` (the bot-posted-menu / user-checks-box
+ *     pattern).  Propagated to child workflows so their confused-deputy check can
+ *     skip the actor-vs-comment-author mismatch guard for this known-safe scenario.
+ *     `false` in all other cases.
  */
 function buildAwContext() {
   const { item_type, item_number, comment_id, comment_node_id } = resolveItemContext(context.payload);
@@ -267,6 +282,15 @@ function buildAwContext() {
         : currentRunId;
   const assignments = readExperimentAssignments();
   const experimentAssignments = assignments ? JSON.stringify(assignments) : "";
+
+  // Compute allow_bot_authored_trigger_comment ahead of the object.
+  // True when the triggering event is issue_comment:edited, the comment was authored
+  // by a GitHub App bot (login ends with "[bot]"), and the editor (actor) differs from
+  // the comment author — the bot-posted-menu / user-checks-box pattern.
+  const isIssueCommentEdited = context.eventName === "issue_comment" && context.payload?.action === "edited";
+  const triggerCommentAuthor = context.payload?.comment?.user?.login;
+  const triggerCommentByBot = typeof triggerCommentAuthor === "string" && triggerCommentAuthor.endsWith("[bot]");
+  const allowBotAuthoredTriggerComment = isIssueCommentEdited && triggerCommentByBot && triggerCommentAuthor !== (context.actor ?? "");
 
   return {
     repo: currentRepo,
@@ -324,6 +348,12 @@ function buildAwContext() {
     // Empty string when no experiments are declared or the assignments file cannot be read.
     // Propagated to dispatched child workflows for experiment context continuity.
     experiments: experimentAssignments,
+    // allow_bot_authored_trigger_comment is set to true when the triggering event is
+    // issue_comment:edited, the comment was authored by a GitHub App bot (login ends
+    // with "[bot]"), and the editor (actor) differs from the comment author — the
+    // bot-posted-menu / user-checks-box pattern described in gh-aw issue #29480.
+    // Propagated as metadata to child workflows so they can identify the trigger context.
+    allow_bot_authored_trigger_comment: allowBotAuthoredTriggerComment,
   };
 }
 
