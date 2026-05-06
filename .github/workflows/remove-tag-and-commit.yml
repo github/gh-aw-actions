@@ -123,8 +123,6 @@ jobs:
             echo "| Parent commit (new main head) | \\`$PARENT_SHA\\` | $PARENT_URL |"
             echo "| Current main | \\`$MAIN_SHA\\` | $MAIN_URL |"
             echo ""
-            echo "If you approve environment **confirm**, the next job will delete tag \\`$TAG\\` and force-push \\`main\\` to \\`$PARENT_SHA\\`."
-            echo ""
             echo "## Ready for destructive operation"
             echo ""
             echo "Environment **confirm** approval is required before deletion continues."
