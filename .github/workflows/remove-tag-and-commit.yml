@@ -193,9 +193,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git tag -d "$TAG"
+          git tag -d "$TAG" >/dev/null 2>&1 || echo "Local tag '$TAG' not found; continuing."
           git push origin ":refs/tags/$TAG"
-          if git ls-remote --exit-code --refs origin "refs/tags/$TAG" >/dev/null 2>&1; then
+          TAG_REMAINED=0
+          for _ in 1 2 3; do
+            if git ls-remote --exit-code --refs origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              TAG_REMAINED=1
+              sleep 1
+            else
+              TAG_REMAINED=0
+              break
+            fi
+          done
+          if [[ "$TAG_REMAINED" -eq 1 ]]; then
             echo "::error::Tag '$TAG' still exists after deletion push."
             exit 1
           fi
@@ -207,6 +217,7 @@ jobs:
           UPDATED_MAIN=$(git rev-parse origin/main)
           if [[ "$UPDATED_MAIN" != "$PARENT_SHA" ]]; then
             echo "::error::origin/main is $UPDATED_MAIN after push; expected $PARENT_SHA."
+            echo "::error::This may indicate a concurrent push. Review repository state and re-run if needed."
             exit 1
           fi
 
