@@ -89,12 +89,12 @@ jobs:
           fi
 
           PARENTS=$(git show -s --format=%P "$COMMIT_SHA")
-          PARENT_COUNT=$(wc -w <<<"$PARENTS")
+          PARENT_COUNT=$(echo -n "$PARENTS" | wc -w | tr -d '[:space:]')
           if [[ "$PARENT_COUNT" -ne 1 ]]; then
             echo "::error::Commit '$COMMIT_SHA' must have exactly one parent to remove exactly one commit from main."
             exit 1
           fi
-          PARENT_SHA="$PARENTS"
+          PARENT_SHA=$(echo "$PARENTS" | awk '{print $1}')
 
           REPO_URL="https://github.com/${{ github.repository }}"
           COMMIT_URL="$REPO_URL/commit/$COMMIT_SHA"
@@ -192,7 +192,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git tag -d -- "$TAG" 2>/dev/null || true
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            git tag -d -- "$TAG"
+          else
+            echo "Local tag '$TAG' not present; continuing with remote deletion."
+          fi
           git push origin ":refs/tags/$TAG"
           if git ls-remote --exit-code --refs origin "refs/tags/$TAG" >/dev/null 2>&1; then
             echo "::error::Tag '$TAG' still exists after deletion push."
