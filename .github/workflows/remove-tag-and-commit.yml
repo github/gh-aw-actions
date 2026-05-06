@@ -65,6 +65,11 @@ jobs:
 
           git fetch --force --tags origin main
 
+          if ! git check-ref-format "refs/tags/$TAG"; then
+            echo "::error::Tag '$TAG' is not a valid tag name."
+            exit 1
+          fi
+
           if ! git show-ref --verify --quiet "refs/tags/$TAG"; then
             echo "::error::Tag '$TAG' does not exist in this repository."
             exit 1
@@ -83,10 +88,13 @@ jobs:
             exit 1
           fi
 
-          if ! PARENT_SHA=$(git rev-parse "${COMMIT_SHA}^"); then
-            echo "::error::Commit '$COMMIT_SHA' has no parent commit and cannot be removed with this workflow."
+          PARENTS=$(git show -s --format=%P "$COMMIT_SHA")
+          PARENT_COUNT=$(wc -w <<<"$PARENTS")
+          if [[ "$PARENT_COUNT" -ne 1 ]]; then
+            echo "::error::Commit '$COMMIT_SHA' must have exactly one parent to remove exactly one commit from main."
             exit 1
           fi
+          PARENT_SHA="$PARENTS"
 
           REPO_URL="https://github.com/${{ github.repository }}"
           COMMIT_URL="$REPO_URL/commit/$COMMIT_SHA"
@@ -169,6 +177,12 @@ jobs:
         run: |
           git fetch --force --tags origin main
 
+          TAG_COMMIT_SHA=$(git rev-list -n 1 "refs/tags/$TAG")
+          if [[ "$TAG_COMMIT_SHA" != "$COMMIT_SHA" ]]; then
+            echo "::error::Tag '$TAG' currently points to $TAG_COMMIT_SHA; expected $COMMIT_SHA. Aborting."
+            exit 1
+          fi
+
           CURRENT_MAIN=$(git rev-parse origin/main)
           if [[ "$CURRENT_MAIN" != "$COMMIT_SHA" ]]; then
             echo "::error::origin/main moved to $CURRENT_MAIN after approval; expected $COMMIT_SHA. Aborting."
@@ -178,12 +192,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git tag -d "$TAG" 2>/dev/null || true
+          git tag -d -- "$TAG" 2>/dev/null || true
           git push origin ":refs/tags/$TAG"
+          if git ls-remote --exit-code --refs origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag '$TAG' still exists after deletion push."
+            exit 1
+          fi
 
           git checkout -B main origin/main
           git reset --hard "$PARENT_SHA"
           git push origin "+HEAD:refs/heads/main"
+          git fetch --force origin main
+          UPDATED_MAIN=$(git rev-parse origin/main)
+          if [[ "$UPDATED_MAIN" != "$PARENT_SHA" ]]; then
+            echo "::error::origin/main is $UPDATED_MAIN after push; expected $PARENT_SHA."
+            exit 1
+          fi
 
           {
             echo "## Tag and commit removed"
