@@ -18,6 +18,10 @@ const { computeEffectiveTokens, getTokenClassWeights, formatET } = require("./ef
  */
 
 const TOKEN_USAGE_PATH = "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl";
+const MAX_RPC_SUMMARY_DETAILS_LENGTH = 120;
+const MAX_RPC_SUMMARY_GENERIC_LENGTH = 160;
+const MAX_RPC_MESSAGE_LABEL_LENGTH = 80;
+const TOP_LEVEL_RPC_IGNORED_KEYS = new Set(["timestamp", "direction", "type", "server_id", "payload"]);
 
 /**
  * Formats milliseconds as a human-readable duration string.
@@ -321,6 +325,183 @@ function getRpcRequestLabel(entry) {
 }
 
 /**
+ * Formats an rpc-messages timestamp for display in the step summary.
+ * @param {string|undefined} timestamp
+ * @returns {string}
+ */
+function formatRpcMessageTime(timestamp) {
+  return timestamp ? timestamp.replace("T", " ").replace(/\.\d+Z$/, "Z") : "-";
+}
+
+/**
+ * Escapes text for safe display inside a markdown table cell.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function escapeMarkdownTableCell(value) {
+  return String(value ?? "-")
+    .replace(/\n/g, " ")
+    .replace(/\|/g, "\\|")
+    .trim();
+}
+
+/**
+ * Escapes text for safe use in HTML fragments embedded in markdown.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Truncates a string to a maximum length, appending an ellipsis when needed.
+ * @param {unknown} value
+ * @param {number} maxLength
+ * @returns {string}
+ */
+function truncateSummaryValue(value, maxLength) {
+  const text = String(value);
+  if (maxLength <= 0) return "";
+  if (text.length <= maxLength) return text;
+  if (maxLength < 4) return text.slice(0, maxLength);
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Normalizes an RPC summary label sourced from logs.
+ * @param {unknown} value
+ * @param {number} maxLength
+ * @returns {string}
+ */
+function normalizeRpcSummaryLabel(value, maxLength = MAX_RPC_MESSAGE_LABEL_LENGTH) {
+  return truncateSummaryValue(
+    String(value ?? "-")
+      .replace(/\s+/g, " ")
+      .trim() || "-",
+    maxLength
+  );
+}
+
+/**
+ * Formats an RPC label as HTML code for safe use inside markdown tables.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function formatRpcInlineCodeLabel(value) {
+  return `<code>${escapeHtml(normalizeRpcSummaryLabel(value))}</code>`;
+}
+
+/**
+ * Summarizes an MCP RESPONSE entry for table rendering.
+ * @param {Object} entry
+ * @returns {{status: string, details: string}}
+ */
+function summarizeRpcResponseEntry(entry) {
+  const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : {};
+  const error = payload.error && typeof payload.error === "object" ? payload.error : null;
+  if (error) {
+    const code = error.code !== null && error.code !== undefined ? ` ${error.code}` : "";
+    const message = truncateSummaryValue(String(error.message || "Unknown error"), MAX_RPC_SUMMARY_DETAILS_LENGTH);
+    return {
+      status: "error",
+      details: `error${code}: ${message}`,
+    };
+  }
+
+  const result = payload.result;
+  if (result && typeof result === "object") {
+    if (Array.isArray(result.tools)) {
+      return {
+        status: "ok",
+        details: `${result.tools.length} tool${result.tools.length !== 1 ? "s" : ""}`,
+      };
+    }
+
+    const keys = Object.keys(result);
+    if (keys.length > 0) {
+      const shownKeys = keys.slice(0, 3);
+      const moreCount = keys.length - shownKeys.length;
+      return {
+        status: "ok",
+        details: `result keys: ${shownKeys.join(", ")}${moreCount > 0 ? ` +${moreCount} more` : ""}`,
+      };
+    }
+  }
+
+  if (result !== undefined) {
+    return {
+      status: "ok",
+      details: truncateSummaryValue(JSON.stringify(result), MAX_RPC_SUMMARY_DETAILS_LENGTH),
+    };
+  }
+
+  return {
+    status: "ok",
+    details: "response received",
+  };
+}
+
+/**
+ * Summarizes a non-REQUEST rpc-messages entry for table rendering.
+ * @param {Object} entry
+ * @returns {string}
+ */
+function summarizeGenericRpcEntry(entry) {
+  const parts = [];
+  const pushPart = (key, value) => {
+    parts.push(`${key}=${truncateSummaryValue(String(value), MAX_RPC_SUMMARY_GENERIC_LENGTH)}`);
+  };
+
+  for (const [key, value] of Object.entries(entry)) {
+    if (TOP_LEVEL_RPC_IGNORED_KEYS.has(key) || value === null || value === undefined || typeof value === "object") continue;
+    pushPart(key, value);
+  }
+
+  const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : null;
+  if (payload) {
+    if (payload.method) {
+      pushPart("method", payload.method);
+    }
+    if (payload.params && typeof payload.params === "object" && payload.params.name) {
+      pushPart("tool", payload.params.name);
+    }
+    if (payload.id !== null && payload.id !== undefined) {
+      pushPart("id", payload.id);
+    }
+    if (payload.error && typeof payload.error === "object" && payload.error.message) {
+      pushPart("error", payload.error.message);
+    }
+    if (parts.length === 0) {
+      const payloadKeys = Object.keys(payload);
+      if (payloadKeys.length > 0) {
+        pushPart("payload keys", payloadKeys.join(", "));
+      }
+    }
+  }
+
+  if (parts.length === 0) {
+    return "-";
+  }
+
+  return truncateSummaryValue(parts.join(" · "), MAX_RPC_SUMMARY_GENERIC_LENGTH);
+}
+
+/**
+ * Builds a markdown table row for the RPC message summary.
+ * @param {Array<unknown>} cells
+ * @returns {string}
+ */
+function buildRpcSummaryRow(cells) {
+  return `| ${cells.map(cell => escapeMarkdownTableCell(cell)).join(" | ")} |`;
+}
+
+/**
  * Generates a markdown step summary for rpc-messages.jsonl entries (mcpg v0.2.0+ format).
  * Shows a table of REQUEST entries (tool calls), a count of RESPONSE entries, any other
  * message types, and the DIFC_FILTERED section if there are blocked events.
@@ -336,41 +517,84 @@ function generateRpcMessagesSummary(entries, difcFilteredEvents) {
   if (totalMessages === 0) return "";
 
   const parts = [];
+  /** @type {Map<string, Array<Object>>} */
+  const otherByType = new Map();
+  for (const entry of other) {
+    const entriesForType = otherByType.get(entry.type) || [];
+    entriesForType.push(entry);
+    otherByType.set(entry.type, entriesForType);
+  }
+  const renderedOtherTypes = Array.from(otherByType.keys());
 
-  // Tool calls / requests table
-  if (requests.length > 0) {
-    const blockedNote = blockedCount > 0 ? `, ${blockedCount} blocked` : "";
-    const callLines = [];
-    callLines.push("<details>");
-    callLines.push(`<summary>MCP Gateway Activity (${requests.length} request${requests.length !== 1 ? "s" : ""}${blockedNote})</summary>\n`);
-    callLines.push("");
-    callLines.push("| Time | Server | Tool / Method |");
-    callLines.push("|------|--------|---------------|");
-
-    for (const req of requests) {
-      const time = req.timestamp ? req.timestamp.replace("T", " ").replace(/\.\d+Z$/, "Z") : "-";
-      const server = req.server_id || "-";
-      const label = getRpcRequestLabel(req);
-      callLines.push(`| ${time} | ${server} | \`${label}\` |`);
-    }
-
-    callLines.push("");
-    callLines.push("</details>\n");
-    parts.push(callLines.join("\n"));
-  } else if (blockedCount > 0) {
+  if (requests.length === 0 && responses.length === 0 && other.length === 0 && blockedCount > 0) {
     // No requests, but there are DIFC_FILTERED events — add a minimal header
     parts.push(`<details>\n<summary>MCP Gateway Activity (${blockedCount} blocked)</summary>\n\n*All tool calls were blocked by the integrity filter.*\n\n</details>\n`);
-  }
-
-  // Other message types (not REQUEST, RESPONSE, DIFC_FILTERED)
-  if (other.length > 0) {
-    /** @type {Record<string, number>} */
-    const typeCounts = {};
-    for (const entry of other) {
-      typeCounts[entry.type] = (typeCounts[entry.type] || 0) + 1;
+  } else {
+    const summaryParts = [];
+    if (requests.length > 0) {
+      summaryParts.push(`${requests.length} request${requests.length !== 1 ? "s" : ""}`);
     }
-    const otherLines = Object.entries(typeCounts).map(([type, count]) => `- **${type}**: ${count} message${count !== 1 ? "s" : ""}`);
-    parts.push("<details>\n<summary>Other Gateway Messages</summary>\n\n" + otherLines.join("\n") + "\n\n</details>\n");
+    if (responses.length > 0) {
+      summaryParts.push(`${responses.length} response${responses.length !== 1 ? "s" : ""}`);
+    }
+    for (const type of renderedOtherTypes) {
+      const count = otherByType.get(type)?.length || 0;
+      summaryParts.push(`${count} ${escapeHtml(normalizeRpcSummaryLabel(type))}`);
+    }
+    if (blockedCount > 0) {
+      summaryParts.push(`${blockedCount} blocked`);
+    }
+
+    const callLines = [];
+    callLines.push("<details>");
+    callLines.push(`<summary>MCP Gateway Activity (${summaryParts.join(", ")})</summary>\n`);
+    callLines.push("");
+
+    if (requests.length > 0) {
+      callLines.push("#### REQUEST");
+      callLines.push("");
+      callLines.push("| Time | Server | Tool / Method |");
+      callLines.push("|------|--------|---------------|");
+
+      for (const req of requests) {
+        const time = formatRpcMessageTime(req.timestamp);
+        const server = escapeMarkdownTableCell(req.server_id || "-");
+        const label = formatRpcInlineCodeLabel(getRpcRequestLabel(req));
+        callLines.push(`| ${time} | ${server} | ${label} |`);
+      }
+
+      callLines.push("");
+    }
+
+    if (responses.length > 0) {
+      callLines.push("#### RESPONSE");
+      callLines.push("");
+      callLines.push("| Time | Server | Direction | Status | Details |");
+      callLines.push("|------|--------|-----------|--------|---------|");
+
+      for (const response of responses) {
+        const { status, details } = summarizeRpcResponseEntry(response);
+        callLines.push(buildRpcSummaryRow([formatRpcMessageTime(response.timestamp), response.server_id || "-", response.direction || "-", status, details]));
+      }
+
+      callLines.push("");
+    }
+
+    for (const type of renderedOtherTypes) {
+      callLines.push(`#### ${escapeHtml(normalizeRpcSummaryLabel(type))}`);
+      callLines.push("");
+      callLines.push("| Time | Server | Direction | Details |");
+      callLines.push("|------|--------|-----------|---------|");
+
+      for (const entry of otherByType.get(type) || []) {
+        callLines.push(buildRpcSummaryRow([formatRpcMessageTime(entry.timestamp), entry.server_id || "-", entry.direction || "-", summarizeGenericRpcEntry(entry)]));
+      }
+
+      callLines.push("");
+    }
+
+    callLines.push("</details>\n");
+    parts.push(callLines.join("\n"));
   }
 
   // DIFC_FILTERED section (re-uses existing table renderer)
