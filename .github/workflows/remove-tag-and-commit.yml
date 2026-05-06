@@ -60,8 +60,13 @@ jobs:
 
       - name: Resolve tag and commit information
         id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_ROLE: ${{ steps.permission.outputs.role }}
         run: |
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
 
           git fetch --force --tags origin main
 
@@ -97,7 +102,7 @@ jobs:
           fi
           PARENT_SHA="${PARENTS_ARRAY[0]}"
 
-          REPO_URL="https://github.com/${{ github.repository }}"
+          REPO_URL="https://github.com/$REPOSITORY"
           COMMIT_URL="$REPO_URL/commit/$COMMIT_SHA"
           PARENT_URL="$REPO_URL/commit/$PARENT_SHA"
           TAG_URL="$REPO_URL/releases/tag/$TAG"
@@ -110,21 +115,33 @@ jobs:
             echo ""
             echo "| Field | Raw value | URL |"
             echo "|---|---|---|"
-            echo "| Repository | \\`${{ github.repository }}\\` | $REPO_URL |"
-            echo "| Actor | \\`${{ github.actor }}\\` | https://github.com/${{ github.actor }} |"
-            echo "| Actor role | \\`${{ steps.permission.outputs.role }}\\` | n/a |"
+            echo "| Repository | \\`$REPOSITORY\\` | $REPO_URL |"
+            echo "| Actor | \\`$ACTOR\\` | https://github.com/$ACTOR |"
+            echo "| Actor role | \\`$ACTOR_ROLE\\` | n/a |"
             echo "| Tag | \\`$TAG\\` | $TAG_URL |"
             echo "| Tagged commit | \\`$COMMIT_SHA\\` | $COMMIT_URL |"
             echo "| Parent commit (new main head) | \\`$PARENT_SHA\\` | $PARENT_URL |"
             echo "| Current main | \\`$MAIN_SHA\\` | $MAIN_URL |"
             echo ""
             echo "If you approve environment **confirm**, the next job will delete tag \\`$TAG\\` and force-push \\`main\\` to \\`$PARENT_SHA\\`."
+            echo ""
+            echo "## Ready for destructive operation"
+            echo ""
+            echo "Environment **confirm** approval is required before deletion continues."
+            echo ""
+            echo "- Tag: \\`$TAG\\`"
+            echo "- Tagged commit: \\`$COMMIT_SHA\\`"
+            echo "- New main head after rewrite: \\`$PARENT_SHA\\`"
+            echo "- Tag URL: $TAG_URL"
+            echo "- Commit URL: $COMMIT_URL"
+            echo "- Parent URL: $PARENT_URL"
+            echo "- Main URL: $MAIN_URL"
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
           echo "parent_sha=$PARENT_SHA" >> "$GITHUB_OUTPUT"
-          echo "actor_role=${{ steps.permission.outputs.role }}" >> "$GITHUB_OUTPUT"
+          echo "actor_role=$ACTOR_ROLE" >> "$GITHUB_OUTPUT"
           echo "commit_url=$COMMIT_URL" >> "$GITHUB_OUTPUT"
           echo "parent_url=$PARENT_URL" >> "$GITHUB_OUTPUT"
           echo "tag_url=$TAG_URL" >> "$GITHUB_OUTPUT"
@@ -138,21 +155,9 @@ jobs:
     permissions: {}
 
     steps:
-      - name: Await approval in confirm environment
+      - name: Wait for manual approval
         run: |
-          {
-            echo "## Ready for destructive operation"
-            echo ""
-            echo "Environment **confirm** approval is required before deletion continues."
-            echo ""
-            echo "- Tag: \\`${{ needs.prepare.outputs.tag }}\\`"
-            echo "- Tagged commit: \\`${{ needs.prepare.outputs.commit_sha }}\\`"
-            echo "- New main head after rewrite: \\`${{ needs.prepare.outputs.parent_sha }}\\`"
-            echo "- Tag URL: ${{ needs.prepare.outputs.tag_url }}"
-            echo "- Commit URL: ${{ needs.prepare.outputs.commit_url }}"
-            echo "- Parent URL: ${{ needs.prepare.outputs.parent_url }}"
-            echo "- Main URL: ${{ needs.prepare.outputs.main_url }}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Manual approval granted in confirm environment."
 
   remove:
     name: Remove tag and commit
