@@ -89,12 +89,16 @@ jobs:
           fi
 
           PARENTS=$(git show -s --format=%P "$COMMIT_SHA")
-          PARENT_COUNT=$(echo -n "$PARENTS" | wc -w | tr -d '[:space:]')
+          if [[ -z "$PARENTS" ]]; then
+            echo "::error::Commit '$COMMIT_SHA' has no parent commit and cannot be removed."
+            exit 1
+          fi
+          PARENT_COUNT=$(echo "$PARENTS" | awk '{print NF}')
           if [[ "$PARENT_COUNT" -ne 1 ]]; then
             echo "::error::Commit '$COMMIT_SHA' must have exactly one parent to remove exactly one commit from main."
             exit 1
           fi
-          PARENT_SHA=$(echo "$PARENTS" | awk '{print $1}')
+          PARENT_SHA="$PARENTS"
 
           REPO_URL="https://github.com/${{ github.repository }}"
           COMMIT_URL="$REPO_URL/commit/$COMMIT_SHA"
@@ -193,7 +197,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if git show-ref --verify --quiet "refs/tags/$TAG"; then
-            git tag -d -- "$TAG"
+            git tag -d "$TAG"
           else
             echo "Local tag '$TAG' not present; continuing with remote deletion."
           fi
