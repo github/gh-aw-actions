@@ -12,7 +12,13 @@ const { parseOTLPEndpoints, sendOTLPToAllEndpoints, sanitizeOTLPPayload, appendT
  * @returns {payload is { resourceSpans: unknown[] }}
  */
 function isOTLPPayload(payload) {
-  return !!payload && typeof payload === "object" && Array.isArray(payload.resourceSpans);
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+
+  /** @type {{ resourceSpans?: unknown }} */
+  const payloadWithResourceSpans = payload;
+  return Array.isArray(payloadWithResourceSpans.resourceSpans);
 }
 
 /**
