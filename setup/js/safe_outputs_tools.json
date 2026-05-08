@@ -21,6 +21,25 @@
           },
           "description": "Labels to categorize the issue (e.g., 'bug', 'enhancement'). Labels must exist in the repository."
         },
+        "fields": {
+          "type": "array",
+          "description": "Optional issue fields to set after creating the issue (e.g., Priority, Iteration, Start Date).",
+          "items": {
+            "type": "object",
+            "required": ["name", "value"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Issue field name exactly as configured in the repository (e.g., \"Priority\", \"Iteration\")."
+              },
+              "value": {
+                "type": ["string", "number"],
+                "description": "Field value. Use string for text, single-select, iteration, and date (YYYY-MM-DD) fields; use number for numeric fields."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
         "parent": {
           "type": ["number", "string"],
           "description": "Parent issue number for creating sub-issues. This is the numeric ID from the GitHub URL (e.g., 42 in github.com/owner/repo/issues/42). Can also be a temporary_id (e.g., 'aw_abc123', 'aw_Test123') from a previously created issue in the same workflow run."
@@ -1109,6 +1128,41 @@
         "issue_type": {
           "type": "string",
           "description": "Issue type name to set (e.g., \"Bug\", \"Feature\", \"Task\"). Use an empty string \"\" to clear the current issue type."
+        },
+        "secrecy": {
+          "type": "string",
+          "description": "Confidentiality level of the message content (e.g., \"public\", \"internal\", \"private\")."
+        },
+        "integrity": {
+          "type": "string",
+          "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "set_issue_field",
+    "description": "Set a single GitHub issue field by name and value. Use field_name for discovery by field label (for example, \"Priority\"), or provide field_node_id to skip discovery. Supports text, number, date (YYYY-MM-DD), and single-select fields (value must match an option name).",
+    "inputSchema": {
+      "type": "object",
+      "required": ["value"],
+      "properties": {
+        "issue_number": {
+          "type": ["number", "string"],
+          "description": "Issue number to set the field on. If omitted, targets the issue that triggered this workflow."
+        },
+        "field_name": {
+          "type": "string",
+          "description": "Issue field name to set (e.g., \"Priority\", \"Severity\", \"Customer Impact\")."
+        },
+        "field_node_id": {
+          "type": "string",
+          "description": "Optional GraphQL node ID of the issue field. Provide this to skip field-name discovery and set a field directly."
+        },
+        "value": {
+          "type": "string",
+          "description": "Field value to set. For single-select fields, this must match an existing option name. For date fields, use YYYY-MM-DD."
         },
         "secrecy": {
           "type": "string",

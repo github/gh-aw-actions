@@ -23,6 +23,9 @@ const fs = require("fs");
 const path = require("path");
 
 const MAX_STATE_FILE_BYTES = 102400;
+// Keep this allowlist aligned with actions/setup/js/normalize_branch_name.cjs valid characters.
+const BRANCH_NAME_PATTERN = /^[A-Za-z0-9._/-]+$/;
+const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 /**
  * Returns true when decoded state content exceeds allowed byte length.
@@ -33,6 +36,35 @@ const MAX_STATE_FILE_BYTES = 102400;
  */
 function checkLimit(content, maxBytes) {
   return content.length > maxBytes;
+}
+
+/**
+ * Validate required input values before any API calls.
+ *
+ * @param {string} branch
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} repository
+ * @returns {{valid: boolean, error?: string}}
+ */
+function validateInputs(branch, owner, repo, repository) {
+  if (!branch) {
+    return { valid: false, error: "GH_AW_EXPERIMENT_BRANCH is not set" };
+  }
+
+  if (!BRANCH_NAME_PATTERN.test(branch)) {
+    return { valid: false, error: "GH_AW_EXPERIMENT_BRANCH contains invalid characters" };
+  }
+
+  if (branch.includes("..")) {
+    return { valid: false, error: "GH_AW_EXPERIMENT_BRANCH contains invalid characters" };
+  }
+
+  if (!REPOSITORY_PATTERN.test(repository)) {
+    return { valid: false, error: "GITHUB_REPOSITORY is not set or invalid" };
+  }
+
+  return { valid: true };
 }
 
 /**
@@ -76,16 +108,12 @@ async function main() {
   const stateFile = process.env.GH_AW_EXPERIMENT_STATE_FILE || "/tmp/gh-aw/experiments/state.json";
   const stateDir = process.env.GH_AW_EXPERIMENT_STATE_DIR || "/tmp/gh-aw/experiments";
   const branch = process.env.GH_AW_EXPERIMENT_BRANCH || "";
+  const repository = process.env.GITHUB_REPOSITORY || "";
+  const [owner, repo] = repository.split("/");
 
-  if (!branch) {
-    core.warning("GH_AW_EXPERIMENT_BRANCH is not set – starting with empty experiment state");
-    fs.mkdirSync(stateDir, { recursive: true });
-    return;
-  }
-
-  const [owner, repo] = (process.env.GITHUB_REPOSITORY || "/").split("/");
-  if (!owner || !repo) {
-    core.warning("GITHUB_REPOSITORY is not set – starting with empty experiment state");
+  const validationResult = validateInputs(branch, owner, repo, repository);
+  if (!validationResult.valid) {
+    core.warning(`${validationResult.error} – starting with empty experiment state`);
     fs.mkdirSync(stateDir, { recursive: true });
     return;
   }
@@ -133,4 +161,4 @@ async function main() {
   core.info(`Experiment state written to ${stateFile}`);
 }
 
-module.exports = { main, fetchFileFromBranch };
+module.exports = { main, fetchFileFromBranch, validateInputs };
