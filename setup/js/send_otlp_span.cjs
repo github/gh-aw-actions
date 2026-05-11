@@ -100,6 +100,19 @@ function buildAttr(key, value) {
 }
 
 /**
+ * Build an OTLP key-value attribute with an array of string values.
+ * Used for OTel attributes whose type is `string[]`, such as
+ * `gen_ai.response.finish_reasons`.
+ *
+ * @param {string} key
+ * @param {string[]} values
+ * @returns {{ key: string, value: { arrayValue: { values: Array<{ stringValue: string }> } } }}
+ */
+function buildArrayAttr(key, values) {
+  return { key, value: { arrayValue: { values: values.map(v => ({ stringValue: String(v) })) } } };
+}
+
+/**
  * Build the workflow-call identifier for the current run when enough GitHub
  * context is available.
  *
@@ -778,6 +791,10 @@ function isValidSpanId(id) {
  *   and if none of those are set a new random trace ID is generated.
  *   Pass the `trace-id` output of the activation job setup step to correlate all
  *   subsequent job spans under the same trace.
+ * @property {string} [parentSpanId] - Parent span ID to use for setup-span nesting.
+ *   When omitted the value is taken from the `INPUT_PARENT_SPAN_ID` environment variable
+ *   (the `parent-span-id` action input); if that is also absent the
+ *   `otel_parent_span_id` field from `aw_info.context` is used.
  */
 
 /**
@@ -785,7 +802,7 @@ function isValidSpanId(id) {
  * is configured) to the configured OTLP endpoint.
  *
  * This is designed to be called from `actions/setup/index.js` immediately after
- * the setup script completes.  It always returns `{ traceId, spanId }` so callers
+ * the setup script completes.  It always returns `{ traceId, spanId, parentSpanId }` so callers
  * can expose the trace ID as an action output and write both values to `$GITHUB_ENV`
  * for downstream step correlation — even when `OTEL_EXPORTER_OTLP_ENDPOINT` is not
  * set (no span is sent in that case).
@@ -796,6 +813,7 @@ function isValidSpanId(id) {
  * - `OTEL_SERVICE_NAME`            – service name (defaults to "gh-aw")
  * - `INPUT_JOB_NAME`               – job name passed via the `job-name` action input
  * - `INPUT_TRACE_ID`               – optional trace ID passed via the `trace-id` action input
+ * - `INPUT_PARENT_SPAN_ID`         – optional parent span ID passed via the `parent-span-id` action input
  * - `GH_AW_INFO_WORKFLOW_NAME`     – workflow name injected by the gh-aw compiler
  * - `GH_AW_INFO_ENGINE_ID`         – engine ID injected by the gh-aw compiler
  * - `GITHUB_RUN_ID`                – GitHub Actions run ID
@@ -813,7 +831,7 @@ function isValidSpanId(id) {
  *   (and specific comment) that triggered the workflow
  *
  * @param {SendJobSetupSpanOptions} [options]
- * @returns {Promise<{ traceId: string, spanId: string }>} The trace and span IDs used.
+ * @returns {Promise<{ traceId: string, spanId: string, parentSpanId: string }>} The trace/span IDs used and resolved parent span ID.
  */
 async function sendJobSetupSpan(options = {}) {
   // Resolve the trace ID before the early-return so it is always available as
@@ -823,6 +841,7 @@ async function sendJobSetupSpan(options = {}) {
 
   // Validate options.traceId if supplied; callers may pass raw user input.
   const optionsTraceId = options.traceId && isValidTraceId(options.traceId) ? options.traceId : "";
+  const optionsParentSpanId = options.parentSpanId && isValidSpanId(options.parentSpanId) ? options.parentSpanId : "";
 
   // Normalize INPUT_TRACE_ID to lowercase before validating: OTLP requires lowercase
   // hex, but trace IDs pasted from external tools may use uppercase characters.
@@ -830,6 +849,8 @@ async function sendJobSetupSpan(options = {}) {
   // input name hyphen instead of converting it to an underscore.
   const rawInputTraceId = (process.env.INPUT_TRACE_ID || process.env["INPUT_TRACE-ID"] || "").trim().toLowerCase();
   const inputTraceId = isValidTraceId(rawInputTraceId) ? rawInputTraceId : "";
+  const rawInputParentSpanId = (process.env.INPUT_PARENT_SPAN_ID || process.env["INPUT_PARENT-SPAN-ID"] || "").trim().toLowerCase();
+  const inputParentSpanId = isValidSpanId(rawInputParentSpanId) ? rawInputParentSpanId : "";
 
   // When this job was dispatched by a parent workflow, the parent's trace ID is
   // propagated via aw_context.otel_trace_id → aw_info.context.otel_trace_id so that
@@ -853,6 +874,7 @@ async function sendJobSetupSpan(options = {}) {
   const commentId = typeof awInfo.context?.comment_id === "string" ? awInfo.context.comment_id : "";
 
   const traceId = optionsTraceId || inputTraceId || contextTraceId || generateTraceId();
+  const parentSpanId = optionsParentSpanId || inputParentSpanId || contextParentSpanId || "";
 
   // Always generate a span ID so it can be written to GITHUB_ENV as
   // GITHUB_AW_OTEL_PARENT_SPAN_ID even when OTLP is not configured, allowing downstream
@@ -924,7 +946,7 @@ async function sendJobSetupSpan(options = {}) {
   const payload = buildOTLPPayload({
     traceId,
     spanId,
-    ...(contextParentSpanId ? { parentSpanId: contextParentSpanId } : {}),
+    ...(parentSpanId ? { parentSpanId } : {}),
     spanName: jobName ? `gh-aw.${jobName}.setup` : "gh-aw.job.setup",
     startMs,
     endMs,
@@ -939,12 +961,12 @@ async function sendJobSetupSpan(options = {}) {
 
   const endpoints = parseOTLPEndpoints();
   if (endpoints.length === 0) {
-    return { traceId, spanId };
+    return { traceId, spanId, parentSpanId };
   }
 
   // Pass skipJSONL: true so sendOTLPToAllEndpoints/sendOTLPSpan don't double-write the mirror.
   await sendOTLPToAllEndpoints(endpoints, payload, { skipJSONL: true });
-  return { traceId, spanId };
+  return { traceId, spanId, parentSpanId };
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1097,7 @@ function getErrorMessage(errorEntry) {
  * @typedef {Object} AgentRuntimeMetrics
  * @property {number | undefined} turns
  * @property {number | undefined} estimatedCostUsd
+ * @property {string | undefined} stopReason
  * @property {number} warningCount
  */
 
@@ -1085,7 +1108,7 @@ function getErrorMessage(errorEntry) {
  */
 function readAgentRuntimeMetrics() {
   /** @type {AgentRuntimeMetrics} */
-  const metrics = { turns: undefined, estimatedCostUsd: undefined, warningCount: 0 };
+  const metrics = { turns: undefined, estimatedCostUsd: undefined, stopReason: undefined, warningCount: 0 };
 
   try {
     const content = fs.readFileSync(AGENT_STDIO_LOG_PATH, "utf8");
@@ -1117,6 +1140,9 @@ function readAgentRuntimeMetrics() {
         }
         if (typeof parsed.total_cost_usd === "number" && Number.isFinite(parsed.total_cost_usd) && parsed.total_cost_usd >= 0) {
           metrics.estimatedCostUsd = parsed.total_cost_usd;
+        }
+        if (typeof parsed.stop_reason === "string" && parsed.stop_reason) {
+          metrics.stopReason = parsed.stop_reason;
         }
       } catch {
         // Ignore non-JSON and truncated log lines.
@@ -1251,7 +1277,8 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const runtimeMetrics = readAgentRuntimeMetrics();
 
   // Mark the span as an error when the agent job failed, timed out, or was cancelled.
-  const isAgentFailure = agentConclusion === "failure" || agentConclusion === "timed_out";
+  const isAgentTimedOut = agentConclusion === "timed_out";
+  const isAgentFailure = agentConclusion === "failure" || isAgentTimedOut;
   const isAgentCancelled = agentConclusion === "cancelled";
   const isAgentNonOK = isAgentFailure || isAgentCancelled;
   // STATUS_CODE_ERROR = 2, STATUS_CODE_OK = 1
@@ -1264,7 +1291,10 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   }
 
   // Always read agent_output.json so output metrics are available on all outcomes.
-  const agentOutput = readJSONIfExists("/tmp/gh-aw/agent_output.json") || {};
+  const rawAgentOutput = readJSONIfExists("/tmp/gh-aw/agent_output.json");
+  const agentOutput = rawAgentOutput || {};
+  // readJSONIfExists returns null when the file is absent OR unreadable (e.g. partial/corrupt write).
+  const hasNoReadableAgentOutput = rawAgentOutput === null;
   const outputErrors = Array.isArray(agentOutput.errors) ? agentOutput.errors : [];
   const outputItems = Array.isArray(agentOutput.items) ? agentOutput.items : [];
   const errorMessages = outputErrors.map(getErrorMessage).filter(Boolean).slice(0, 5);
@@ -1375,7 +1405,18 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // making individual errors queryable and classifiable in backends like
   // Grafana Tempo, Honeycomb, and Datadog.
   const buildSpanEvents = eventTimeMs => {
+    const shouldEmitSyntheticException = hasNoReadableAgentOutput && isAgentNonOK;
     if (outputErrors.length === 0) {
+      if (shouldEmitSyntheticException) {
+        let exceptionType = "gh-aw.AgentFailed";
+        if (isAgentTimedOut) {
+          exceptionType = "gh-aw.AgentTimedOut";
+        } else if (isAgentCancelled) {
+          exceptionType = "gh-aw.AgentCancelled";
+        }
+        const exceptionMessage = (statusMessage || `agent ${agentConclusion}`).slice(0, MAX_ATTR_VALUE_LENGTH);
+        return [{ timeUnixNano: toNanoString(eventTimeMs), name: "exception", attributes: [buildAttr("exception.type", exceptionType), buildAttr("exception.message", exceptionMessage)] }];
+      }
       return [];
     }
     const errorTimeNano = toNanoString(eventTimeMs);
@@ -1462,6 +1503,12 @@ async function sendJobConclusionSpan(spanName, options = {}) {
     // gen_ai.workflow.name identifies the agentic workflow, matching the OTel spec example
     // use-cases (e.g. "multi_agent_rag", "customer_support_pipeline").
     if (workflowName) agentAttributes.push(buildAttr("gen_ai.workflow.name", workflowName));
+    // gen_ai.response.finish_reasons is a standard OTel GenAI response attribute (array of strings).
+    // It exposes the stop_reason from the agent's result line so operators can detect truncated
+    // runs (e.g. "max_tokens") that would otherwise silently appear as STATUS_OK.
+    if (runtimeMetrics.stopReason) {
+      agentAttributes.push(buildArrayAttr("gen_ai.response.finish_reasons", [runtimeMetrics.stopReason]));
+    }
 
     const agentPayload = buildOTLPPayload({
       traceId,
@@ -1528,6 +1575,7 @@ module.exports = {
   generateSpanId,
   toNanoString,
   buildAttr,
+  buildArrayAttr,
   buildGitHubActionsResourceAttributes,
   buildOTLPSpan,
   buildOTLPBatchPayload,

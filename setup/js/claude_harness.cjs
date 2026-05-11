@@ -61,7 +61,11 @@ const MAX_DELAY_MS = 60000;
 const OVERLOADED_ERROR_PATTERN = /overloaded_error|"overloaded"/i;
 
 // Pattern to detect Anthropic rate-limit errors (HTTP 429).
-const RATE_LIMIT_ERROR_PATTERN = /rate_limit_error|429 Too Many Requests/i;
+// Claude CLI may surface this as:
+//   - transport-style text (e.g. "429 Too Many Requests")
+//   - embedded stream-json result fields (e.g. "api_error_status":429)
+//   - human-readable message text ("rate limit")
+const RATE_LIMIT_ERROR_PATTERN = /rate_limit_error|429 Too Many Requests|"api_error_status"\s*:\s*429|request rejected \(429\)|rate limit/i;
 
 // Pattern to detect a clean max-turns exit from Claude Code.
 // Claude Code emits a JSON result object with "subtype":"error_max_turns" when the
@@ -73,8 +77,9 @@ const MAX_TURNS_EXIT_PATTERN = /"subtype"\s*:\s*"error_max_turns"/;
 // This occurs when --continue is attempted but the session either was never deferred,
 // the deferred marker is stale (tool already ran), or it falls outside the tail-scan
 // window.  Retrying with --continue will always produce the same instant failure, so
-// this is a deterministic terminal condition that must not be retried.
+// this path must not be retried via --continue (fall back to a fresh run if budget remains).
 const NO_DEFERRED_MARKER_PATTERN = /No deferred tool marker found/i;
+const SIGNAL_TERMINATION_EXIT_CODES = new Set([137, 143]);
 
 /**
  * Emit a timestamped diagnostic log line to stderr.
@@ -122,12 +127,47 @@ function isMaxTurnsExit(output) {
  * This occurs when Claude Code is invoked with --continue but the session was never
  * deferred, the deferred marker is stale (tool already ran), or it falls outside the
  * tail-scan window.  Each retry with --continue will instantly produce the same error,
- * so this is a deterministic terminal condition that must not be retried.
+ * so this should not be retried via --continue (fall back to fresh run retries).
  * @param {string} output - Collected stdout+stderr from the process
  * @returns {boolean}
  */
 function isNoDeferredMarkerError(output) {
   return NO_DEFERRED_MARKER_PATTERN.test(output);
+}
+
+/**
+ * Determines whether the exit code corresponds to signal-style termination
+ * (SIGKILL=137 / SIGTERM=143), typically from timeout/cancellation.
+ * @param {number} exitCode
+ * @returns {boolean}
+ */
+function isSignalTerminationExitCode(exitCode) {
+  return SIGNAL_TERMINATION_EXIT_CODES.has(exitCode);
+}
+
+/**
+ * Decide whether the next retry should use --continue.
+ * @param {{
+ *   attempt: number,
+ *   maxRetries: number,
+ *   exitCode: number,
+ *   hasOutput: boolean,
+ *   isNoDeferredMarker: boolean,
+ *   continueDisabledPermanently: boolean
+ * }} input
+ * @returns {boolean}
+ */
+function shouldRetryWithContinue({ attempt, maxRetries, exitCode, hasOutput, isNoDeferredMarker, continueDisabledPermanently }) {
+  if (attempt >= maxRetries || !hasOutput || continueDisabledPermanently) {
+    return false;
+  }
+  if (isSignalTerminationExitCode(exitCode)) {
+    return false;
+  }
+  if (isNoDeferredMarker) {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -204,6 +244,17 @@ function stripPromptFileArgs(args) {
 }
 
 /**
+ * Strip any user-supplied --continue flags from args.
+ * The harness decides when --continue should be used on retries.
+ *
+ * @param {string[]} args
+ * @returns {string[]}
+ */
+function stripContinueArgs(args) {
+  return args.filter(arg => arg !== "--continue");
+}
+
+/**
  * Main entry point: run claude with retry logic for transient API failures.
  */
 async function main() {
@@ -226,8 +277,9 @@ async function main() {
     log(`fatal: ${e.message}`);
     process.exit(1);
   }
+  const freshRetryArgs = stripContinueArgs(initialArgs);
   // Args without --prompt-file, used as the base for --continue retries.
-  const continueBaseArgs = stripPromptFileArgs(args);
+  const continueBaseArgs = stripContinueArgs(stripPromptFileArgs(args));
 
   // Detect whether the original args included --prompt-file so we know whether
   // initialArgs carries prompt text as its last positional arg.
@@ -237,6 +289,7 @@ async function main() {
   // initialArgs is the resolved prompt content. Replace it with a placeholder so that
   // task instructions are never written to stderr or captured in agent logs.
   const safeInitialArgs = hadPromptFile && initialArgs.length > 0 ? [...initialArgs.slice(0, -1), "<prompt omitted>"] : initialArgs;
+  const safeFreshRetryArgs = hadPromptFile && freshRetryArgs.length > 0 ? [...freshRetryArgs.slice(0, -1), "<prompt omitted>"] : freshRetryArgs;
 
   // Fetch AWF API proxy reflection data before running the agent to capture initial proxy state.
   // This is best-effort: failures are logged but do not affect the agent run.
@@ -245,6 +298,7 @@ async function main() {
   let delay = INITIAL_DELAY_MS;
   let lastExitCode = 1;
   let useContinueOnRetry = false;
+  let continueDisabledPermanently = false;
   const driverStartTime = Date.now();
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -255,11 +309,11 @@ async function main() {
     if (attempt > 0 && useContinueOnRetry) {
       currentArgs = [...continueBaseArgs, "--continue"];
     } else {
-      currentArgs = initialArgs;
+      currentArgs = attempt === 0 ? initialArgs : freshRetryArgs;
     }
 
     // Use redacted args for logging when the run carries the prompt text.
-    const logArgs = attempt === 0 || !useContinueOnRetry ? safeInitialArgs : currentArgs;
+    const logArgs = attempt === 0 ? safeInitialArgs : useContinueOnRetry ? currentArgs : safeFreshRetryArgs;
 
     if (attempt > 0) {
       const retryMode = useContinueOnRetry ? "--continue" : "fresh run";
@@ -305,19 +359,44 @@ async function main() {
 
     // "No deferred tool marker found" is a deterministic terminal condition: the session
     // was never deferred, the marker is stale (tool already ran), or it falls outside the
-    // tail-scan window.  Retrying with --continue always produces the same instant failure,
-    // so we stop immediately to avoid wasting retry budget and masking the real cause.
+    // tail-scan window. If this happens on a --continue attempt, restart fresh and disable
+    // --continue permanently so we do not re-enter the same invalid retry path.
     if (isNoDeferredMarker) {
-      log(`attempt ${attempt + 1}: no deferred tool marker — not retriable via --continue`);
+      if (attempt < MAX_RETRIES && result.hasOutput) {
+        useContinueOnRetry = false;
+        continueDisabledPermanently = true;
+        log(`attempt ${attempt + 1}: no deferred tool marker on --continue — retrying as fresh run (failure_reason=harness_retry_path_invalid, --continue disabled permanently, attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
+        continue;
+      }
+      log(`attempt ${attempt + 1}: no deferred tool marker — not retriable via --continue (failure_reason=harness_retry_path_invalid)`);
       break;
     }
 
     // Retry when the session was partially executed (has output).
     // Use --continue so Claude Code can resume from its saved session state.
     if (attempt < MAX_RETRIES && result.hasOutput) {
-      const reason = isOverloaded ? "overloaded_error (transient)" : isRateLimit ? "rate_limit_error (transient)" : "partial execution";
-      useContinueOnRetry = true;
-      log(`attempt ${attempt + 1}: ${reason} — will retry with --continue (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
+      const isSignalTermination = isSignalTerminationExitCode(result.exitCode);
+      const retryWithContinue = shouldRetryWithContinue({
+        attempt,
+        maxRetries: MAX_RETRIES,
+        exitCode: result.exitCode,
+        hasOutput: result.hasOutput,
+        isNoDeferredMarker,
+        continueDisabledPermanently,
+      });
+      if (isSignalTermination) {
+        continueDisabledPermanently = true;
+      }
+      const reason = isSignalTermination
+        ? `signal-style termination exitCode=${result.exitCode} (failure_reason=cancelled_or_timed_out)`
+        : isOverloaded
+          ? "overloaded_error (transient)"
+          : isRateLimit
+            ? "rate_limit_error (transient)"
+            : "partial execution";
+      useContinueOnRetry = retryWithContinue;
+      const retryMode = retryWithContinue ? "--continue" : "fresh run (--continue disabled permanently)";
+      log(`attempt ${attempt + 1}: ${reason} — will retry with ${retryMode} (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
       continue;
     }
 
@@ -341,8 +420,11 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     resolveClaudePromptFileArgs,
     stripPromptFileArgs,
+    isRateLimitError,
     isMaxTurnsExit,
     isNoDeferredMarkerError,
+    isSignalTerminationExitCode,
+    shouldRetryWithContinue,
   };
 }
 

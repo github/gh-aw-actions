@@ -146,6 +146,17 @@ const ALLOWED_EXPRESSIONS = [
 function isSafeExpression(expr) {
   const trimmed = expr.trim();
 
+  // Expressions containing line terminators are never safe.
+  // A newline inside an expression can split the operator regex matching and
+  // cause compound expressions like "safe == 'x' &\n 'payload' || 'default'"
+  // to appear safe via the comparison extractor even though the full expression
+  // is not.  Cover all JavaScript line terminator characters: LF, CR, LS (U+2028),
+  // and PS (U+2029).  Check the original `expr` (before trimming) so that
+  // leading/trailing line terminators like "\ngithub.repository\n" are also caught.
+  if (/[\n\r\u2028\u2029]/.test(expr)) {
+    return false;
+  }
+
   // Block dangerous JavaScript built-in property names
   const DANGEROUS_PROPS = [
     "constructor",
@@ -341,16 +352,11 @@ function isSafeExpression(expr) {
   // This check only runs for expressions that have no top-level || or && operators (since those
   // cases are fully handled above), preventing a partially-validated compound expression from
   // sneaking through via the comparison path.
-  // Extract each property access on the left side of a comparison operator and verify it is in
-  // the allowed list.  This mirrors the Go comparisonExtractionRegex logic.
-  const compExtractRegex = /([a-zA-Z_][a-zA-Z0-9_.]*)\s*(?:==|!=|<=?|>=?)\s*/g;
-  const comparisonProps = [];
-  let compMatch;
-  while ((compMatch = compExtractRegex.exec(trimmed)) !== null) {
-    comparisonProps.push(compMatch[1].trim());
-  }
-  if (comparisonProps.length > 0 && comparisonProps.every(prop => isSafeExpression(prop))) {
-    return true;
+  const comparisonMatch = trimmed.match(/^(.+?)\s*(?:==|!=|<=?|>=?)\s*(.+)$/);
+  if (comparisonMatch) {
+    const leftExpr = comparisonMatch[1].trim();
+    const rightExpr = comparisonMatch[2].trim();
+    return leftExpr.length > 0 && rightExpr.length > 0 && isSafeExpression(leftExpr) && isSafeExpression(rightExpr);
   }
 
   return false;
