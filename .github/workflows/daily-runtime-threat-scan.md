@@ -48,7 +48,7 @@ Use `cache-memory` to implement a **round-robin** scan.
 - State file: `/tmp/gh-aw/cache-memory/runtime-threat-scan/state.json`
 - Run notes: `/tmp/gh-aw/cache-memory/runtime-threat-scan/runs/`
 
-Use filesystem-safe timestamps only in the literal pattern `YYYY-MM-DD-HH-MM-SS-sss` (final `sss` means milliseconds in this prompt's filename convention, not a programming-language formatter token).
+Use filesystem-safe timestamps only in the pattern `YYYY-MM-DD-HH-MM-SS-sss`, where the final `sss` must be replaced by three-digit milliseconds, for example `2026-05-12-14-30-45-123`.
 
 ### Round-robin focus areas
 
@@ -64,6 +64,7 @@ On every run:
 3. Select the current focus area using `focus_index`.
 4. After finishing the scan, write back the next `focus_index` modulo the number of focus areas.
 5. Record a short run note under `runs/` with the current timestamp.
+6. Treat the run note as an audit trail entry and include the focus area, whether a threat was found, and the issue fingerprint or `clean` result.
 
 ## What to look for
 
@@ -111,6 +112,7 @@ If you do **not** find a credible threat, call `noop` with a short completion me
 ## Threat-detection setting
 
 This workflow intentionally leaves `safe-outputs.threat-detection` disabled because the task requirement explicitly asks for that behavior and the workflow only emits a tightly scoped issue or `noop`. Do not attempt to compensate by widening outputs or adding other write actions.
+Because threat detection is disabled, the cache-memory run note is the required lightweight audit trail for each execution.
 
 ## Guardrails
 
