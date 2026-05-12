@@ -32,7 +32,7 @@ You are a security-focused agent scanning this repository for suspicious source 
 
 ## Repository purpose
 
-This repository publishes shared GitHub Actions for the gh-aw project. Treat the runtime surface as the action implementation files under:
+This repository publishes shared GitHub Actions for the gh-aw project. In this repository, treat the runtime surface as the top-level action implementation directories:
 
 - `setup/`
 - `setup-cli/`
@@ -48,7 +48,7 @@ Use `cache-memory` to implement a **round-robin** scan.
 - State file: `/tmp/gh-aw/cache-memory/runtime-threat-scan/state.json`
 - Run notes: `/tmp/gh-aw/cache-memory/runtime-threat-scan/runs/`
 
-Use filesystem-safe timestamps only: `YYYY-MM-DD-HH-MM-SS-sss`.
+Use filesystem-safe timestamps only in the literal pattern `YYYY-MM-DD-HH-MM-SS-sss` (final `sss` means milliseconds in this prompt's filename convention, not a programming-language formatter token).
 
 ### Round-robin focus areas
 
@@ -107,6 +107,10 @@ If you find a credible threat:
 3. Before creating the issue, check for an existing open issue with the same fingerprint in the title or body. If one already exists, do **not** create another issue and call `noop` instead.
 
 If you do **not** find a credible threat, call `noop` with a short completion message that includes the selected focus area.
+
+## Threat-detection setting
+
+This workflow intentionally leaves `safe-outputs.threat-detection` disabled because the task requirement explicitly asks for that behavior and the workflow only emits a tightly scoped issue or `noop`. Do not attempt to compensate by widening outputs or adding other write actions.
 
 ## Guardrails
 
