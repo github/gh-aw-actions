@@ -22,6 +22,7 @@ safe-outputs:
     title-prefix: "[runtime-threat-scan] "
     labels: [security, automated-analysis]
     max: 1
+  # Intentionally disabled per task requirements; cache-memory run notes provide the lightweight audit trail.
   threat-detection: false
 timeout-minutes: 20
 ---
