@@ -22,7 +22,8 @@ safe-outputs:
     title-prefix: "[runtime-threat-scan] "
     labels: [security, automated-analysis]
     max: 1
-  # Intentionally disabled per task requirements; cache-memory run notes provide the lightweight audit trail.
+  # Intentionally disabled per task requirements; this bypasses built-in threat review of safe outputs/cache-memory artifacts,
+  # so the workflow stays limited to create-issue/noop and records a cache-memory run-note audit trail for each run.
   threat-detection: false
 timeout-minutes: 20
 ---
