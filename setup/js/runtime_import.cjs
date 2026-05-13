@@ -8,6 +8,7 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_API, ERR_CONFIG, ERR_PARSE, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
+const { isTruthy } = require("./is_truthy.cjs");
 
 const fs = require("fs");
 const path = require("path");
@@ -491,6 +492,34 @@ function evaluateExpression(expr) {
       if (value !== undefined && value !== null) {
         return String(value);
       }
+
+      // If the direct context lookup failed, try resolving via aw_context.
+      // Slash-command workflows run as workflow_dispatch events; the triggering
+      // issue/discussion/PR number lives in inputs.aw_context, not in the event
+      // payload (context.payload.issue is undefined for workflow_dispatch).
+      const awCtxStr = context?.payload?.inputs?.aw_context;
+      if (awCtxStr && typeof awCtxStr === "string") {
+        try {
+          /** @type {{ item_type?: string, item_number?: number|string, comment_id?: number|string }} */
+          const awCtx = JSON.parse(awCtxStr);
+          /** @type {Record<string, () => string | undefined>} */
+          const fieldResolvers = {
+            "github.event.issue.number": () => (awCtx.item_type === "issue" && awCtx.item_number ? String(awCtx.item_number) : undefined),
+            "github.event.discussion.number": () => (awCtx.item_type === "discussion" && awCtx.item_number ? String(awCtx.item_number) : undefined),
+            "github.event.pull_request.number": () => (awCtx.item_type === "pull_request" && awCtx.item_number ? String(awCtx.item_number) : undefined),
+            "github.event.comment.id": () => (awCtx.comment_id ? String(awCtx.comment_id) : undefined),
+          };
+          const resolver = fieldResolvers[trimmed];
+          if (resolver) {
+            const awValue = resolver();
+            if (awValue !== undefined) {
+              return awValue;
+            }
+          }
+        } catch (_parseError) {
+          // aw_context is not valid JSON – ignore and fall through
+        }
+      }
     } catch (error) {
       // If evaluation fails, log but don't throw
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -791,20 +820,27 @@ function wrapExpressionsInTemplateConditionals(content) {
       return match;
     }
 
-    // Only wrap expressions that look like GitHub Actions expressions
-    // GitHub Actions expressions typically start with a letter and contain dots
-    // (e.g., github.actor, github.event.issue.number).
-    // Expressions starting with non-alphabetic characters (e.g., "...") are NOT GitHub expressions.
-    const looksLikeGitHubExpr =
-      (/^[a-zA-Z]/.test(trimmed) && trimmed.includes(".")) || trimmed.startsWith("github.") || trimmed.startsWith("needs.") || trimmed.startsWith("steps.") || trimmed.startsWith("env.") || trimmed.startsWith("inputs.");
+    // Only process expressions whose root matches a known GitHub Actions namespace.
+    // Restricting to explicit prefixes prevents non-GH dotted identifiers such as
+    // `experiments.foo` (resolved later by interpolate_prompt.cjs via experiment
+    // substitution) from being incorrectly collapsed to {{#if }} (falsy) here.
+    const looksLikeGitHubExpr = trimmed.startsWith("github.") || trimmed.startsWith("needs.") || trimmed.startsWith("steps.") || trimmed.startsWith("env.") || trimmed.startsWith("inputs.");
 
     if (!looksLikeGitHubExpr) {
       // Not a GitHub Actions expression, leave as-is
       return match;
     }
 
-    // Wrap the expression
-    return `{{#if \${{ ${trimmed} }} }}`;
+    // Evaluate the condition inline so that the template renderer (renderMarkdownTemplate /
+    // isTruthy) receives a concrete boolean sentinel rather than a raw value string or an
+    // always-truthy __GH_AW__ placeholder.
+    //
+    // We emit "{{#if true}}" / "{{#if }}" rather than the raw resolved value to prevent
+    // template tag injection: if the resolved value contained "}}" it would prematurely
+    // close the {{#if ...}} tag and corrupt the rendered output.
+    const evaluated = evaluateExpression(trimmed);
+    const shouldRenderBlock = !evaluated.startsWith("${{") && isTruthy(evaluated);
+    return shouldRenderBlock ? `{{#if true}}` : `{{#if }}`;
   });
 }
 
