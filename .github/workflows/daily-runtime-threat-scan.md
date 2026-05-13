@@ -2,6 +2,8 @@
 description: Daily Copilot-powered scan for suspicious runtime code that does not belong in gh-aw action runtimes
 on:
   schedule: daily
+  pull_request:
+    types: [ready_for_review]
   workflow_dispatch:
 permissions:
   contents: read
@@ -94,6 +96,15 @@ Treat the following as especially suspicious:
 3. Deeply inspect source-like files in that area, including shell scripts, JavaScript, CommonJS, YAML, JSON, and action metadata.
 4. Also perform a light sanity check for unexpected hidden files or obviously suspicious filenames anywhere under `setup/` and `setup-cli/`.
 5. Use GitHub issue search to avoid filing a duplicate open issue for the same finding.
+
+### LLM-as-judge spread
+
+For each run, use multiple independent sub-agents with different model families to judge findings before escalation.
+
+- Launch at least 3 sub-agents with distinct model families when available (for example: sonnet, gpt-5, gemini).
+- Give each sub-agent the same candidate evidence and ask for a verdict (`threat` or `clean`) plus a short rationale.
+- Only escalate when at least 2 sub-agents independently agree the finding is a credible threat.
+- If sub-agent verdicts disagree, prefer `noop` and include the disagreement in the run note.
 
 ## Reporting rules
 
