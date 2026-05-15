@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const childProcess = require("child_process");
 const { randomBytes } = require("crypto");
 const fs = require("fs");
 const { buildWorkflowCallId } = require("./aw_context.cjs");
@@ -123,6 +124,17 @@ function buildArrayAttr(key, values) {
  */
 function buildCurrentWorkflowCallId(runId, runAttempt, workflowRef = process.env.GH_AW_CURRENT_WORKFLOW_REF || process.env.GITHUB_WORKFLOW_REF || "") {
   return buildWorkflowCallId(runId, runAttempt, workflowRef);
+}
+
+/**
+ * Parse a strict boolean env var.
+ * @param {string | undefined} value
+ * @returns {boolean | undefined}
+ */
+function parseBooleanEnv(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return undefined;
 }
 
 /**
@@ -577,6 +589,65 @@ function parseOTLPHeaders(raw) {
 }
 
 /**
+ * Determine whether OTLP export should use a proxy-aware transport.
+ * Native Node fetch does not honor proxy environment variables by default.
+ *
+ * @param {string} endpoint
+ * @returns {boolean}
+ */
+function hasProxyConfigured(endpoint) {
+  const isHTTPS = /^https:/i.test(endpoint);
+  if (isHTTPS) {
+    return Boolean(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.ALL_PROXY || process.env.all_proxy);
+  }
+  return Boolean(process.env.HTTP_PROXY || process.env.http_proxy || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.ALL_PROXY || process.env.all_proxy);
+}
+
+/**
+ * Send OTLP through curl so standard proxy environment variables are honored.
+ *
+ * @param {string} url
+ * @param {Record<string, string>} headers
+ * @param {string} body
+ * @returns {{ ok: boolean, status: number, statusText: string }}
+ */
+function sendOTLPViaCurl(url, headers, body) {
+  /** @type {string[]} */
+  const args = ["--silent", "--show-error", "--location", "--output", "/dev/null", "--write-out", "%{http_code}", "--request", "POST", "--data-binary", "@-"];
+
+  for (const [key, value] of Object.entries(headers)) {
+    args.push("--header", `${key}: ${value}`);
+  }
+  args.push(url);
+
+  const result = childProcess.spawnSync("curl", args, {
+    encoding: "utf8",
+    input: body,
+    maxBuffer: 1024 * 1024,
+    timeout: 15_000,
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  const status = Number.parseInt((result.stdout || "").trim(), 10);
+  if (Number.isInteger(status)) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      statusText: result.status === 0 ? "OK" : (result.stderr || "curl failed").trim() || "curl failed",
+    };
+  }
+
+  return {
+    ok: false,
+    status: 0,
+    statusText: (result.stderr || "curl failed").trim() || "curl failed",
+  };
+}
+
+/**
  * Regular expression matching attribute key fragments that indicate the value
  * is sensitive and should be redacted before the payload is sent over the
  * wire.  The pattern is case-insensitive.  Word-boundary anchors (`\b`) are
@@ -767,16 +838,19 @@ async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 1
   const rawHeaders = headersOverride !== undefined ? headersOverride : process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
   const extraHeaders = parseOTLPHeaders(rawHeaders);
   const headers = { "Content-Type": "application/json", ...extraHeaders };
+  const sanitizedBody = JSON.stringify(sanitizeOTLPPayload(payload));
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) {
       await new Promise(resolve => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)));
     }
     try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(sanitizeOTLPPayload(payload)),
-      });
+      const response = hasProxyConfigured(endpoint)
+        ? sendOTLPViaCurl(url, headers, sanitizedBody)
+        : await fetch(url, {
+            method: "POST",
+            headers,
+            body: sanitizedBody,
+          });
       if (response.ok) {
         return;
       }
@@ -924,6 +998,9 @@ async function sendJobSetupSpan(options = {}) {
   const itemNumber = typeof awInfo.context?.item_number === "string" ? awInfo.context.item_number : "";
   const triggerLabel = typeof awInfo.context?.trigger_label === "string" ? awInfo.context.trigger_label : "";
   const commentId = typeof awInfo.context?.comment_id === "string" ? awInfo.context.comment_id : "";
+  const frontmatterSource = (typeof awInfo.frontmatter_source === "string" ? awInfo.frontmatter_source : "") || process.env.GH_AW_INFO_FRONTMATTER_SOURCE || "";
+  const frontmatterEmoji = (typeof awInfo.frontmatter_emoji === "string" ? awInfo.frontmatter_emoji : "") || process.env.GH_AW_INFO_FRONTMATTER_EMOJI || "";
+  const bodyModified = typeof awInfo.body_modified === "boolean" ? awInfo.body_modified : parseBooleanEnv(process.env.GH_AW_INFO_BODY_MODIFIED);
 
   const traceId = optionsTraceId || inputTraceId || contextTraceId || generateTraceId();
   const parentSpanId = optionsParentSpanId || inputParentSpanId || contextParentSpanId || "";
@@ -969,6 +1046,8 @@ async function sendJobSetupSpan(options = {}) {
   ];
 
   if (engineId) {
+    const genAiSystem = ENGINE_TO_SYSTEM_MAP[engineId] || engineId;
+    attributes.push(buildAttr("gen_ai.system", genAiSystem));
     attributes.push(buildAttr("gh-aw.engine.id", engineId));
   }
   if (eventName) {
@@ -991,6 +1070,9 @@ async function sendJobSetupSpan(options = {}) {
   if (itemNumber) attributes.push(buildAttr("gh-aw.trigger.item_number", itemNumber));
   if (triggerLabel) attributes.push(buildAttr("gh-aw.trigger.label", triggerLabel));
   if (commentId) attributes.push(buildAttr("gh-aw.trigger.comment_id", commentId));
+  if (frontmatterSource) attributes.push(buildAttr("gh-aw.frontmatter.source", frontmatterSource));
+  if (frontmatterEmoji) attributes.push(buildAttr("gh-aw.frontmatter.emoji", frontmatterEmoji));
+  if (typeof bodyModified === "boolean") attributes.push(buildAttr("gh-aw.frontmatter.body_modified", bodyModified));
 
   // Include experiment assignments so each span can be correlated with the
   // A/B variant selected for this run (written by pick_experiment.cjs).
@@ -1326,6 +1408,9 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const itemNumber = typeof awInfo.context?.item_number === "string" ? awInfo.context.item_number : "";
   const triggerLabel = typeof awInfo.context?.trigger_label === "string" ? awInfo.context.trigger_label : "";
   const commentId = typeof awInfo.context?.comment_id === "string" ? awInfo.context.comment_id : "";
+  const frontmatterSource = (typeof awInfo.frontmatter_source === "string" ? awInfo.frontmatter_source : "") || process.env.GH_AW_INFO_FRONTMATTER_SOURCE || "";
+  const frontmatterEmoji = (typeof awInfo.frontmatter_emoji === "string" ? awInfo.frontmatter_emoji : "") || process.env.GH_AW_INFO_FRONTMATTER_EMOJI || "";
+  const bodyModified = typeof awInfo.body_modified === "boolean" ? awInfo.body_modified : parseBooleanEnv(process.env.GH_AW_INFO_BODY_MODIFIED);
   const trackerId = process.env.GH_AW_TRACKER_ID || awInfo.tracker_id || "";
   const jobName = process.env.INPUT_JOB_NAME || "";
   const runId = process.env.GITHUB_RUN_ID || "";
@@ -1399,7 +1484,11 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   attributes.push(buildAttr("gh-aw.action_minutes", Math.max(0, endMs - startMs) / 60000));
 
   if (jobName) attributes.push(buildAttr("gh-aw.job.name", jobName));
-  if (engineId) attributes.push(buildAttr("gh-aw.engine.id", engineId));
+  if (engineId) {
+    const genAiSystem = ENGINE_TO_SYSTEM_MAP[engineId] || engineId;
+    attributes.push(buildAttr("gen_ai.system", genAiSystem));
+    attributes.push(buildAttr("gh-aw.engine.id", engineId));
+  }
   if (model) attributes.push(buildAttr("gen_ai.request.model", model));
   if (trackerId) attributes.push(buildAttr("gh-aw.tracker.id", trackerId));
   if (eventName) attributes.push(buildAttr("gh-aw.event_name", eventName));
@@ -1418,6 +1507,9 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   if (itemNumber) attributes.push(buildAttr("gh-aw.trigger.item_number", itemNumber));
   if (triggerLabel) attributes.push(buildAttr("gh-aw.trigger.label", triggerLabel));
   if (commentId) attributes.push(buildAttr("gh-aw.trigger.comment_id", commentId));
+  if (frontmatterSource) attributes.push(buildAttr("gh-aw.frontmatter.source", frontmatterSource));
+  if (frontmatterEmoji) attributes.push(buildAttr("gh-aw.frontmatter.emoji", frontmatterEmoji));
+  if (typeof bodyModified === "boolean") attributes.push(buildAttr("gh-aw.frontmatter.body_modified", bodyModified));
   attributes.push(...buildEpisodeAttributesFromContext(awInfo, runId, runAttempt));
   if (!isNaN(effectiveTokens) && effectiveTokens > 0) {
     attributes.push(buildAttr("gh-aw.effective_tokens", effectiveTokens));
@@ -1713,6 +1805,7 @@ module.exports = {
   parseOTLPEndpoints,
   sendOTLPSpan,
   sendOTLPToAllEndpoints,
+  hasProxyConfigured,
   readJSONIfExists,
   readLastRateLimitEntry,
   buildCurrentWorkflowCallId,

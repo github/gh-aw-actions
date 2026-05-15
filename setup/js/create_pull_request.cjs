@@ -34,7 +34,7 @@ const { withRetry, isTransientError, RATE_LIMIT_RETRY_CONFIG } = require("./erro
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
 const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
 const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
-const { ensureFullHistoryForBundle } = require("./git_helpers.cjs");
+const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits } = require("./git_helpers.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -68,6 +68,170 @@ const HANDLER_TYPE = "create_pull_request";
 
 /** @type {string} Label always added to fallback issues so the triage system can find them */
 const MANAGED_FALLBACK_ISSUE_LABEL = "agentic-workflows";
+
+/**
+ * Creates a temporary refs/bundles ref for applying create_pull_request bundles.
+ * Branch names are sanitized for ref compatibility, and a short crypto-random
+ * suffix avoids collisions between branches that sanitize to the same value.
+ *
+ * @param {string} branchName - Target branch name
+ * @returns {string} Temporary bundle ref name
+ */
+function createBundleTempRef(branchName) {
+  const suffix = crypto.randomBytes(4).toString("hex");
+  return `refs/bundles/create-pr-${branchName.replace(/[^a-zA-Z0-9-]/g, "-")}-${suffix}`;
+}
+
+/**
+ * Summarize a list for log output to avoid excessively long lines.
+ * @param {string[]} values
+ * @param {number} limit
+ * @returns {string}
+ */
+function summarizeListForLog(values, limit = 10) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return "(none)";
+  }
+  const preview = values.slice(0, limit).join(", ");
+  return values.length > limit ? `${preview} ... and ${values.length - limit} more` : preview;
+}
+
+/**
+ * Apply a git bundle to a local branch without fetching directly into the branch ref.
+ * Fetching directly into refs/heads/<branch> fails when that branch is currently checked out.
+ *
+ * @param {string} bundleFilePath - Path to the bundle file
+ * @param {string} branchName - Target branch name
+ * @param {string} originalAgentBranch - Original source branch name from the agent, if different
+ * @param {{ exec: Function, getExecOutput: Function }} execApi - GitHub Actions exec API
+ * @returns {Promise<void>}
+ */
+async function applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, execApi) {
+  let bundleBranchRef = `refs/heads/${originalAgentBranch || branchName}`;
+  const bundleTargetRef = `refs/heads/${branchName}`;
+  const bundleTempRef = createBundleTempRef(branchName);
+
+  try {
+    await ensureFullHistoryForBundle(execApi);
+    core.info(`Applying bundle ${bundleFilePath} to ${bundleTargetRef} using temp ref ${bundleTempRef} from ${bundleBranchRef}`);
+
+    // Fetch from bundle into a temporary ref, then update the target branch.
+    // bundleBranchRef is the source ref inside the bundle (typically refs/heads/<agent-branch>).
+    // Use getExecOutput with ignoreReturnCode so we can read the actual stderr from git —
+    // exec() only throws "The process '...' failed with exit code 1" which loses the
+    // "lacks these prerequisite commits" text needed for the recovery path below.
+    core.info(`Attempting bundle fetch from ${bundleBranchRef} into ${bundleTempRef}`);
+    const initialBundleFetch = await execApi.getExecOutput("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`], { ignoreReturnCode: true });
+    if (initialBundleFetch.exitCode !== 0) {
+      const initialFetchErrorOutput = initialBundleFetch.stderr || `exit code ${initialBundleFetch.exitCode}`;
+
+      // Recovery path for bundle prerequisite failures: fetch missing prerequisite
+      // commit objects, then retry with the original bundle ref.
+      // This handles the race where main advanced between agent-time and safe_outputs-time:
+      // the bundle's base commit may not be reachable from a fetch-depth:1 shallow clone
+      // even after --unshallow (e.g. when the commit is on a ref not in the fetch refspec).
+      const prerequisiteCommits = extractBundlePrerequisiteCommits(initialFetchErrorOutput);
+      if (prerequisiteCommits.length > 0) {
+        core.warning(`Bundle fetch with ${bundleBranchRef} failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
+        core.info(`Prerequisite commits: ${summarizeListForLog(prerequisiteCommits)}`);
+        core.info(`Fetching ${prerequisiteCommits.length} prerequisite commit(s) from origin`);
+        await execApi.exec("git", ["fetch", "origin", ...prerequisiteCommits]);
+        core.info("Fetched prerequisite commits from origin successfully");
+        try {
+          core.info(`Retrying bundle fetch from ${bundleBranchRef} into ${bundleTempRef} after prerequisite recovery`);
+          await execApi.exec("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`]);
+          core.info("Bundle fetch retry succeeded after prerequisite recovery");
+        } catch (retryError) {
+          throw new Error(`Bundle fetch failed after fetching ${prerequisiteCommits.length} prerequisite commit(s): ${retryError instanceof Error ? retryError.message : String(retryError)}`, { cause: retryError });
+        }
+      } else {
+        // Fallback: resolve the source ref directly from the bundle contents.
+        // Some agents may emit a JSONL branch name that differs from the ref embedded in the bundle.
+        core.warning(`Bundle fetch with ${bundleBranchRef} failed: ${initialFetchErrorOutput}; resolving branch ref from bundle heads`);
+        core.info(`Inspecting bundle heads from ${bundleFilePath}`);
+        const { stdout: bundleHeadsOutput } = await execApi.getExecOutput("git", ["bundle", "list-heads", bundleFilePath]);
+        const branchRefs = bundleHeadsOutput
+          .split("\n")
+          .map(line => line.trim().split(/\s+/)[1] || "")
+          .filter(ref => /^refs\/heads\/[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(ref));
+        core.info(`Bundle list-heads returned ${branchRefs.length} candidate branch ref(s): ${summarizeListForLog(branchRefs)}`);
+
+        if (branchRefs.length === 1) {
+          bundleBranchRef = branchRefs[0];
+          core.info(`Resolved bundle source ref from list-heads: ${bundleBranchRef}`);
+          core.info(`Fetching resolved bundle ref ${bundleBranchRef} into ${bundleTempRef}`);
+          await execApi.exec("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`]);
+        } else {
+          throw new Error(`Failed to resolve bundle branch ref from list-heads: expected exactly 1 refs/heads entry, found ${branchRefs.length}`);
+        }
+      }
+    }
+    core.info(`Fetched bundle to ${bundleTempRef}`);
+    await execApi.exec("git", ["update-ref", bundleTargetRef, bundleTempRef]);
+    core.info(`Created local branch ${branchName} from bundle`);
+    await execApi.exec("git", ["checkout", branchName]);
+    // Ensure the working tree matches the new HEAD in case checkout left any index/working tree drift.
+    await execApi.exec("git", ["reset", "--hard"]);
+    core.info(`Checked out branch ${branchName} from bundle`);
+  } finally {
+    try {
+      await execApi.exec("git", ["update-ref", "-d", bundleTempRef]);
+    } catch (cleanupError) {
+      // Non-fatal cleanup
+      core.warning(`Non-fatal cleanup: failed to delete temporary bundle ref ${bundleTempRef}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+    }
+  }
+}
+
+/**
+ * Rewrites the current branch to a single non-merge commit relative to origin/<baseBranch>.
+ * This is used as a recovery path when signed commit replay rejects merge commit topology.
+ *
+ * @param {string} baseBranch
+ * @param {{ exec: Function, getExecOutput: Function }} execApi
+ * @returns {Promise<void>}
+ */
+async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi) {
+  const baseRef = `origin/${baseBranch}`;
+  const { stdout: originalHeadOut } = await execApi.getExecOutput("git", ["rev-parse", "HEAD"]);
+  const originalHead = originalHeadOut.trim();
+  if (!originalHead) {
+    throw new Error("Could not resolve current HEAD before bundle rewrite");
+  }
+
+  let commitHeadline = "Apply bundled create_pull_request changes";
+  try {
+    const { stdout: headlineOut } = await execApi.getExecOutput("git", ["log", "-1", "--format=%s", "HEAD"]);
+    if (headlineOut.trim()) {
+      commitHeadline = headlineOut.trim();
+    }
+  } catch {
+    // Non-fatal: use default commit headline.
+  }
+
+  core.warning(`Rewriting bundled commits to a single linear commit for signed push compatibility (base: ${baseRef})`);
+  try {
+    await execApi.exec("git", ["reset", "--soft", baseRef]);
+    const { stdout: stagedFilesOut } = await execApi.getExecOutput("git", ["diff", "--cached", "--name-only"]);
+    if (!stagedFilesOut.trim()) {
+      throw new Error(`No staged changes found after soft reset to ${baseRef}`);
+    }
+    await execApi.exec("git", ["commit", "-m", commitHeadline]);
+    const { stdout: rewrittenHeadOut } = await execApi.getExecOutput("git", ["rev-parse", "HEAD"]);
+    const rewrittenHead = rewrittenHeadOut.trim();
+    core.info(`Bundle rewrite completed (old HEAD: ${originalHead}, new HEAD: ${rewrittenHead})`);
+  } catch (rewriteError) {
+    try {
+      await execApi.exec("git", ["reset", "--hard", originalHead]);
+      core.warning(`Bundle rewrite failed; restored original HEAD ${originalHead}`);
+    } catch (restoreError) {
+      core.warning(`Bundle rewrite rollback failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+    }
+    throw new Error(`Failed to rewrite bundled commits for signed push retry: ${rewriteError instanceof Error ? rewriteError.message : String(rewriteError)}`, {
+      cause: rewriteError,
+    });
+  }
+}
 
 /**
  * Determines if a label API error is transient and worth retrying.
@@ -544,6 +708,17 @@ async function handleRemoteBranchCollision(branchName, preserveBranchName, optio
  */
 async function main(config = {}) {
   // Extract configuration
+  const rawBranchPrefix = config.branch_prefix || "";
+  const normalizedBranchPrefix = normalizeBranchName(rawBranchPrefix);
+  if (rawBranchPrefix && normalizedBranchPrefix !== rawBranchPrefix) {
+    const branchPrefixWarning = [
+      `Branch prefix "${rawBranchPrefix}" contains characters that are invalid in a git ref.`,
+      `Using normalized prefix: "${normalizedBranchPrefix}".`,
+      "Update branch-prefix in the workflow configuration to avoid this warning.",
+    ].join(" ");
+    core.warning(branchPrefixWarning);
+  }
+  const branchPrefix = normalizedBranchPrefix;
   const titlePrefix = config.title_prefix || "";
   const envLabels = parseStringListConfig(config.labels);
   const configFallbackLabels = parseStringListConfig(config.fallback_labels);
@@ -558,6 +733,7 @@ async function main(config = {}) {
   const autoMerge = parseBoolTemplatable(config.auto_merge, false);
   const preserveBranchName = config.preserve_branch_name === true;
   const recreateRef = config.recreate_ref === true;
+  const signedCommits = config.signed_commits !== false;
   const expiresHours = config.expires ? parseInt(String(config.expires), 10) : 0;
   const maxCount = config.max || 1; // PRs are typically limited to 1
   const maxSizeKb = config.max_patch_size ? parseInt(String(config.max_patch_size), 10) : 1024;
@@ -689,6 +865,7 @@ async function main(config = {}) {
   core.info(`If no changes: ${ifNoChanges}`);
   core.info(`Allow empty: ${allowEmpty}`);
   core.info(`Auto-merge: ${autoMerge}`);
+  core.info(`Signed commits: ${signedCommits}`);
   if (expiresHours > 0) {
     core.info(`Pull requests expire after: ${expiresHours} hours`);
   }
@@ -1243,6 +1420,12 @@ async function main(config = {}) {
       branchName = `${workflowId}-${randomHex}`;
     }
 
+    // Apply the configured branch prefix (e.g. "signed/") if it hasn't already been applied.
+    if (branchPrefix && !branchName.startsWith(branchPrefix)) {
+      branchName = `${branchPrefix}${branchName}`;
+      core.info(`Applied branch prefix: ${branchName}`);
+    }
+
     core.info(`Generated branch name: ${branchName}`);
     core.info(`Base branch: ${baseBranch}`);
 
@@ -1265,36 +1448,8 @@ async function main(config = {}) {
       // This preserves merge commit topology and per-commit metadata (messages, authorship)
       // unlike git format-patch which flattens history and drops merge resolution content.
       core.info(`Applying changes from bundle: ${bundleFilePath}`);
-      let bundleBranchRef = `refs/heads/${originalAgentBranch || branchName}`;
       try {
-        await ensureFullHistoryForBundle(exec);
-
-        // Fetch from bundle: creates a local branch pointing to the bundle's tip commit.
-        // bundleBranchRef is the source ref inside the bundle (typically refs/heads/<agent-branch>).
-        try {
-          await exec.exec("git", ["fetch", bundleFilePath, `${bundleBranchRef}:refs/heads/${branchName}`]);
-        } catch (initialFetchError) {
-          // Fallback: resolve the source ref directly from the bundle contents.
-          // Some agents may emit a JSONL branch name that differs from the ref embedded in the bundle.
-          const initialFetchErrorMessage = initialFetchError instanceof Error ? initialFetchError.message : String(initialFetchError);
-          core.warning(`Bundle fetch with ${bundleBranchRef} failed: ${initialFetchErrorMessage}; resolving branch ref from bundle heads`);
-          const { stdout: bundleHeadsOutput } = await exec.getExecOutput("git", ["bundle", "list-heads", bundleFilePath]);
-          const branchRefs = bundleHeadsOutput
-            .split("\n")
-            .map(line => line.trim().split(/\s+/)[1] || "")
-            .filter(ref => /^refs\/heads\/[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(ref));
-
-          if (branchRefs.length === 1) {
-            bundleBranchRef = branchRefs[0];
-            core.info(`Resolved bundle source ref from list-heads: ${bundleBranchRef}`);
-            await exec.exec("git", ["fetch", bundleFilePath, `${bundleBranchRef}:refs/heads/${branchName}`]);
-          } else {
-            throw new Error(`Failed to resolve bundle branch ref from list-heads: expected exactly 1 refs/heads entry, found ${branchRefs.length}`, { cause: initialFetchError });
-          }
-        }
-        core.info(`Created local branch ${branchName} from bundle`);
-        await exec.exec("git", ["checkout", branchName]);
-        core.info(`Checked out branch ${branchName} from bundle`);
+        await applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, exec);
       } catch (bundleError) {
         core.error(`Failed to apply bundle: ${bundleError instanceof Error ? bundleError.message : String(bundleError)}`);
         return { success: false, error: "Failed to apply bundle" };
@@ -1311,6 +1466,7 @@ async function main(config = {}) {
           branch: branchName,
           baseRef: `origin/${baseBranch}`,
           cwd: process.cwd(),
+          signedCommits,
         });
         core.info("Changes pushed to branch (from bundle)");
 
@@ -1322,21 +1478,58 @@ async function main(config = {}) {
         } catch {
           core.info("Could not count new commits - extra empty commit will be skipped");
         }
-      } catch (pushError) {
-        core.error(`Git push failed: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
+      } catch (initialPushError) {
+        /** @type {unknown} */
+        let pushError = initialPushError;
+        let pushRecovered = false;
+        const pushErrorMessage = pushError instanceof Error ? pushError.message : String(pushError);
+        const isSignedMergeReplayRefusal = signedCommits && /pushSignedCommits: refusing unsigned push/.test(pushErrorMessage) && /merge commit/i.test(pushErrorMessage);
 
-        if (!fallbackAsIssue) {
-          const error = `Failed to push changes: ${pushError instanceof Error ? pushError.message : String(pushError)}`;
-          return { success: false, error, error_type: "push_failed" };
+        if (isSignedMergeReplayRefusal) {
+          core.warning("Signed push rejected merge commit topology from bundle; rewriting branch and retrying signed push");
+          try {
+            await rewriteBundleBranchAsSingleCommit(baseBranch, exec);
+            await pushSignedCommits({
+              githubClient,
+              owner: repoParts.owner,
+              repo: repoParts.repo,
+              branch: branchName,
+              baseRef: `origin/${baseBranch}`,
+              cwd: process.cwd(),
+              signedCommits,
+            });
+            core.info("Changes pushed to branch after bundle rewrite retry");
+
+            try {
+              const { stdout: countStr } = await exec.getExecOutput("git", ["rev-list", "--count", `origin/${baseBranch}..HEAD`]);
+              newCommitCount = parseInt(countStr.trim(), 10);
+              core.info(`${newCommitCount} new commit(s) on branch relative to origin/${baseBranch}`);
+            } catch {
+              core.info("Could not count new commits - extra empty commit will be skipped");
+            }
+            pushRecovered = true;
+          } catch (retryPushError) {
+            pushError = retryPushError;
+          }
         }
 
-        core.warning("Git push operation failed - creating fallback issue instead of pull request");
+        if (!pushRecovered) {
+          core.error(`Git push failed: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
 
-        const runUrl = buildWorkflowRunUrl(context, context.repo);
-        const runId = context.runId;
+          if (!fallbackAsIssue) {
+            const error = `Failed to push changes: ${pushError instanceof Error ? pushError.message : String(pushError)}`;
+            return { success: false, error, error_type: "push_failed" };
+          }
 
-        const artifactFileName = bundleFilePath ? bundleFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.bundle";
-        const fallbackBody = `${body}
+          core.warning("Git push operation failed - creating fallback issue instead of pull request");
+
+          const runUrl = buildWorkflowRunUrl(context, context.repo);
+          const runId = context.runId;
+
+          const artifactFileName = bundleFilePath ? bundleFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.bundle";
+          const fallbackBundleSourceRef = `refs/heads/${originalAgentBranch || branchName}`;
+          const fallbackBundleTempRef = createBundleTempRef(branchName);
+          const fallbackBody = `${body}
 
 ---
 
@@ -1353,9 +1546,14 @@ To create a pull request with the changes:
 # Download the artifact from the workflow run
 gh run download ${runId} -n agent -D /tmp/agent-${runId}
 
-# Fetch the bundle into a local branch
-git fetch /tmp/agent-${runId}/${artifactFileName} ${bundleBranchRef}:refs/heads/${branchName}
+# Fetch the bundle into a temporary ref, then update the local branch
+git fetch /tmp/agent-${runId}/${artifactFileName} ${fallbackBundleSourceRef}:${fallbackBundleTempRef}
+git update-ref refs/heads/${branchName} ${fallbackBundleTempRef}
 git checkout ${branchName}
+# Ensure the working tree matches the updated branch
+git reset --hard
+# Remove the temporary bundle ref
+git update-ref -d ${fallbackBundleTempRef}
 
 # Push the branch to origin
 git push origin ${branchName}
@@ -1364,22 +1562,23 @@ git push origin ${branchName}
 gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo ${repoParts.owner}/${repoParts.repo}
 \`\`\``;
 
-        try {
-          const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
+          try {
+            const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
 
-          core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
-          await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
-          await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+            core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
+            await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
+            await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
 
-          return {
-            success: true,
-            fallback_used: true,
-            issue_number: issue.number,
-            issue_url: issue.html_url,
-          };
-        } catch (issueError) {
-          const error = `Failed to push changes and failed to create fallback issue. Push error: ${pushError instanceof Error ? pushError.message : String(pushError)}. Issue error: ${issueError instanceof Error ? issueError.message : String(issueError)}`;
-          return { success: false, error };
+            return {
+              success: true,
+              fallback_used: true,
+              issue_number: issue.number,
+              issue_url: issue.html_url,
+            };
+          } catch (issueError) {
+            const error = `Failed to push changes and failed to create fallback issue. Push error: ${pushError instanceof Error ? pushError.message : String(pushError)}. Issue error: ${issueError instanceof Error ? issueError.message : String(issueError)}`;
+            return { success: false, error };
+          }
         }
       }
     } else {
@@ -1520,6 +1719,7 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo
             branch: branchName,
             baseRef: `origin/${baseBranch}`,
             cwd: process.cwd(),
+            signedCommits,
           });
           core.info("Changes pushed to branch");
 
@@ -1664,6 +1864,7 @@ ${patchPreview}`;
               branch: branchName,
               baseRef: `origin/${baseBranch}`,
               cwd: process.cwd(),
+              signedCommits,
             });
             core.info("Empty branch pushed successfully");
 
@@ -2059,4 +2260,4 @@ ${patchPreview}`;
   }; // End of handleCreatePullRequest
 } // End of main
 
-module.exports = { main, enforcePullRequestLimits, countUniquePatchFiles, parseDiffGitHeader };
+module.exports = { main, enforcePullRequestLimits, countUniquePatchFiles, parseDiffGitHeader, applyBundleToBranch };

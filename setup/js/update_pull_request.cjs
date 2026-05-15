@@ -19,6 +19,31 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { withRetry, isTransientError } = require("./error_recovery.cjs");
 
 /**
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isNonFatalUpdateBranchError(error) {
+  /** @type {number | undefined} */
+  let status;
+  if (typeof error === "object" && error !== null && "status" in error) {
+    const candidateStatus = error.status;
+    if (typeof candidateStatus === "number") {
+      status = candidateStatus;
+    }
+  }
+  if (status !== undefined && status !== 422) {
+    return false;
+  }
+
+  // GitHub update-branch API can return these 422 messages for benign conditions:
+  // - already up to date ("There are no new commits on the base branch")
+  // - cannot auto-update due to conflict ("merge conflict between base and head")
+  // These should not fail safe output processing.
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes("there are no new commits on the base branch") || message.includes("merge conflict between base and head");
+}
+
+/**
  * Execute the pull request update API call
  * @param {any} github - GitHub API client
  * @param {any} context - GitHub Actions context
@@ -55,8 +80,13 @@ async function executePRUpdate(github, context, prNumber, updateData) {
         `update pull request #${prNumber} branch from base`
       );
     } catch (error) {
-      core.warning(`Failed to update pull request #${prNumber} branch from base: ${getErrorMessage(error)}`);
-      throw error;
+      const errorMessage = getErrorMessage(error);
+      if (isNonFatalUpdateBranchError(error)) {
+        core.warning(`Failed to update pull request #${prNumber} branch from base (non-fatal): ${errorMessage}`);
+      } else {
+        core.warning(`Failed to update pull request #${prNumber} branch from base: ${errorMessage}`);
+        throw error;
+      }
     }
   }
 

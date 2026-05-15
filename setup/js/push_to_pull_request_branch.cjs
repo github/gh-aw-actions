@@ -17,8 +17,9 @@ const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { checkFileProtection } = require("./manifest_file_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { renderTemplateFromFile, buildProtectedFileList, getPromptPath } = require("./messages_core.cjs");
-const { ensureFullHistoryForBundle, getGitAuthEnv } = require("./git_helpers.cjs");
+const { ensureFullHistoryForBundle, getGitAuthEnv, extractBundlePrerequisiteCommits } = require("./git_helpers.cjs");
 const { findRepoCheckout } = require("./find_repo_checkout.cjs");
+const { getThreatDetectedMarker } = require("./threat_detection_warning.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -59,9 +60,11 @@ function parseAwContext(rawAwContext) {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       return null;
     }
-    const parsedObj = /** @type {Record<string, unknown>} */ (parsed);
-    const itemType = typeof parsedObj.item_type === "string" ? parsedObj.item_type : "";
-    const itemNumber = parsePositiveInteger(parsedObj.item_number);
+    const parsedObj = /** @type {Record<string, unknown>} */ parsed;
+    const itemTypeValue = parsedObj["item_type"];
+    const itemNumberValue = parsedObj["item_number"];
+    const itemType = typeof itemTypeValue === "string" ? itemTypeValue : "";
+    const itemNumber = parsePositiveInteger(itemNumberValue);
     return { item_type: itemType, item_number: itemNumber };
   }
 
@@ -111,6 +114,7 @@ async function main(config = {}) {
   const ignoreMissingBranchFailure = config.ignore_missing_branch_failure === true;
   const fallbackAsPullRequest = config.fallback_as_pull_request !== false;
   const checkBranchProtection = config.check_branch_protection !== false;
+  const signedCommits = config.signed_commits !== false;
   const commitTitleSuffix = config.commit_title_suffix || "";
   const maxSizeKb = config.max_patch_size ? parseInt(String(config.max_patch_size), 10) : 1024;
   const maxCount = config.max || 0; // 0 means no limit
@@ -148,6 +152,7 @@ async function main(config = {}) {
   core.info(`Ignore missing branch failure: ${ignoreMissingBranchFailure}`);
   core.info(`Fallback as pull request: ${fallbackAsPullRequest}`);
   core.info(`Check branch protection: ${checkBranchProtection}`);
+  core.info(`Push signed commits: ${signedCommits}`);
   if (commitTitleSuffix) {
     core.info(`Commit title suffix: ${commitTitleSuffix}`);
   }
@@ -664,8 +669,32 @@ async function main(config = {}) {
             ...baseGitOpts,
           });
 
-          // Fetch from bundle into a temporary ref
-          await exec.exec("git", ["fetch", bundleFilePath, `refs/heads/${message.branch}:${bundleRef}`], baseGitOpts);
+          // Fetch from bundle into a temporary ref.
+          // Use getExecOutput with ignoreReturnCode so we can read the actual stderr from git —
+          // exec() only throws "The process '...' failed with exit code 1" which loses the
+          // "lacks these prerequisite commits" text needed for the recovery path below.
+          const bundleFetchRef = `refs/heads/${message.branch}:${bundleRef}`;
+          const initialBundleFetch = await exec.getExecOutput("git", ["fetch", bundleFilePath, bundleFetchRef], { ...baseGitOpts, ignoreReturnCode: true });
+          if (initialBundleFetch.exitCode !== 0) {
+            const initialFetchErrorOutput = initialBundleFetch.stderr || `exit code ${initialBundleFetch.exitCode}`;
+
+            // Recovery path for bundle prerequisite failures: fetch missing prerequisite
+            // commit objects, then retry with the original bundle ref.
+            // This handles the race where main advanced between agent-time and safe_outputs-time:
+            // the bundle's base commit may not be reachable from a fetch-depth:1 shallow clone
+            // even after --unshallow (e.g. when the commit is on a ref not in the fetch refspec).
+            const prerequisiteCommits = extractBundlePrerequisiteCommits(initialFetchErrorOutput);
+            if (prerequisiteCommits.length > 0) {
+              core.warning(`Bundle fetch failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
+              core.info(`Fetching ${prerequisiteCommits.length} prerequisite commit(s) from origin`);
+              await exec.exec("git", ["fetch", "origin", ...prerequisiteCommits], { env: { ...process.env, ...gitAuthEnv }, ...baseGitOpts });
+              core.info("Fetched prerequisite commits from origin successfully");
+              await exec.exec("git", ["fetch", bundleFilePath, bundleFetchRef], baseGitOpts);
+              core.info("Bundle fetch retry succeeded after prerequisite recovery");
+            } else {
+              throw new Error(`Failed to fetch bundle: ${initialFetchErrorOutput}`);
+            }
+          }
           core.info(`Fetched bundle to ${bundleRef}`);
 
           // Point the checked-out branch at the bundle tip directly. In shallow
@@ -829,7 +858,9 @@ async function main(config = {}) {
           const detectionReasonEnv = process.env.GH_AW_DETECTION_REASON || "unknown";
           const prBody = [
             "> [!CAUTION]",
-            "> **This PR requires manual review** because threat detection produced a warning.",
+            "> agentic threat detected",
+            "> Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.",
+            `> ${getThreatDetectedMarker(detectionReasonEnv)}`,
             ">",
             `> **Reason:** ${detectionReasonEnv}`,
             ">",
@@ -889,6 +920,7 @@ async function main(config = {}) {
           baseRef: remoteHeadBeforePatch || `origin/${branchName}`,
           cwd: repoCwd || process.cwd(),
           gitAuthEnv,
+          signedCommits,
         });
         if (pushedSha) {
           pushedCommitSha = pushedSha;
