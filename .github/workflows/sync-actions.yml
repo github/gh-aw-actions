@@ -284,7 +284,12 @@ jobs:
           done
           echo "::endgroup::"
           echo "::group::Destination — gh-aw-actions/.github/aw/ after sync"
-          find gh-aw-actions/.github/aw -maxdepth 1 -type f -name 'compat*' | sort || echo "(no compat files)"
+          compat_files=$(find gh-aw-actions/.github/aw -maxdepth 1 -type f -name 'compat*' | sort)
+          if [ -n "$compat_files" ]; then
+            printf '%s\n' "$compat_files"
+          else
+            echo "(no compat files)"
+          fi
           echo "::endgroup::"
 
       - name: Create branch, commit, and open pull request
