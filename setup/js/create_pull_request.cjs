@@ -27,7 +27,7 @@ const { getBaseBranch } = require("./get_base_branch.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { checkFileProtection } = require("./manifest_file_helpers.cjs");
-const { renderTemplateFromFile, buildProtectedFileList, getPromptPath } = require("./messages_core.cjs");
+const { renderTemplateFromFile, renderFilesList, buildProtectedFileList, getPromptPath } = require("./messages_core.cjs");
 const { COPILOT_REVIEWER_BOT, FAQ_CREATE_PR_PERMISSIONS_URL } = require("./constants.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
@@ -1061,10 +1061,15 @@ async function main(config = {}) {
     // Check file protection: allowlist (strict) or protected-files policy.
     /** @type {string[] | null} Protected files that trigger fallback-to-issue handling */
     let manifestProtectionFallback = null;
+    /** @type {string[] | null} Protected files that trigger request-review handling */
+    let manifestProtectionRequestReview = null;
     /** @type {unknown} */
     let manifestProtectionPushFailedError = null;
     if (!isEmpty) {
-      const protection = checkFileProtection(patchContent, config);
+      const protection = checkFileProtection(patchContent, {
+        ...config,
+        protected_files_policy: config.protected_files_policy ?? "request_review",
+      });
       if (protection.action === "deny") {
         const filesStr = protection.files.join(", ");
         const message =
@@ -1077,6 +1082,10 @@ async function main(config = {}) {
       if (protection.action === "fallback") {
         manifestProtectionFallback = protection.files;
         core.warning(`Protected file protection triggered (fallback-to-issue): ${protection.files.join(", ")}. Will create review issue instead of pull request.`);
+      }
+      if (protection.action === "request_review") {
+        manifestProtectionRequestReview = protection.files;
+        core.warning(`Protected file protection triggered (request_review): ${protection.files.join(", ")}. Will create pull request with caution and request-changes review.`);
       }
     }
 
@@ -1229,6 +1238,15 @@ async function main(config = {}) {
       bodyLines.unshift(...bodyHeader.split("\n"), "");
     }
 
+    // Keep the protected-files notice directly under detection caution:
+    // this block runs first, then detectionCaution below unshifts to index 0.
+    if (manifestProtectionRequestReview && manifestProtectionRequestReview.length > 0) {
+      const protectedFilesNoticeTemplatePath = getPromptPath("manifest_protection_request_review.md");
+      const protectedFilesNotice = renderTemplateFromFile(protectedFilesNoticeTemplatePath, {
+        files: renderFilesList(manifestProtectionRequestReview.join(", ")),
+      });
+      bodyLines.unshift(protectedFilesNotice, "", "");
+    }
     // Inject CAUTION at top of body (unshifted after header so it appears first in the final output)
     const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
     if (detectionCaution) {
@@ -2028,6 +2046,60 @@ ${patchPreview}`;
             core.info(`Requested copilot as reviewer for pull request #${pullRequest.number}`);
           } catch (copilotError) {
             core.warning(`Failed to request copilot as reviewer for PR #${pullRequest.number}: ${copilotError instanceof Error ? copilotError.message : String(copilotError)}`);
+          }
+        }
+      }
+
+      const requestChangesSections = [];
+      if (manifestProtectionRequestReview && manifestProtectionRequestReview.length > 0) {
+        const protectedFilesReviewTemplatePath = getPromptPath("manifest_protection_request_changes_review.md");
+        requestChangesSections.push(
+          renderTemplateFromFile(protectedFilesReviewTemplatePath, {
+            files: renderFilesList(manifestProtectionRequestReview),
+          })
+        );
+      }
+      if (detectionCaution) {
+        const detectionReason = process.env.GH_AW_DETECTION_REASON || "unknown";
+        const detectionWarningReviewTemplatePath = getPromptPath("threat_warning_request_changes_review.md");
+        requestChangesSections.push(
+          renderTemplateFromFile(detectionWarningReviewTemplatePath, {
+            detectionReason,
+            runUrl,
+          })
+        );
+      }
+      if (requestChangesSections.length > 0) {
+        const requestChangesBody = requestChangesSections.join("\n\n---\n\n");
+        /** @type {{ owner: string, repo: string, pull_number: number, event: "REQUEST_CHANGES" | "COMMENT", body: string, commit_id?: string }} */
+        const requestChangesParams = {
+          owner: repoParts.owner,
+          repo: repoParts.repo,
+          pull_number: pullRequest.number,
+          event: "REQUEST_CHANGES",
+          body: requestChangesBody,
+        };
+        if (pullRequest.head && pullRequest.head.sha) {
+          requestChangesParams.commit_id = pullRequest.head.sha;
+        }
+        core.info(`Creating REQUEST_CHANGES review for PR #${pullRequest.number} due to protected files`);
+        try {
+          await withRetry(() => githubClient.rest.pulls.createReview(requestChangesParams), RATE_LIMIT_RETRY_CONFIG, `create REQUEST_CHANGES review for PR #${pullRequest.number}`);
+          core.info(`Created REQUEST_CHANGES review for PR #${pullRequest.number}`);
+        } catch (requestChangesError) {
+          const requestChangesErrorMessage = getErrorMessage(requestChangesError);
+          const ownPrMessages = ["Can not request changes on your own pull request"];
+          if (ownPrMessages.some(msg => requestChangesErrorMessage.includes(msg))) {
+            core.warning(`Cannot submit REQUEST_CHANGES on own PR #${pullRequest.number}. Retrying with COMMENT.`);
+            try {
+              const commentReviewParams = { ...requestChangesParams, event: "COMMENT" };
+              await withRetry(() => githubClient.rest.pulls.createReview(commentReviewParams), RATE_LIMIT_RETRY_CONFIG, `create COMMENT review fallback for PR #${pullRequest.number}`);
+              core.info(`Created COMMENT review fallback for PR #${pullRequest.number}`);
+            } catch (commentReviewError) {
+              core.warning(`Failed to create COMMENT review fallback for PR #${pullRequest.number}: ${commentReviewError instanceof Error ? commentReviewError.message : String(commentReviewError)}`);
+            }
+          } else {
+            core.warning(`Failed to create REQUEST_CHANGES review for PR #${pullRequest.number}: ${requestChangesErrorMessage}`);
           }
         }
       }
