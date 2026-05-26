@@ -17,7 +17,7 @@ const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { checkFileProtection } = require("./manifest_file_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { renderTemplateFromFile, buildProtectedFileList, getPromptPath } = require("./messages_core.cjs");
-const { ensureFullHistoryForBundle, getGitAuthEnv, extractBundlePrerequisiteCommits } = require("./git_helpers.cjs");
+const { ensureFullHistoryForBundle, getGitAuthEnv, extractBundlePrerequisiteCommits, linearizeRangeAsCommit } = require("./git_helpers.cjs");
 const { findRepoCheckout } = require("./find_repo_checkout.cjs");
 const { getThreatDetectedMarker } = require("./threat_detection_warning.cjs");
 
@@ -674,7 +674,7 @@ async function main(config = {}) {
           // Use getExecOutput with ignoreReturnCode so we can read the actual stderr from git —
           // exec() only throws "The process '...' failed with exit code 1" which loses the
           // "lacks these prerequisite commits" text needed for the recovery path below.
-          const bundleFetchRef = `refs/heads/${message.branch}:${bundleRef}`;
+          const bundleFetchRef = `refs/heads/${branchName}:${bundleRef}`;
           const initialBundleFetch = await exec.getExecOutput("git", ["fetch", bundleFilePath, bundleFetchRef], { ...baseGitOpts, ignoreReturnCode: true });
           if (initialBundleFetch.exitCode !== 0) {
             const initialFetchErrorOutput = initialBundleFetch.stderr || `exit code ${initialBundleFetch.exitCode}`;
@@ -908,6 +908,42 @@ async function main(config = {}) {
         } catch (reviewError) {
           core.error(`Failed to create review PR: ${getErrorMessage(reviewError)}`);
           return { success: false, error: `Failed to create review PR: ${getErrorMessage(reviewError)}` };
+        }
+      }
+
+      // When signed commits are required, the GitHub GraphQL createCommitOnBranch mutation
+      // cannot represent merge commits.  If the range to be pushed contains merge commits
+      // (e.g. the agent ran `git merge origin/main` instead of `git rebase origin/main`),
+      // squash the entire range into a single regular commit that carries the same tree.
+      // This preserves the file-level outcome while producing a linear history that can
+      // be signed.  A warning is emitted so workflow authors and agents know that rebase
+      // should be preferred over merge in future runs.
+      if (signedCommits && hasChanges) {
+        const squashBase = remoteHeadBeforePatch || `origin/${branchName}`;
+        try {
+          const { stdout: mergeCountOut } = await exec.getExecOutput("git", ["rev-list", "--merges", "--count", `${squashBase}..HEAD`], baseGitOpts);
+          const mergeCount = parseInt(mergeCountOut.trim(), 10);
+          if (Number.isFinite(mergeCount) && mergeCount > 0) {
+            core.warning(
+              `push_to_pull_request_branch: detected ${mergeCount} merge commit(s) in range ${squashBase}..HEAD. ` +
+                `Merge commits cannot be pushed as signed commits. Squashing the range into a single regular commit to preserve content. ` +
+                `To avoid this, use 'git rebase' instead of 'git merge' when updating the PR branch.`
+            );
+            // Prefer the message from the first non-merge commit in the range — it carries
+            // the most meaningful description of the actual work.  Fall back to the last
+            // commit's message (which may be the merge commit itself) if no regular commit
+            // exists, and finally to a generic label.
+            const { stdout: firstNonMergeOut } = await exec.getExecOutput("git", ["log", "--no-merges", "--max-count=1", "--format=%B", "--reverse", `${squashBase}..HEAD`], baseGitOpts);
+            let squashMessage = firstNonMergeOut.trim();
+            if (!squashMessage) {
+              const { stdout: lastMsgOut } = await exec.getExecOutput("git", ["log", "-1", "--format=%B"], baseGitOpts);
+              squashMessage = lastMsgOut.trim() || "Merge changes";
+            }
+            await linearizeRangeAsCommit(squashBase, squashMessage, exec, { gitOpts: baseGitOpts, commitFlags: ["--allow-empty", "--no-verify"] });
+            core.info(`push_to_pull_request_branch: merge commits linearized into single regular commit for signed-commit push`);
+          }
+        } catch (squashErr) {
+          core.warning(`push_to_pull_request_branch: failed to linearize merge commits: ${getErrorMessage(squashErr)}; push may fail`);
         }
       }
 
