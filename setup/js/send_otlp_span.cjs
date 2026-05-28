@@ -372,9 +372,9 @@ function buildGitHubActionsResourceAttributes({
   runAttempt = "1",
 }) {
   const resourceAttributes = [buildAttr("github.repository", repository), buildAttr("github.run_id", runId), buildAttr("github.run_attempt", runAttempt)];
-  if (repository && runId && repository.includes("/")) {
-    const [owner, repo] = repository.split("/");
-    resourceAttributes.push(buildAttr("github.actions.run_url", buildWorkflowRunUrl({ runId }, { owner, repo })));
+  const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
+  if (runUrlAttr) {
+    resourceAttributes.push(runUrlAttr);
   }
   if (eventName) {
     resourceAttributes.push(buildAttr("github.event_name", eventName));
@@ -420,6 +420,21 @@ function buildGitHubActionsResourceAttributes({
   }
   resourceAttributes.push(buildAttr("deployment.environment", staged ? "staging" : "production"));
   return resourceAttributes;
+}
+
+/**
+ * Build github.actions.run_url attribute when repository and run ID are available.
+ *
+ * @param {string} repository
+ * @param {string} runId
+ * @returns {{ key: string, value: object } | null}
+ */
+function buildGitHubActionsRunUrlAttribute(repository, runId) {
+  if (!repository || !runId || !repository.includes("/")) {
+    return null;
+  }
+  const [owner, repo] = repository.split("/");
+  return buildAttr("github.actions.run_url", buildWorkflowRunUrl({ runId }, { owner, repo }));
 }
 
 /**
@@ -1158,6 +1173,10 @@ async function sendJobSetupSpan(options = {}) {
     buildAttr("gh-aw.run.actor", actor),
     buildAttr("gh-aw.repository", repository),
   ];
+  const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
+  if (runUrlAttr) {
+    attributes.push(runUrlAttr);
+  }
   if (scopeVersion !== "unknown") {
     attributes.push(buildAttr("gh-aw.cli.version", scopeVersion));
   }
@@ -1523,7 +1542,6 @@ function getErrorMessage(errorEntry) {
 /**
  * @typedef {Object} AgentRuntimeMetrics
  * @property {number | undefined} turns
- * @property {number | undefined} estimatedCostUsd
  * @property {string | undefined} stopReason
  * @property {string | undefined} resolvedModel
  * @property {{input_tokens?: number, output_tokens?: number, cache_read_tokens?: number, cache_write_tokens?: number} | undefined} tokenUsage
@@ -1576,13 +1594,13 @@ function normalizeRuntimeTokenUsage(rawUsage) {
 }
 
 /**
- * Read turns, estimated cost, token usage, and warning volume from agent-stdio.log.
+ * Read turns, token usage, and warning volume from agent-stdio.log.
  *
  * @returns {AgentRuntimeMetrics}
  */
 function readAgentRuntimeMetrics() {
   /** @type {AgentRuntimeMetrics} */
-  const metrics = { turns: undefined, estimatedCostUsd: undefined, stopReason: undefined, resolvedModel: undefined, tokenUsage: undefined, warningCount: 0 };
+  const metrics = { turns: undefined, stopReason: undefined, resolvedModel: undefined, tokenUsage: undefined, warningCount: 0 };
 
   try {
     const content = fs.readFileSync(AGENT_STDIO_LOG_PATH, "utf8");
@@ -1608,9 +1626,6 @@ function readAgentRuntimeMetrics() {
 
       if (typeof parsed.num_turns === "number" && parsed.num_turns >= 0) {
         metrics.turns = parsed.num_turns;
-      }
-      if (typeof parsed.total_cost_usd === "number" && Number.isFinite(parsed.total_cost_usd) && parsed.total_cost_usd >= 0) {
-        metrics.estimatedCostUsd = parsed.total_cost_usd;
       }
       if (typeof parsed.stop_reason === "string" && parsed.stop_reason) {
         metrics.stopReason = parsed.stop_reason;
@@ -1847,6 +1862,10 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   }
 
   const attributes = [buildAttr("gh-aw.workflow.name", workflowName), buildAttr("gh-aw.run.id", runId), buildAttr("gh-aw.run.attempt", runAttempt), buildAttr("gh-aw.run.actor", actor), buildAttr("gh-aw.repository", repository)];
+  const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
+  if (runUrlAttr) {
+    attributes.push(runUrlAttr);
+  }
   if (version !== "unknown") {
     attributes.push(buildAttr("gh-aw.cli.version", version));
   }
@@ -1888,9 +1907,6 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   }
   if (typeof runtimeMetrics.turns === "number") {
     attributes.push(buildAttr("gh-aw.turns", runtimeMetrics.turns));
-  }
-  if (typeof runtimeMetrics.estimatedCostUsd === "number") {
-    attributes.push(buildAttr("gh-aw.estimated_cost_usd", runtimeMetrics.estimatedCostUsd));
   }
   if (jobName === "agent") {
     // Emit OTel GenAI semantic attributes on agent conclusion spans even when the

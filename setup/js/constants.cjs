@@ -31,6 +31,15 @@ const TMP_GH_AW_PATH = "/tmp/gh-aw";
  */
 const COPILOT_REVIEWER_BOT = "copilot-pull-request-reviewer[bot]";
 
+/**
+ * GitHub.com GraphQL node ID for the Copilot pull request reviewer bot.
+ * Used as a fallback when the node ID cannot be resolved at runtime (e.g. network error).
+ * For GHES and other GitHub instances the node ID differs; prefer runtime resolution via
+ * the REST users API ({@link https://docs.github.com/en/rest/users/users#get-a-user}).
+ * @type {string}
+ */
+const COPILOT_REVIEWER_BOT_ID = "BOT_kgDOCnlnWA";
+
 // ---------------------------------------------------------------------------
 // Documentation URLs
 // ---------------------------------------------------------------------------
@@ -112,10 +121,20 @@ const GITHUB_RATE_LIMITS_JSONL_PATH = `${TMP_GH_AW_PATH}/github_rate_limits.json
  */
 const DETECTION_LOG_FILENAME = "detection.log";
 
+/**
+ * Filename of the structured threat detection result written by the Codex engine
+ * via `--output-last-message`. When present, the parser reads this file directly
+ * instead of scraping the detection log, eliminating false parse_error warnings
+ * caused by noisy SSE/tracing output in the log stream.
+ * @type {string}
+ */
+const DETECTION_RESULT_FILENAME = "detection_result.json";
+
 module.exports = {
   AGENT_OUTPUT_FILENAME,
   TMP_GH_AW_PATH,
   COPILOT_REVIEWER_BOT,
+  COPILOT_REVIEWER_BOT_ID,
   FAQ_CREATE_PR_PERMISSIONS_URL,
   MAX_LABELS,
   MAX_ASSIGNEES,
@@ -126,4 +145,5 @@ module.exports = {
   OTEL_JSONL_PATH,
   GITHUB_RATE_LIMITS_JSONL_PATH,
   DETECTION_LOG_FILENAME,
+  DETECTION_RESULT_FILENAME,
 };

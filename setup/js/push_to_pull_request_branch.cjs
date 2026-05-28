@@ -18,8 +18,10 @@ const { checkFileProtection } = require("./manifest_file_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { renderTemplateFromFile, buildProtectedFileList, getPromptPath } = require("./messages_core.cjs");
 const { ensureFullHistoryForBundle, getGitAuthEnv, extractBundlePrerequisiteCommits, linearizeRangeAsCommit } = require("./git_helpers.cjs");
+const { normalizeCommitSHA } = require("./commit_sha_helpers.cjs");
 const { findRepoCheckout } = require("./find_repo_checkout.cjs");
 const { getThreatDetectedMarker } = require("./threat_detection_warning.cjs");
+const { attachExecutionState } = require("./safe_output_execution_metadata.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -37,7 +39,6 @@ const MISSING_REMOTE_REF_PATTERNS = [
   "fatal: couldn't find remote ref",
   "exit code 128",
 ];
-
 /**
  * @param {unknown} value
  * @returns {boolean}
@@ -195,6 +196,11 @@ async function main(config = {}) {
     // Check if bundle or patch file exists
     const hasBundleFile = !!(bundleFilePath && fs.existsSync(bundleFilePath));
     const hasPatchFile = !!(patchFilePath && fs.existsSync(patchFilePath));
+    const applyTransport = hasBundleFile ? "bundle" : "patch";
+    core.info(`Apply transport mode: ${applyTransport} (patch file present: ${hasPatchFile}, bundle file present: ${hasBundleFile})`);
+    if (bundleFilePath && !hasBundleFile) {
+      core.warning(`Bundle file path was provided but file is not present on disk: ${bundleFilePath}; falling back to patch transport`);
+    }
 
     // Always require a patch file for policy enforcement. Bundle is used for apply-time
     // transport, but allowed-files/protected-files checks must run on patch content
@@ -397,6 +403,7 @@ async function main(config = {}) {
     let branchName;
     let prTitle = "";
     let prLabels = [];
+    let branchStateBefore = null;
 
     if (!pullNumber) {
       return { success: false, error: "Pull request number is required but not found" };
@@ -445,6 +452,9 @@ async function main(config = {}) {
       branchName = pullRequest.head.ref;
       prTitle = pullRequest.title || "";
       prLabels = pullRequest.labels.map(label => label.name);
+      if (typeof pullRequest.head?.sha === "string" && pullRequest.head.sha) {
+        branchStateBefore = { head_sha: pullRequest.head.sha };
+      }
     } catch (error) {
       core.info(`Warning: Could not fetch PR ${pullNumber} from ${itemRepo}: ${getErrorMessage(error)}`);
       return { success: false, error: `Failed to determine branch name for PR ${pullNumber} in ${itemRepo}` };
@@ -552,12 +562,16 @@ async function main(config = {}) {
         );
         core.info(`Created manifest-protection review issue #${issue.number}: ${issue.html_url}`);
         await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
-        return {
-          success: true,
-          fallback_used: true,
-          issue_number: issue.number,
-          issue_url: issue.html_url,
-        };
+        return attachExecutionState(
+          {
+            success: true,
+            fallback_used: true,
+            issue_number: issue.number,
+            issue_url: issue.html_url,
+          },
+          branchStateBefore,
+          branchStateBefore
+        );
       } catch (issueError) {
         const error = `Manifest file protection: failed to create review issue. Error: ${issueError instanceof Error ? issueError.message : String(issueError)}`;
         core.error(error);
@@ -650,13 +664,53 @@ async function main(config = {}) {
     let newCommitCount = 0;
     let remoteHeadBeforePatch = "";
     let pushedCommitSha = "";
+    let rangeBaseRef = `origin/${branchName}`;
     if (hasChanges) {
       // Capture HEAD before applying changes to compute new-commit count later
       try {
         const { stdout } = await exec.getExecOutput("git", ["rev-parse", "HEAD"], baseGitOpts);
         remoteHeadBeforePatch = stdout.trim();
+        if (remoteHeadBeforePatch) {
+          rangeBaseRef = remoteHeadBeforePatch;
+          core.info(`Remote branch HEAD before apply: ${remoteHeadBeforePatch}`);
+        }
       } catch {
         // Non-fatal - extra empty commit will be skipped
+      }
+
+      // Pin patch application to the recorded base commit captured at patch-generation time.
+      // This avoids applying a patch generated from an older branch tip onto a newer remote tip.
+      // If the commit is unavailable (e.g. cross-repo/missing object), continue with current HEAD.
+      if (!hasBundleFile && message.base_commit) {
+        const recordedBaseCommit = normalizeCommitSHA(message.base_commit);
+        if (recordedBaseCommit) {
+          core.info(`Patch route base_commit resolved: ${recordedBaseCommit}`);
+          try {
+            try {
+              await exec.exec("git", ["fetch", "origin", recordedBaseCommit, "--depth=1"], {
+                env: { ...process.env, ...gitAuthEnv },
+                ...baseGitOpts,
+              });
+            } catch (fetchError) {
+              core.info(`Note: could not fetch base_commit ${recordedBaseCommit} explicitly (${getErrorMessage(fetchError)}); will verify local availability next`);
+            }
+            await exec.exec("git", ["cat-file", "-e", recordedBaseCommit], baseGitOpts);
+            const ancestryCheck = await exec.getExecOutput("git", ["merge-base", "--is-ancestor", recordedBaseCommit, `origin/${branchName}`], { ...baseGitOpts, ignoreReturnCode: true });
+            if (ancestryCheck.exitCode !== 0) {
+              throw new Error(`recorded base_commit ${recordedBaseCommit} is not an ancestor of origin/${branchName}; cannot safely re-anchor patch apply`);
+            }
+            if (remoteHeadBeforePatch && remoteHeadBeforePatch !== recordedBaseCommit) {
+              core.warning(`Remote PR branch advanced since patch generation (remote HEAD ${remoteHeadBeforePatch}, patch base ${recordedBaseCommit}); applying patch from recorded base commit`);
+            }
+            await exec.exec("git", ["reset", "--hard", recordedBaseCommit], baseGitOpts);
+            rangeBaseRef = recordedBaseCommit;
+            core.info(`Reset branch to recorded base_commit before patch apply: ${recordedBaseCommit}`);
+          } catch (baseCommitError) {
+            core.warning(`Unable to use recorded base_commit ${recordedBaseCommit}; applying patch on current branch HEAD: ${getErrorMessage(baseCommitError)}`);
+          }
+        } else if (String(message.base_commit).trim()) {
+          core.warning(`Ignoring invalid base_commit value for patch apply: ${String(message.base_commit).trim()}`);
+        }
       }
 
       if (hasBundleFile) {
@@ -683,7 +737,7 @@ async function main(config = {}) {
             // commit objects, then retry with the original bundle ref.
             // This handles the race where main advanced between agent-time and safe_outputs-time:
             // the bundle's base commit may not be reachable from a fetch-depth:1 shallow clone
-            // even after --unshallow (e.g. when the commit is on a ref not in the fetch refspec).
+            // (e.g. when the commit is on a ref not in the fetch refspec).
             const prerequisiteCommits = extractBundlePrerequisiteCommits(initialFetchErrorOutput);
             if (prerequisiteCommits.length > 0) {
               core.warning(`Bundle fetch failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
@@ -702,13 +756,14 @@ async function main(config = {}) {
           // checkouts, merge --ff-only can fail to discover the ancestry even
           // when the bundle tip is based on the current branch tip and the
           // prerequisite exists locally.
+          core.info(`Updating local branch ref refs/heads/${branchName} to ${bundleRef} (expected previous tip: ${remoteHeadBeforePatch || "unknown"})`);
           const updateRefArgs = ["update-ref", `refs/heads/${branchName}`, bundleRef];
           if (remoteHeadBeforePatch) {
             updateRefArgs.push(remoteHeadBeforePatch);
           }
           await exec.exec("git", updateRefArgs, baseGitOpts);
           await exec.exec("git", ["reset", "--hard"], baseGitOpts);
-          core.info("Updated branch to bundle tip");
+          core.info(`Updated branch to bundle tip from ${bundleRef}`);
 
           // Clean up the temporary ref
           try {
@@ -832,6 +887,7 @@ async function main(config = {}) {
           }
         }
       } // end else (patch path)
+      core.info(`Apply transport completed; signed-push base ref: ${rangeBaseRef}`);
 
       // When threat detection produced a warning, create a review PR instead of pushing
       // directly to the existing PR branch. This allows manual review of the changes
@@ -919,7 +975,7 @@ async function main(config = {}) {
       // be signed.  A warning is emitted so workflow authors and agents know that rebase
       // should be preferred over merge in future runs.
       if (signedCommits && hasChanges) {
-        const squashBase = remoteHeadBeforePatch || `origin/${branchName}`;
+        const squashBase = rangeBaseRef;
         try {
           const { stdout: mergeCountOut } = await exec.getExecOutput("git", ["rev-list", "--merges", "--count", `${squashBase}..HEAD`], baseGitOpts);
           const mergeCount = parseInt(mergeCountOut.trim(), 10);
@@ -954,7 +1010,7 @@ async function main(config = {}) {
           owner: repoParts.owner,
           repo: repoParts.repo,
           branch: branchName,
-          baseRef: remoteHeadBeforePatch || `origin/${branchName}`,
+          baseRef: rangeBaseRef,
           cwd: repoCwd || process.cwd(),
           gitAuthEnv,
           signedCommits,
@@ -1139,12 +1195,19 @@ async function main(config = {}) {
       }
     }
 
-    return {
-      success: true,
-      branch_name: branchName,
-      commit_sha: commitSha,
-      commit_url: commitUrl,
-    };
+    return attachExecutionState(
+      {
+        success: true,
+        number: pullNumber,
+        repo: itemRepo,
+        url: `${repoUrl}/pull/${pullNumber}`,
+        branch_name: branchName,
+        commit_sha: commitSha,
+        commit_url: commitUrl,
+      },
+      branchStateBefore || (remoteHeadBeforePatch ? { head_sha: remoteHeadBeforePatch } : null),
+      commitSha ? { head_sha: commitSha } : null
+    );
   };
 }
 
