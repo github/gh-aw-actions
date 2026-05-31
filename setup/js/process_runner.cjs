@@ -138,6 +138,38 @@ function runProcess({ command, args, attempt, log, logArgs, env }) {
   });
 }
 
+/**
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {boolean}
+ */
+function isCopilotSDKEnabled(env) {
+  const sourceEnv = env ?? process.env;
+  return Boolean(sourceEnv.COPILOT_SDK_URI);
+}
+
+/**
+ * Returns the Copilot SDK environment additions to inject into child processes
+ * when SDK mode is active.
+ *
+ * When COPILOT_SDK_URI is set in process.env, returns an object with
+ * { COPILOT_SDK_URI } so callers can merge it into their child-process env.
+ * Returns an empty object when SDK mode is not active, making it safe to call
+ * unconditionally.
+ *
+ * Intended to be shared by all engine harnesses (copilot_harness, claude_harness, …)
+ * so that COPILOT_SDK_URI is forwarded consistently without duplicating the logic.
+ *
+ * @param {NodeJS.ProcessEnv} [env] - Source environment (defaults to process.env)
+ * @returns {NodeJS.ProcessEnv}
+ */
+function buildCopilotSDKEnv(env) {
+  const sourceEnv = env ?? process.env;
+  if (!isCopilotSDKEnabled(sourceEnv)) return {};
+  const uri = sourceEnv.COPILOT_SDK_URI;
+  if (!uri) return {};
+  return { COPILOT_SDK_URI: uri };
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { runProcess, formatDuration, sleep };
+  module.exports = { runProcess, formatDuration, sleep, isCopilotSDKEnabled, buildCopilotSDKEnv };
 }

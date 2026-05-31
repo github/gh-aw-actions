@@ -32,6 +32,7 @@
 "use strict";
 
 const fs = require("fs");
+const { isMaxEffectiveTokensExceededError } = require("./effective_tokens_hard_rail.cjs");
 const { runProcess, formatDuration, sleep } = require("./process_runner.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
@@ -44,6 +45,7 @@ const {
   fetchAWFReflect,
   fetchModelsFromUrl,
 } = require("./awf_reflect.cjs");
+const { emitMissingToolPermissionIssue } = require("./safeoutputs_cli.cjs");
 
 // Maximum number of retry attempts after the initial run
 const MAX_RETRIES = 3;
@@ -181,34 +183,6 @@ function buildMissingToolPermissionIssuePayload(deniedCommands) {
     alternatives: "Verify token scopes, repository permissions, and MCP/tool access configuration.",
     denied_commands: deniedCommands && deniedCommands.length > 0 ? deniedCommands : [],
   });
-}
-
-/**
- * Emit a structured missing_tool signal for repeated permission-denied failures.
- * @param {{
- *   safeOutputsPath?: string,
- *   appendFileSync?: (path: import('node:fs').PathOrFileDescriptor, data: string, options?: import('node:fs').WriteFileOptions) => void,
- *   logger?: (message: string) => void,
- *   deniedCommands?: string[]
- * }=} options
- */
-function emitMissingToolPermissionIssue(options) {
-  const safeOutputsPath = options && typeof options.safeOutputsPath === "string" ? options.safeOutputsPath : process.env.GH_AW_SAFE_OUTPUTS || "";
-  const appendFileSync = options && options.appendFileSync ? options.appendFileSync : fs.appendFileSync;
-  const logger = options && options.logger ? options.logger : log;
-  const deniedCommands = options && options.deniedCommands ? options.deniedCommands : [];
-
-  if (!safeOutputsPath) {
-    logger("missing_tool skipped: GH_AW_SAFE_OUTPUTS is not set");
-    return;
-  }
-  try {
-    appendFileSync(safeOutputsPath, buildMissingToolPermissionIssuePayload(deniedCommands) + "\n", { encoding: "utf8" });
-    logger(`missing_tool emitted for permission issues: ${safeOutputsPath}`);
-  } catch (error) {
-    const err = /** @type {Error} */ error;
-    logger(`missing_tool emission failed: ${err.message}`);
-  }
 }
 
 /**
@@ -510,8 +484,13 @@ async function main() {
 
     if (hasNumerousPermissionDenied) {
       const deniedCommands = extractDeniedCommands(result.output);
-      emitMissingToolPermissionIssue({ deniedCommands });
+      emitMissingToolPermissionIssue({ deniedCommands, logger: log });
       log(`attempt ${attempt + 1}: detected numerous permission-denied issues — not retrying (classified as missing tool/permission issue)`);
+      break;
+    }
+
+    if (isMaxEffectiveTokensExceededError(result.output)) {
+      log(`attempt ${attempt + 1}: AWF effective-token hard rail hit — not retrying (further inference will be refused until budget resets)`);
       break;
     }
 
@@ -545,6 +524,7 @@ if (typeof module !== "undefined" && module.exports) {
     resolveCodexPromptFileArgs,
     injectJsonFlag,
     isRateLimitError,
+    isMaxEffectiveTokensExceededError,
     isAuthenticationFailedError,
     isMissingApiKeyError,
     isServerError,
