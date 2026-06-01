@@ -27,6 +27,35 @@ async function getArtifactClient() {
 }
 
 /**
+ * @param {string} message
+ * @param {Record<string, unknown>} [details]
+ * @returns {string}
+ */
+function formatDailyGuardrailLogMessage(message, details) {
+  if (!details || Object.keys(details).length === 0) {
+    return `[daily-workflow-et] ${message}`;
+  }
+  let serializedDetails = "";
+  try {
+    serializedDetails = JSON.stringify(details);
+  } catch {
+    serializedDetails = JSON.stringify({ error: "failed to serialize log details" });
+  }
+  return `[daily-workflow-et] ${message}: ${serializedDetails}`;
+}
+
+/**
+ * Emit a consistently prefixed daily workflow ET diagnostic log line.
+ *
+ * @param {string} message
+ * @param {Record<string, unknown>} [details]
+ * @returns {void}
+ */
+function logDailyGuardrail(message, details) {
+  core.info(formatDailyGuardrailLogMessage(message, details));
+}
+
+/**
  * @returns {boolean}
  */
 function shouldSkipDailyEffectiveWorkflowGuardrail() {
@@ -66,12 +95,34 @@ async function getRunEffectiveTokens(artifactClient, runId, token, owner, repo) 
       repositoryName: repo,
     },
   });
+  const artifactSummaries = artifacts.map(item => ({ id: item?.id ?? null, name: item?.name || "" }));
+  logDailyGuardrail("Listed workflow artifacts", {
+    runId,
+    artifactCount: artifacts.length,
+    artifacts: artifactSummaries,
+  });
 
-  const artifact = artifacts.find(item => matchesGuardrailArtifactName(item.name));
+  const artifact = artifacts.find(item => item?.name && matchesGuardrailArtifactName(item.name));
   if (!artifact) {
+    logDailyGuardrail("No matching guardrail artifact found", {
+      runId,
+      availableArtifacts: artifactSummaries,
+    });
+    return 0;
+  }
+  if (!artifact.id) {
+    logDailyGuardrail("Skipping guardrail artifact without an id", {
+      runId,
+      artifactName: artifact.name,
+    });
     return 0;
   }
 
+  logDailyGuardrail("Selected guardrail artifact", {
+    runId,
+    artifactId: artifact.id,
+    artifactName: artifact.name,
+  });
   const downloadRoot = fs.mkdtempSync(path.join(os.tmpdir(), `gh-aw-daily-guardrail-${runId}-`));
   const download = await artifactClient.downloadArtifact(artifact.id, {
     path: downloadRoot,
@@ -84,7 +135,20 @@ async function getRunEffectiveTokens(artifactClient, runId, token, owner, repo) 
   });
 
   const tokenUsageFile = findTokenUsageFile(download.downloadPath || downloadRoot);
-  return sumEffectiveTokensFromTokenUsageFile(tokenUsageFile);
+  logDailyGuardrail("Downloaded guardrail artifact", {
+    runId,
+    artifactId: artifact.id,
+    artifactName: artifact.name,
+    downloadPath: download.downloadPath || downloadRoot,
+    tokenUsageFile,
+  });
+  const effectiveTokens = sumEffectiveTokensFromTokenUsageFile(tokenUsageFile);
+  logDailyGuardrail("Computed run ET from artifact", {
+    runId,
+    artifactId: artifact.id,
+    effectiveTokens,
+  });
+  return effectiveTokens;
 }
 
 /**
@@ -251,6 +315,17 @@ async function main() {
     return;
   }
 
+  logDailyGuardrail("Resolved current workflow ET guardrail context", {
+    owner,
+    repo,
+    currentRunId: context.runId,
+    workflowId: currentRun.data.workflow_id,
+    workflowName,
+    actorLogin,
+    threshold,
+    rateLimitRemaining: rateLimit.remaining,
+    rateLimitLimit: rateLimit.limit,
+  });
   const maxInspectableRuns = computeMaxInspectableRuns(rateLimit.remaining);
   if (maxInspectableRuns <= 0) {
     core.warning(`Skipping daily workflow ET guardrail because the GitHub API rate limit is too low (${rateLimit.remaining} remaining, reserve ${RATE_LIMIT_RESERVE}).`);
@@ -265,6 +340,13 @@ async function main() {
   let page = 1;
   let truncatedByRateLimit = false;
   while (page <= MAX_WORKFLOW_RUN_PAGES) {
+    logDailyGuardrail("Querying completed workflow runs", {
+      workflowId: currentRun.data.workflow_id,
+      actorLogin,
+      page,
+      perPage: 100,
+      cutoff: new Date(cutoffMs).toISOString(),
+    });
     const response = await githubClient.rest.actions.listWorkflowRuns({
       owner,
       repo,
@@ -275,6 +357,11 @@ async function main() {
       page,
     });
     runs = response.data.workflow_runs || [];
+    logDailyGuardrail("Received workflow runs page", {
+      page,
+      runCount: runs.length,
+      runIds: runs.map(run => run?.id).filter(Boolean),
+    });
     if (runs.length === 0) {
       break;
     }
@@ -297,6 +384,12 @@ async function main() {
     }
     page += 1;
   }
+  logDailyGuardrail("Prepared candidate workflow runs for artifact inspection", {
+    candidateRunsCount: candidateRuns.length,
+    candidateRunIds: candidateRuns.map(run => run.id),
+    maxInspectableRuns,
+    truncatedByRateLimit,
+  });
 
   const artifactClient = await getArtifactClient();
   let totalEffectiveTokens = 0;
@@ -310,6 +403,11 @@ async function main() {
     try {
       const runEffectiveTokens = await getRunEffectiveTokens(artifactClient, run.id, token, owner, repo);
       if (runEffectiveTokens <= 0) {
+        logDailyGuardrail("Skipping run without ET usage artifact data", {
+          runId: run.id,
+          currentEffectiveTokens: totalEffectiveTokens,
+          threshold,
+        });
         continue;
       }
       totalEffectiveTokens += runEffectiveTokens;
@@ -319,6 +417,13 @@ async function main() {
         created_at: run.created_at || "",
         conclusion: run.conclusion || "",
         effective_tokens: runEffectiveTokens,
+      });
+      logDailyGuardrail("Updated current ET state", {
+        runId: run.id,
+        runEffectiveTokens,
+        currentEffectiveTokens: totalEffectiveTokens,
+        threshold,
+        countedRunIds: countedRuns.map(item => item.id),
       });
     } catch (error) {
       core.warning(`Failed to inspect token usage for run ${run.id}: ${getErrorMessage(error)}`);
@@ -334,6 +439,14 @@ async function main() {
     inspectedRunsCount: countedRuns.length,
     truncatedByRateLimit,
   };
+  logDailyGuardrail("Completed ET inspection window", {
+    candidateRunsCount: summaryMeta.candidateRunsCount,
+    inspectedRunsCount: summaryMeta.inspectedRunsCount,
+    countedRunIds: countedRuns.map(run => run.id),
+    currentEffectiveTokens: totalEffectiveTokens,
+    threshold,
+    exceeded: totalEffectiveTokens > threshold,
+  });
 
   if (totalEffectiveTokens <= threshold) {
     await appendDailyEffectiveWorkflowSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, summaryMeta);
@@ -355,4 +468,5 @@ module.exports = {
   calculateDailyEffectiveWorkflowStats,
   computeMaxInspectableRuns,
   renderDailyEffectiveWorkflowSummary,
+  formatDailyGuardrailLogMessage,
 };
