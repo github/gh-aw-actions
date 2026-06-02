@@ -57,6 +57,7 @@ const {
   fetchModelsFromUrl,
 } = require("./awf_reflect.cjs");
 const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete } = require("./safeoutputs_cli.cjs");
+const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
 
 // Maximum number of retry attempts after the initial run
 const MAX_RETRIES = 3;
@@ -89,7 +90,7 @@ const MODEL_NOT_SUPPORTED_PATTERN = /The requested model is not supported/;
 // credential (written by a mid-stream interrupted run) is incomplete or invalid.  In that
 // case the driver falls back to a fresh run (without --continue) to re-do env-var auth.
 // On a fresh run the token is genuinely absent — retrying will not help.
-const NO_AUTH_INFO_PATTERN = /No authentication information found/;
+const NO_AUTH_INFO_PATTERN = /No authentication information found|Session was not created with authentication info or custom provider/;
 // Pattern to detect authentication failures returned by Copilot API.
 // After a first-attempt auth failure, retrying is futile because the entrypoint unsets
 // COPILOT_GITHUB_TOKEN between attempts.
@@ -106,18 +107,15 @@ const AGENTIC_ENGINE_TIMEOUT_PATTERN = /signal=SIG(?:TERM|KILL|INT)/;
 // re-injects the same broken history, producing the same 400 on every subsequent attempt.
 // A fresh restart is required to discard the poisoned history.
 const NULL_TYPE_TOOL_CALL_PATTERN = /tool_calls\[.*?\]\.type.*null/;
-const PERMISSION_DENIED_PATTERN = /\b(?:permission denied|permissions denied|EACCES|EPERM)\b/gi;
-const NUMEROUS_PERMISSION_DENIED_THRESHOLD = 3;
 
 /**
- * Emit a timestamped diagnostic log line to stderr.
+ * Emit a diagnostic log line to stderr.
  * All driver messages are prefixed with "[copilot-harness]" so they are easy to
  * grep out of the combined agent-stdio.log.
  * @param {string} message
  */
 function log(message) {
-  const ts = new Date().toISOString();
-  process.stderr.write(`[copilot-harness] ${ts} ${message}\n`);
+  process.stderr.write(`[copilot-harness] ${message}\n`);
 }
 
 /**
@@ -219,6 +217,73 @@ function isModelAvailableInReflectFile(model, options) {
 }
 
 /**
+ * Resolve Copilot SDK BYOK custom provider configuration from saved AWF /reflect data.
+ * Chooses a configured endpoint and maps it to an OpenAI-compatible provider base URL.
+ *
+ * @param {{
+ *   model?: string,
+ *   reflectPath?: string,
+ *   readFileSync?: (path: string, encoding: string) => string,
+ *   logger?: (msg: string) => void,
+ * }} [options]
+ * @returns {{ model: string, provider: { type: "openai", baseUrl: string } } | null}
+ */
+function resolveCopilotSDKCustomProviderFromReflect(options) {
+  const configuredModel = typeof options?.model === "string" ? options.model.trim() : "";
+  const reflectPath = (options && options.reflectPath) || AWF_REFLECT_OUTPUT_PATH;
+  const readFile = (options && options.readFileSync) || fs.readFileSync;
+  const logger = (options && options.logger) || log;
+
+  try {
+    const raw = readFile(reflectPath, "utf8");
+    const reflectData = JSON.parse(raw);
+    const endpoints = Array.isArray(reflectData?.endpoints) ? reflectData.endpoints.filter(ep => ep && ep.configured === true) : [];
+    if (endpoints.length === 0) {
+      logger(`sdk-mode: no configured endpoints in ${reflectPath}; skipping custom provider config`);
+      return null;
+    }
+
+    const endpoint = (configuredModel ? endpoints.find(ep => Array.isArray(ep.models) && ep.models.includes(configuredModel)) : null) || endpoints.find(ep => String(ep.provider || "").toLowerCase() === "copilot") || endpoints[0];
+
+    let baseUrl = "";
+    if (typeof endpoint?.models_url === "string" && endpoint.models_url) {
+      try {
+        baseUrl = new URL(endpoint.models_url).origin;
+      } catch {
+        // ignore malformed URL and fall back to port-based construction below
+      }
+    }
+    if (!baseUrl && endpoint?.port != null) {
+      baseUrl = `http://api-proxy:${String(endpoint.port)}`;
+    }
+    if (!baseUrl) {
+      logger("sdk-mode: unable to derive provider baseUrl from awf-reflect endpoint data; skipping custom provider config");
+      return null;
+    }
+
+    let model = configuredModel;
+    if (!model && Array.isArray(endpoint?.models)) {
+      const firstModel = endpoint.models.find(m => typeof m === "string" && m.trim().length > 0);
+      model = typeof firstModel === "string" ? firstModel.trim() : "";
+    }
+    if (!model) {
+      logger("sdk-mode: unable to derive model for custom provider from awf-reflect; skipping custom provider config");
+      return null;
+    }
+
+    logger(`sdk-mode: custom provider resolved from awf-reflect (provider=${String(endpoint.provider || "unknown")} baseUrl=${baseUrl} model=${model})`);
+    return {
+      model,
+      provider: { type: "openai", baseUrl },
+    };
+  } catch (error) {
+    const err = /** @type {Error} */ error;
+    logger(`sdk-mode: unable to read custom provider config from ${reflectPath}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Determines if the collected output contains a "No authentication information found" error.
  * This means no auth token (COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN) is available
  * in the environment.  Retrying will not help because the absent token will remain absent.
@@ -236,6 +301,84 @@ function isNoAuthInfoError(output) {
  */
 function isAuthenticationFailedError(output) {
   return AUTHENTICATION_FAILED_PATTERN.test(output);
+}
+
+/**
+ * Extract provider auth failure details from Copilot output when available.
+ * @param {string} output
+ * @returns {{ providerUrl: string, statusCode: string } | null}
+ */
+function parseProviderAuthFailure(output) {
+  const match = output.match(/Authentication failed with provider at (\S+) \(HTTP (\d+)\)\.?/i);
+  if (!match) {
+    return null;
+  }
+  return {
+    providerUrl: match[1],
+    statusCode: match[2],
+  };
+}
+
+/**
+ * Determine whether a provider URL likely points at the gh-aw API proxy sidecar.
+ * @param {string} providerUrl
+ * @returns {boolean}
+ */
+function isLikelyAWFAPIProxyURL(providerUrl) {
+  try {
+    const { hostname, port } = new URL(providerUrl);
+    const normalizedHostname = hostname.toLowerCase();
+    if (port !== "10002") {
+      return false;
+    }
+    return (
+      normalizedHostname === "api-proxy" ||
+      normalizedHostname === "host.docker.internal" ||
+      normalizedHostname === "localhost" ||
+      /^127(?:\.\d{1,3}){3}$/.test(normalizedHostname) ||
+      /^10(?:\.\d{1,3}){3}$/.test(normalizedHostname) ||
+      /^192\.168(?:\.\d{1,3}){2}$/.test(normalizedHostname) ||
+      /^172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}$/.test(normalizedHostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Infer which Copilot auth stage failed without exposing secrets.
+ * @param {string} output
+ * @returns {string}
+ */
+function detectCopilotAuthFailureStage(output) {
+  if (/\b(?:validating|validate|validation)\b[\s\S]{0,40}\b(?:token|auth|authentication)\b/i.test(output)) {
+    return "validating the token";
+  }
+  if (/\b(?:list|listing)\b[\s\S]{0,40}\bmodels?\b/i.test(output) || /\/models\b/i.test(output)) {
+    return "listing models";
+  }
+  return "starting the Copilot CLI request";
+}
+
+/**
+ * Build a more actionable Copilot auth diagnostic when a 401 came from the gh-aw API proxy.
+ * @param {string} output
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string}
+ */
+function buildCopilotProxyAuthFailureDiagnostic(output, env = process.env) {
+  const authFailure = parseProviderAuthFailure(output);
+  if (!authFailure || authFailure.statusCode !== "401" || !isLikelyAWFAPIProxyURL(authFailure.providerUrl)) {
+    return "";
+  }
+
+  const selectedModel = typeof env.COPILOT_MODEL === "string" && env.COPILOT_MODEL.trim() ? env.COPILOT_MODEL.trim() : "(unset)";
+  const stage = detectCopilotAuthFailureStage(output);
+  return (
+    `Copilot authentication failed through the gh-aw API proxy (HTTP 401, model=${selectedModel}, stage=${stage}). ` +
+    "Check that COPILOT_GITHUB_TOKEN is present, unexpired, and authorized for the selected COPILOT_MODEL. " +
+    "If you configured GH_AW_MODEL_AGENT_COPILOT or GH_AW_DEFAULT_MODEL_COPILOT, verify that the token has access to that model."
+  );
 }
 
 /**
@@ -285,55 +428,6 @@ function isNullTypeToolCallError(output) {
 }
 
 /**
- * Count permission-denied indicators in process output.
- * @param {string} output
- * @returns {number}
- */
-function countPermissionDeniedIssues(output) {
-  if (!output) return 0;
-  const matches = output.match(PERMISSION_DENIED_PATTERN);
-  return matches ? matches.length : 0;
-}
-
-/**
- * Detect whether output contains numerous permission-denied issues.
- * @param {string} output
- * @returns {boolean}
- */
-function hasNumerousPermissionDeniedIssues(output) {
-  return countPermissionDeniedIssues(output) >= NUMEROUS_PERMISSION_DENIED_THRESHOLD;
-}
-
-/**
- * Extract the commands that were denied from process output.
- * Scans for lines using the Copilot CLI pipe marker (│) that appear
- * within three lines before each "permission denied" occurrence.
- * Returns a deduplicated array of command strings (may be empty if
- * the output format does not contain extractable commands).
- * @param {string} output
- * @returns {string[]}
- */
-function extractDeniedCommands(output) {
-  if (!output) return [];
-  const lines = output.split("\n");
-  const deniedCommands = new Set();
-  for (let i = 0; i < lines.length; i++) {
-    if (/\bpermission denied\b/i.test(lines[i])) {
-      // Look back up to 3 lines for a command displayed with the
-      // Copilot CLI box-drawing pipe marker (│ U+2502) or plain pipe (|).
-      for (let j = i - 1; j >= Math.max(0, i - 3); j--) {
-        const cmdMatch = lines[j].match(/^\s*[\u2502|]\s+(.+)\s*$/);
-        if (cmdMatch && cmdMatch[1].trim()) {
-          deniedCommands.add(cmdMatch[1].trim());
-          break;
-        }
-      }
-    }
-  }
-  return [...deniedCommands];
-}
-
-/**
  * Build a structured report_incomplete payload for infrastructure failures.
  * @param {string} details
  * @returns {string}
@@ -343,21 +437,6 @@ function buildInfrastructureIncompletePayload(details) {
     type: "report_incomplete",
     reason: "infrastructure_error",
     details,
-  });
-}
-
-/**
- * Build a structured missing_tool payload for repeated permission-denied failures.
- * @param {string[]} [deniedCommands] - Commands that were denied (may be empty)
- * @returns {string}
- */
-function buildMissingToolPermissionIssuePayload(deniedCommands) {
-  return JSON.stringify({
-    type: "missing_tool",
-    tool: "tool/permission",
-    reason: "missing tool/permission issue: numerous permission denied errors detected",
-    alternatives: "Verify token scopes, repository permissions, and MCP/tool access configuration.",
-    denied_commands: deniedCommands && deniedCommands.length > 0 ? deniedCommands : [],
   });
 }
 
@@ -406,7 +485,9 @@ async function readSDKOptionsFromStdin() {
   return new Promise(resolve => {
     /** @type {Buffer[]} */
     const chunks = [];
-    process.stdin.on("data", chunk => chunks.push(/** @type {Buffer} */ (chunk)));
+    process.stdin.on("data", chunk => {
+      chunks.push(Buffer.from(chunk));
+    });
     process.stdin.on("end", () => {
       const text = Buffer.concat(chunks).toString("utf8").trim();
       if (!text) {
@@ -555,6 +636,8 @@ async function main() {
   // In SDK mode the prompt is required; read it from the promptFile in sdkOptions (piped via
   // stdin by the engine command).  Fall back to extracting from CLI args for backward compatibility.
   let sdkPrompt = null;
+  /** @type {{ model: string, provider: { type: "openai", baseUrl: string } } | null} */
+  let sdkCustomProviderConfig = null;
   if (copilotSDKMode) {
     if (sdkOptions && sdkOptions.promptFile) {
       try {
@@ -573,6 +656,12 @@ async function main() {
       } else {
         log("sdk-mode: no prompt found in stdin JSON payload or CLI args");
       }
+    }
+    if (process.env.AWF_REFLECT_ENABLED === "1") {
+      sdkCustomProviderConfig = resolveCopilotSDKCustomProviderFromReflect({
+        model: process.env.COPILOT_MODEL,
+        logger: log,
+      });
     }
   }
   /** @type {Awaited<ReturnType<typeof startCopilotSDKServer>>} */
@@ -619,9 +708,22 @@ async function main() {
 
         // Redact --prompt / -p value from logs to avoid leaking prompt content
         const safeArgs = currentArgs.map((arg, i) => (currentArgs[i - 1] === "--prompt" || currentArgs[i - 1] === "-p" ? "<redacted>" : arg));
-        const result = copilotSDKMode
-          ? await runWithCopilotSDK({ sdkUri: sdkEnv.COPILOT_SDK_URI ?? process.env.COPILOT_SDK_URI ?? "", prompt: sdkPrompt, logger: log, attempt })
-          : await runProcess({ command, args: currentArgs, attempt, log, logArgs: safeArgs, env: childEnv });
+        let result;
+        if (copilotSDKMode) {
+          if (!sdkPrompt) {
+            throw new Error("sdk-mode invariant violated: prompt must be resolved before execution");
+          }
+          result = await runWithCopilotSDK({
+            sdkUri: sdkEnv.COPILOT_SDK_URI ?? process.env.COPILOT_SDK_URI ?? "",
+            prompt: sdkPrompt,
+            logger: log,
+            attempt,
+            model: sdkCustomProviderConfig?.model,
+            provider: sdkCustomProviderConfig?.provider,
+          });
+        } else {
+          result = await runProcess({ command, args: currentArgs, attempt, log, logArgs: safeArgs, env: childEnv });
+        }
         lastExitCode = result.exitCode;
         const attemptDetections = detectCopilotErrors(result.output);
         detectedCopilotErrors.inferenceAccessError ||= attemptDetections.inferenceAccessError;
@@ -653,6 +755,7 @@ async function main() {
         const isModelNotSupported = isModelNotSupportedError(result.output);
         const isAuthErr = isNoAuthInfoError(result.output);
         const isAuthenticationFailed = isAuthenticationFailedError(result.output);
+        const proxyAuthDiagnostic = buildCopilotProxyAuthFailureDiagnostic(result.output, process.env);
         const isNullTypeToolCall = isNullTypeToolCallError(result.output);
         const isMaxEffectiveTokensExceeded = isMaxEffectiveTokensExceededError(result.output);
         const permissionDeniedCount = countPermissionDeniedIssues(result.output);
@@ -674,7 +777,11 @@ async function main() {
         );
 
         if (attempt === 0 && isAuthenticationFailed) {
-          log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
+          if (proxyAuthDiagnostic) {
+            log(`attempt ${attempt + 1}: ${proxyAuthDiagnostic} — not retrying (first-attempt auth failure is non-retryable)`);
+          } else {
+            log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
+          }
           break;
         }
 
@@ -815,11 +922,13 @@ if (typeof module !== "undefined" && module.exports) {
     extractDeniedCommands,
     fetchAWFReflect,
     fetchModelsFromUrl,
+    buildCopilotProxyAuthFailureDiagnostic,
     buildCopilotSDKServerArgs,
     getCopilotSDKServerPort,
     isDetectionPhase,
     isModelAvailableInReflectData,
     isModelAvailableInReflectFile,
+    resolveCopilotSDKCustomProviderFromReflect,
     countPermissionDeniedIssues,
     detectCopilotErrors,
     hasNumerousPermissionDeniedIssues,
