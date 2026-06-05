@@ -77,11 +77,21 @@ jobs:
             core.info(`✅ ${CONFIG_FILE} is valid JSON`);
 
             const errors = [];
-            const allowedTopKeys = new Set(['$schema', 'agent-compat-v1']);
+            const allowedTopKeys = new Set([
+              '$schema',
+              'blockedVersions',
+              'minimumVersion',
+              'minRecommendedVersion',
+              'agent-compat-v1',
+            ]);
             for (const key of Object.keys(config)) {
               if (!allowedTopKeys.has(key)) {
                 errors.push(`Unknown top-level property: '${key}'`);
               }
+            }
+
+            if ('blockedVersions' in config && !Array.isArray(config.blockedVersions)) {
+              errors.push(`'blockedVersions' must be an array`);
             }
 
             const matrix = config['agent-compat-v1'];
