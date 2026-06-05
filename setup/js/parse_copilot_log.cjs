@@ -63,28 +63,214 @@ function extractAwfTokenWarnings(logEntries) {
 }
 
 /**
- * Extracts the premium request count from the log content using regex
- * @param {string} logContent - The raw log content as a string
- * @returns {number} The number of premium requests consumed (defaults to 1 if not found)
+ * Detects whether parsed entries are Copilot SDK events.jsonl entries that need
+ * conversion into the normalized trace structure used by summary renderers.
+ * @param {Array<any>} logEntries
+ * @returns {boolean}
  */
-function extractPremiumRequestCount(logContent) {
-  // Try various patterns that might appear in the Copilot CLI output
-  // Use \d+(?:\.\d+)? to match both integers and decimals (e.g., 1, 0.33, 2.5)
-  const patterns = [/premium\s+requests?\s+consumed:?\s*(\d+(?:\.\d+)?)/i, /(\d+(?:\.\d+)?)\s+premium\s+requests?\s+consumed/i, /consumed\s+(\d+(?:\.\d+)?)\s+premium\s+requests?/i];
+function isCopilotSdkEventsFormat(logEntries) {
+  if (!Array.isArray(logEntries) || logEntries.length === 0) {
+    return false;
+  }
 
-  for (const pattern of patterns) {
-    const match = logContent.match(pattern);
-    if (match && match[1]) {
-      const count = parseFloat(match[1]);
-      if (!isNaN(count) && count > 0) {
-        return count;
-      }
+  const sdkEventTypes = new Set(["user.message", "assistant.message", "tool.execution_start", "tool.execution_complete", "reasoning", "assistant.reasoning"]);
+  let sdkLikeCount = 0;
+
+  for (const entry of logEntries) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.type === "assistant" || entry.type === "user" || entry.type === "system" || entry.type === "result") {
+      return false;
+    }
+    if (typeof entry.type === "string" && sdkEventTypes.has(entry.type) && typeof entry.data === "object" && entry.data !== null) {
+      sdkLikeCount++;
     }
   }
 
-  // Default to 1 if no match found
-  // For agentic workflows, 1 premium request is consumed per workflow run
-  return 1;
+  return sdkLikeCount > 0;
+}
+
+/**
+ * Converts Copilot SDK events.jsonl entries into the normalized trace format
+ * expected by generateConversationMarkdown and copilot-style summary renderers.
+ * @param {Array<any>} sdkEntries
+ * @returns {Array<any>}
+ */
+function normalizeCopilotSdkEventsToTrace(sdkEntries) {
+  /** @type {Array<any>} */
+  const normalizedEntries = [];
+  const toolNames = new Set();
+  const pendingByToolCallId = new Map();
+  const pendingIdsByToolName = new Map();
+  let toolCounter = 0;
+  let turnCount = 0;
+  let assistantMessageCount = 0;
+  let firstTimestampMs = null;
+  let lastTimestampMs = null;
+
+  const addPendingId = (toolName, toolId) => {
+    const existing = pendingIdsByToolName.get(toolName);
+    if (existing) {
+      existing.push(toolId);
+      return;
+    }
+    pendingIdsByToolName.set(toolName, [toolId]);
+  };
+
+  const shiftPendingId = toolName => {
+    const existing = pendingIdsByToolName.get(toolName);
+    if (!existing || existing.length === 0) return null;
+    const toolId = existing.shift();
+    if (existing.length === 0) {
+      pendingIdsByToolName.delete(toolName);
+    }
+    return toolId || null;
+  };
+
+  const removePendingId = (toolName, toolId) => {
+    const existing = pendingIdsByToolName.get(toolName);
+    if (!existing || existing.length === 0) return;
+    const idx = existing.indexOf(toolId);
+    if (idx === -1) return;
+    existing.splice(idx, 1);
+    if (existing.length === 0) {
+      pendingIdsByToolName.delete(toolName);
+    }
+  };
+
+  const normalizeToolName = (rawToolName, mcpServerName) => {
+    const toolName = typeof rawToolName === "string" && rawToolName.trim() ? rawToolName.trim() : "unknown";
+    if (toolName.startsWith("mcp__")) {
+      return toolName;
+    }
+    const serverName = typeof mcpServerName === "string" ? mcpServerName.trim() : "";
+    if (!serverName) {
+      return toolName;
+    }
+    return `mcp__${serverName}__${toolName}`;
+  };
+
+  const maybeTrackTimestamp = timestamp => {
+    if (typeof timestamp !== "string") return;
+    const ms = new Date(timestamp).getTime();
+    if (!Number.isFinite(ms)) return;
+    if (firstTimestampMs === null || ms < firstTimestampMs) {
+      firstTimestampMs = ms;
+    }
+    if (lastTimestampMs === null || ms > lastTimestampMs) {
+      lastTimestampMs = ms;
+    }
+  };
+
+  for (const entry of sdkEntries) {
+    if (!entry || typeof entry !== "object") continue;
+    maybeTrackTimestamp(entry.timestamp);
+
+    switch (entry.type) {
+      case "user.message":
+        turnCount++;
+        break;
+
+      case "assistant.message": {
+        assistantMessageCount++;
+        const text = typeof entry.data?.content === "string" ? entry.data.content.trim() : "";
+        if (!text) break;
+        normalizedEntries.push({
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text }],
+          },
+        });
+        break;
+      }
+
+      case "tool.execution_start": {
+        const toolName = normalizeToolName(entry.data?.toolName, entry.data?.mcpServerName);
+        toolNames.add(toolName);
+        const toolCallId = typeof entry.data?.toolCallId === "string" && entry.data.toolCallId.trim() ? entry.data.toolCallId : null;
+        const resolvedToolId = toolCallId || `sdk_tool_${++toolCounter}`;
+        if (toolCallId) {
+          pendingByToolCallId.set(toolCallId, resolvedToolId);
+        }
+        addPendingId(toolName, resolvedToolId);
+        normalizedEntries.push({
+          type: "assistant",
+          message: {
+            content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: {} }],
+          },
+        });
+        break;
+      }
+
+      case "tool.execution_complete": {
+        const toolName = normalizeToolName(entry.data?.toolName, entry.data?.mcpServerName);
+        toolNames.add(toolName);
+        const toolCallId = typeof entry.data?.toolCallId === "string" && entry.data.toolCallId.trim() ? entry.data.toolCallId : null;
+        let resolvedToolId = null;
+
+        if (toolCallId && pendingByToolCallId.has(toolCallId)) {
+          resolvedToolId = pendingByToolCallId.get(toolCallId);
+          pendingByToolCallId.delete(toolCallId);
+          if (resolvedToolId) {
+            removePendingId(toolName, resolvedToolId);
+          }
+        }
+        if (!resolvedToolId) {
+          resolvedToolId = shiftPendingId(toolName);
+        }
+        if (!resolvedToolId) {
+          resolvedToolId = `sdk_tool_${++toolCounter}`;
+          normalizedEntries.push({
+            type: "assistant",
+            message: {
+              content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: {} }],
+            },
+          });
+        }
+
+        const success = typeof entry.data?.success === "boolean" ? entry.data.success : !entry.data?.error;
+        normalizedEntries.push({
+          type: "user",
+          message: {
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: resolvedToolId,
+                content: success ? "success" : "Tool execution failed",
+                is_error: !success,
+              },
+            ],
+          },
+        });
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  if (normalizedEntries.length === 0) {
+    return [];
+  }
+
+  normalizedEntries.unshift({
+    type: "system",
+    subtype: "init",
+    model: "copilot-sdk",
+    session_id: null,
+    tools: Array.from(toolNames),
+  });
+
+  const resultEntry = {
+    type: "result",
+    num_turns: turnCount > 0 ? turnCount : assistantMessageCount,
+  };
+  if (firstTimestampMs !== null && lastTimestampMs !== null && lastTimestampMs >= firstTimestampMs) {
+    resultEntry.duration_ms = lastTimestampMs - firstTimestampMs;
+  }
+  normalizedEntries.push(resultEntry);
+
+  return normalizedEntries;
 }
 
 /**
@@ -122,6 +308,13 @@ function parseCopilotLog(logContent) {
 
   if (!logEntries || logEntries.length === 0) {
     return { markdown: "## Agent Log Summary\n\nLog format not recognized as Copilot JSON array or JSONL.\n", logEntries: [] };
+  }
+
+  if (isCopilotSdkEventsFormat(logEntries)) {
+    const normalized = normalizeCopilotSdkEventsToTrace(logEntries);
+    if (normalized.length > 0) {
+      logEntries = normalized;
+    }
   }
 
   // Generate conversation markdown using shared function
@@ -186,16 +379,7 @@ function parseCopilotLog(logContent) {
   const initEntry = logEntries.find(entry => entry.type === "system" && entry.subtype === "init");
 
   markdown += generateInformationSection(lastEntry, {
-    additionalInfoCallback: entry => {
-      // Display premium request consumption if using a premium model
-      const isPremiumModel = initEntry && initEntry.model_info && initEntry.model_info.billing && initEntry.model_info.billing.is_premium === true;
-      if (isPremiumModel) {
-        // Prefer the count stored in the result entry (pretty-print format), fall back to regex scan
-        const premiumRequestCount = entry._premium_requests != null ? entry._premium_requests : extractPremiumRequestCount(logContent);
-        return `**Premium Requests Consumed:** ${premiumRequestCount}\n\n`;
-      }
-      return "";
-    },
+    additionalInfoCallback: () => "",
   });
 
   return { markdown, logEntries };
@@ -239,9 +423,7 @@ function parsePrettyPrintFormat(logContent) {
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheReadTokens = 0;
-  let premiumRequests = 1;
   let modelName = "unknown";
-  let hasPremiumModel = false;
   let inModelBreakdown = false;
   let i = 0;
 
@@ -287,11 +469,6 @@ function parsePrettyPrintFormat(logContent) {
 
     // Skip usage stat lines
     if (USAGE_LINES_RE.test(trimmed)) {
-      const premMatch = trimmed.match(/(\d+(?:\.\d+)?)\s+Premium\s+request/i);
-      if (premMatch) {
-        premiumRequests = parseFloat(premMatch[1]);
-        hasPremiumModel = true;
-      }
       // Newer Copilot CLI footer: "Tokens    ↑ 163.9k • ↓ 567 • 149.2k (cached)"
       // The arrow + (cached) form has no "Breakdown by AI model" section, so this
       // is the only place token totals appear. Capture them when present so they
@@ -334,8 +511,6 @@ function parsePrettyPrintFormat(logContent) {
         inputTokens += parseTokenCount(modelMatch[2]);
         outputTokens += parseTokenCount(modelMatch[3]);
         if (modelMatch[4]) cacheReadTokens += parseTokenCount(modelMatch[4]);
-        const isPremMatch = line.match(/\(Est\.\s+[\d.]+\s+Premium\s+request/i);
-        if (isPremMatch) hasPremiumModel = true;
         i++;
         continue;
       }
@@ -361,9 +536,6 @@ function parsePrettyPrintFormat(logContent) {
     tools: [],
     session_id: null,
   };
-  if (hasPremiumModel) {
-    initEntry.model_info = { billing: { is_premium: true } };
-  }
   entries.push(initEntry);
 
   // Tool call entries (assistant + user result pairs)
@@ -420,7 +592,6 @@ function parsePrettyPrintFormat(logContent) {
     type: "result",
     num_turns: numTurns,
     usage,
-    _premium_requests: premiumRequests,
   });
 
   return entries;
@@ -1004,7 +1175,6 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     main,
     parseCopilotLog,
-    extractPremiumRequestCount,
     parsePrettyPrintFormat,
   };
 }

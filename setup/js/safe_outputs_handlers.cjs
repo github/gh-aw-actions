@@ -12,7 +12,7 @@ const { getCurrentBranch } = require("./get_current_branch.cjs");
 const { getBaseBranch } = require("./get_base_branch.cjs");
 const { generateGitPatch } = require("./generate_git_patch.cjs");
 const { generateGitBundle } = require("./generate_git_bundle.cjs");
-const { hasMergeCommitsInRange } = require("./git_helpers.cjs");
+const { hasMergeCommitsInRange, execGitSync } = require("./git_helpers.cjs");
 const { enforceCommentLimits } = require("./comment_limit_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_CONFIG, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
@@ -42,6 +42,14 @@ function buildIntentErrorResponse(error) {
     ],
     isError: true,
   };
+}
+
+/**
+ * @param {Record<string, any>} entry
+ * @returns {boolean}
+ */
+function hasExplicitAddCommentTargetNumber(entry) {
+  return ["item_number", "pr_number", "pr"].some(field => entry[field] !== undefined && entry[field] !== null && String(entry[field]).trim() !== "");
 }
 
 /**
@@ -130,6 +138,8 @@ function resolvePatchWorkspacePath(workspacePath) {
  */
 function createHandlers(server, appendSafeOutput, config = {}) {
   const TOKEN_THRESHOLD = 16000;
+  const addCommentConfig = config.add_comment || config["add-comment"] || {};
+  const wildcardAddCommentTargetRequiresItemNumber = addCommentConfig.target === "*";
 
   /**
    * Detect and offload large string fields to files.
@@ -554,6 +564,36 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       transportOptions.token = prConfig["github-token"];
     }
 
+    // SECURITY: Pin the branch ref to a SHA before generating any transport artifacts.
+    // This prevents TOCTOU races where the agent flips the ref between patch and bundle
+    // generation, causing the two to represent different commit sets.
+    const gitCwd = repoCwd || process.env.GITHUB_WORKSPACE || process.cwd();
+    let pinnedSha;
+    try {
+      pinnedSha = execGitSync(["rev-parse", "--verify", `refs/heads/${entry.branch}^{commit}`], { cwd: gitCwd })
+        .toString()
+        .trim();
+      server.debug(`Pinned branch '${entry.branch}' to SHA ${pinnedSha}`);
+    } catch (pinError) {
+      server.debug(`Failed to pin branch '${entry.branch}': ${getErrorMessage(pinError)}`);
+      if (useBundle) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "error",
+                error: `Failed to pin branch '${entry.branch}' before bundle generation: ${getErrorMessage(pinError)}`,
+                details: `Bundle transport requires branch pinning to prevent patch/bundle desynchronization. Retry after ensuring the branch exists locally (for example: git branch --list '${entry.branch}').`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      pinnedSha = null;
+    }
+
     // Always generate a patch for policy enforcement (allowed-files/protected-files/excluded-files),
     // even when bundle transport is selected for apply-time commit transport.
     server.debug(`Generating patch for create_pull_request with branch: ${entry.branch}${repoCwd ? ` in ${repoCwd} baseBranch: ${baseBranch}` : ""}`);
@@ -565,6 +605,10 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // Pass excluded_files so git excludes them via :(exclude) pathspecs at generation time.
     if (Array.isArray(prConfig.excluded_files) && prConfig.excluded_files.length > 0) {
       patchOptions.excludedFiles = prConfig.excluded_files;
+    }
+    // Pass pinnedSha so patch generation uses the pinned commit, not a potentially-flipped ref
+    if (pinnedSha) {
+      patchOptions.pinnedSha = pinnedSha;
     }
     const patchResult = await generateGitPatch(entry.branch, baseBranch, patchOptions);
 
@@ -627,6 +671,47 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       }
 
       server.debug(`Bundle generated successfully: ${bundleResult.bundlePath} (${bundleResult.bundleSize} bytes)`);
+
+      // SECURITY: Verify the branch ref hasn't been flipped between patch and bundle
+      // generation (TOCTOU check). If the SHA changed, the bundle may contain different
+      // commits than the patch used for file-protection policy enforcement.
+      if (pinnedSha) {
+        try {
+          const currentSha = execGitSync(["rev-parse", "--verify", `refs/heads/${entry.branch}^{commit}`], { cwd: gitCwd })
+            .toString()
+            .trim();
+          if (currentSha !== pinnedSha) {
+            server.debug(`SECURITY: Branch '${entry.branch}' SHA changed during transport generation (was ${pinnedSha}, now ${currentSha}). Aborting.`);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    result: "error",
+                    error: "Branch ref changed during transport artifact generation. This may indicate a concurrent modification. Please retry.",
+                    details: `Branch '${entry.branch}' pointed to ${pinnedSha} at start but ${currentSha} after bundle generation.`,
+                  }),
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch (verifyError) {
+          server.debug(`SECURITY: Failed to verify branch SHA after bundle generation: ${getErrorMessage(verifyError)}`);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  result: "error",
+                  error: `Failed to verify branch integrity after bundle generation: ${getErrorMessage(verifyError)}`,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
 
       // Store the bundle path in the entry so consumers know which file to use
       entry.bundle_path = bundleResult.bundlePath;
@@ -876,6 +961,36 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       pushTransportOptions.token = pushConfig["github-token"];
     }
 
+    // SECURITY: Pin the branch ref to a SHA before generating any transport artifacts.
+    // This prevents TOCTOU races where the agent flips the ref between patch and bundle
+    // generation, causing the two to represent different commit sets.
+    const pushGitCwd = repoCwd || process.env.GITHUB_WORKSPACE || process.cwd();
+    let pushPinnedSha;
+    try {
+      pushPinnedSha = execGitSync(["rev-parse", "--verify", `refs/heads/${entry.branch}^{commit}`], { cwd: pushGitCwd })
+        .toString()
+        .trim();
+      server.debug(`Pinned branch '${entry.branch}' to SHA ${pushPinnedSha}`);
+    } catch (pinError) {
+      server.debug(`Failed to pin branch '${entry.branch}': ${getErrorMessage(pinError)}`);
+      if (useBundle) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "error",
+                error: `Failed to pin branch '${entry.branch}' before bundle generation: ${getErrorMessage(pinError)}`,
+                details: `Bundle transport requires branch pinning to prevent patch/bundle desynchronization. Retry after ensuring the branch exists locally (for example: git branch --list '${entry.branch}').`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      pushPinnedSha = null;
+    }
+
     // Always generate an incremental patch for policy enforcement (allowed-files/protected-files/excluded-files),
     // even when bundle transport is selected for apply-time commit transport.
     server.debug(`Generating incremental patch for push_to_pull_request_branch with branch: ${entry.branch}, baseBranch: ${baseBranch}`);
@@ -887,6 +1002,10 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // Pass excluded_files so git excludes them via :(exclude) pathspecs at generation time.
     if (Array.isArray(pushConfig.excluded_files) && pushConfig.excluded_files.length > 0) {
       pushPatchOptions.excludedFiles = pushConfig.excluded_files;
+    }
+    // Pass pinnedSha so patch generation uses the pinned commit, not a potentially-flipped ref
+    if (pushPinnedSha) {
+      pushPatchOptions.pinnedSha = pushPinnedSha;
     }
     const patchResult = await generateGitPatch(entry.branch, baseBranch, pushPatchOptions);
 
@@ -957,6 +1076,46 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       }
 
       server.debug(`Bundle generated successfully: ${bundleResult.bundlePath} (${bundleResult.bundleSize} bytes)`);
+
+      // SECURITY: Verify the branch ref hasn't been flipped between patch and bundle
+      // generation (TOCTOU check).
+      if (pushPinnedSha) {
+        try {
+          const currentSha = execGitSync(["rev-parse", "--verify", `refs/heads/${entry.branch}^{commit}`], { cwd: pushGitCwd })
+            .toString()
+            .trim();
+          if (currentSha !== pushPinnedSha) {
+            server.debug(`SECURITY: Branch '${entry.branch}' SHA changed during transport generation (was ${pushPinnedSha}, now ${currentSha}). Aborting.`);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    result: "error",
+                    error: "Branch ref changed during transport artifact generation. This may indicate a concurrent modification. Please retry.",
+                    details: `Branch '${entry.branch}' pointed to ${pushPinnedSha} at start but ${currentSha} after bundle generation.`,
+                  }),
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch (verifyError) {
+          server.debug(`SECURITY: Failed to verify branch SHA after bundle generation: ${getErrorMessage(verifyError)}`);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  result: "error",
+                  error: `Failed to verify branch integrity after bundle generation: ${getErrorMessage(verifyError)}`,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
 
       // Store the bundle path in the entry so consumers know which file to use
       entry.bundle_path = bundleResult.bundlePath;
@@ -1333,6 +1492,11 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
     // Build the entry with a temporary_id
     const entry = { ...(args || {}), type: "add_comment" };
+    if (wildcardAddCommentTargetRequiresItemNumber) {
+      if (!hasExplicitAddCommentTargetNumber(entry)) {
+        return buildIntentErrorResponse("add_comment requires item_number when safe-outputs.add-comment.target is '*'. Provide item_number (or pr_number/pr alias).");
+      }
+    }
     const intentValidationError = validateAddCommentIntent(entry);
     if (intentValidationError) {
       return buildIntentErrorResponse(intentValidationError);

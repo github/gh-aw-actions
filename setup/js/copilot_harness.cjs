@@ -39,12 +39,13 @@
 
 "use strict";
 
+require("./shim.cjs");
+
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { runProcess, formatDuration, sleep, isCopilotSDKEnabled, buildCopilotSDKEnv } = require("./process_runner.cjs");
 const { buildCopilotSDKServerArgs, getCopilotSDKServerPort, startCopilotSDKServer, stopCopilotSDKServer, waitForCopilotSDKServer } = require("./copilot_sdk_sidecar.cjs");
-const { extractPromptFromArgs, runWithCopilotSDK } = require("./copilot_sdk_driver.cjs");
 const { isMaxEffectiveTokensExceededError } = require("./effective_tokens_hard_rail.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
@@ -56,6 +57,7 @@ const {
   extractModelIds,
   fetchAWFReflect,
   fetchModelsFromUrl,
+  resolveCopilotSDKCustomProviderFromReflect,
 } = require("./awf_reflect.cjs");
 const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
@@ -74,6 +76,7 @@ const MAX_SCHEDULED_EXIT2_RETRIES = 1;
 // If prompt files are larger than this threshold, avoid inlining into argv.
 const PROMPT_FILE_INLINE_THRESHOLD_BYTES = 100 * 1024;
 const PROMPT_FILE_INLINE_THRESHOLD_LABEL = "100KB";
+const MAX_ENV_VAR_PREVIEW_LENGTH = 120;
 // Pattern to detect transient CAPIError 400 in copilot output
 const CAPI_ERROR_400_PATTERN = /CAPIError:\s*400/;
 
@@ -108,7 +111,6 @@ const AGENTIC_ENGINE_TIMEOUT_PATTERN = /signal=SIG(?:TERM|KILL|INT)/;
 // re-injects the same broken history, producing the same 400 on every subsequent attempt.
 // A fresh restart is required to discard the poisoned history.
 const NULL_TYPE_TOOL_CALL_PATTERN = /tool_calls\[.*?\]\.type.*null/;
-
 /**
  * Emit a diagnostic log line to stderr.
  * All driver messages are prefixed with "[copilot-harness]" so they are easy to
@@ -226,73 +228,6 @@ function isModelAvailableInReflectFile(model, options) {
     const err = /** @type {Error} */ error;
     logger(`awf-reflect: unable to read model availability from ${reflectPath}: ${err.message}`);
     return false;
-  }
-}
-
-/**
- * Resolve Copilot SDK BYOK custom provider configuration from saved AWF /reflect data.
- * Chooses a configured endpoint and maps it to an OpenAI-compatible provider base URL.
- *
- * @param {{
- *   model?: string,
- *   reflectPath?: string,
- *   readFileSync?: (path: string, encoding: string) => string,
- *   logger?: (msg: string) => void,
- * }} [options]
- * @returns {{ model: string, provider: { type: "openai", baseUrl: string } } | null}
- */
-function resolveCopilotSDKCustomProviderFromReflect(options) {
-  const configuredModel = typeof options?.model === "string" ? options.model.trim() : "";
-  const reflectPath = (options && options.reflectPath) || AWF_REFLECT_OUTPUT_PATH;
-  const readFile = (options && options.readFileSync) || fs.readFileSync;
-  const logger = (options && options.logger) || log;
-
-  try {
-    const raw = readFile(reflectPath, "utf8");
-    const reflectData = JSON.parse(raw);
-    const endpoints = Array.isArray(reflectData?.endpoints) ? reflectData.endpoints.filter(ep => ep && ep.configured === true) : [];
-    if (endpoints.length === 0) {
-      logger(`sdk-mode: no configured endpoints in ${reflectPath}; skipping custom provider config`);
-      return null;
-    }
-
-    const endpoint = (configuredModel ? endpoints.find(ep => Array.isArray(ep.models) && ep.models.includes(configuredModel)) : null) || endpoints.find(ep => String(ep.provider || "").toLowerCase() === "copilot") || endpoints[0];
-
-    let baseUrl = "";
-    if (typeof endpoint?.models_url === "string" && endpoint.models_url) {
-      try {
-        baseUrl = new URL(endpoint.models_url).origin;
-      } catch {
-        // ignore malformed URL and fall back to port-based construction below
-      }
-    }
-    if (!baseUrl && endpoint?.port != null) {
-      baseUrl = `http://api-proxy:${String(endpoint.port)}`;
-    }
-    if (!baseUrl) {
-      logger("sdk-mode: unable to derive provider baseUrl from awf-reflect endpoint data; skipping custom provider config");
-      return null;
-    }
-
-    let model = configuredModel;
-    if (!model && Array.isArray(endpoint?.models)) {
-      const firstModel = endpoint.models.find(m => typeof m === "string" && m.trim().length > 0);
-      model = typeof firstModel === "string" ? firstModel.trim() : "";
-    }
-    if (!model) {
-      logger("sdk-mode: unable to derive model for custom provider from awf-reflect; skipping custom provider config");
-      return null;
-    }
-
-    logger(`sdk-mode: custom provider resolved from awf-reflect (provider=${String(endpoint.provider || "unknown")} baseUrl=${baseUrl} model=${model})`);
-    return {
-      model,
-      provider: { type: "openai", baseUrl },
-    };
-  } catch (error) {
-    const err = /** @type {Error} */ error;
-    logger(`sdk-mode: unable to read custom provider config from ${reflectPath}: ${err.message}`);
-    return null;
   }
 }
 
@@ -487,35 +422,33 @@ async function checkCommandAccessible(command) {
 }
 
 /**
- * Read and parse the JSON options payload piped to stdin by the engine command.
- * Called in SDK mode where the Go engine pipes options via `printf '%s' '{"promptFile":"...","serverArgs":[...]}'
- * | node harness`.
- * Returns null when stdin is a TTY, empty, or contains invalid JSON.
- * @returns {Promise<{promptFile?: string, serverArgs?: string[], addWorkspaceDir?: boolean} | null>}
+ * Parse GH_AW_COPILOT_SDK_SERVER_ARGS for SDK driver mode.
+ * Returns [] when unset or invalid so sidecar defaults remain available.
+ *
+ * @param {string | undefined} serverArgsEnv
+ * @param {{ logger?: (msg: string) => void }} [options]
+ * @returns {string[]}
  */
-async function readSDKOptionsFromStdin() {
-  if (process.stdin.isTTY) return null;
-  return new Promise(resolve => {
-    /** @type {Buffer[]} */
-    const chunks = [];
-    process.stdin.on("data", chunk => {
-      chunks.push(Buffer.from(chunk));
-    });
-    process.stdin.on("end", () => {
-      const text = Buffer.concat(chunks).toString("utf8").trim();
-      if (!text) {
-        resolve(null);
-        return;
-      }
-      try {
-        resolve(JSON.parse(text));
-      } catch {
-        log(`warning: failed to parse SDK options from stdin: ${text.slice(0, 100)}`);
-        resolve(null);
-      }
-    });
-    process.stdin.on("error", () => resolve(null));
-  });
+function parseCopilotSDKServerArgsFromEnv(serverArgsEnv, options) {
+  const logger = options?.logger ?? log;
+  if (!serverArgsEnv) {
+    logger("copilot-sdk driver mode: GH_AW_COPILOT_SDK_SERVER_ARGS is not set; using sidecar default args");
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(serverArgsEnv);
+    if (!Array.isArray(parsed) || parsed.some(arg => typeof arg !== "string")) {
+      logger("copilot-sdk driver mode: GH_AW_COPILOT_SDK_SERVER_ARGS must be a JSON string array; using sidecar default args");
+      return [];
+    }
+    logger(`copilot-sdk driver mode: parsed ${parsed.length} sidecar args from GH_AW_COPILOT_SDK_SERVER_ARGS`);
+    return parsed;
+  } catch (parseErr) {
+    const preview = serverArgsEnv.length > MAX_ENV_VAR_PREVIEW_LENGTH ? serverArgsEnv.slice(0, MAX_ENV_VAR_PREVIEW_LENGTH) + "…" : serverArgsEnv;
+    logger(`copilot-sdk driver mode: failed to parse GH_AW_COPILOT_SDK_SERVER_ARGS: ${parseErr} (value: ${preview})`);
+    return [];
+  }
 }
 
 /**
@@ -598,42 +531,69 @@ async function main() {
   const copilotSDKMode = isCopilotSDKEnabled();
   let copilotConnectionToken;
   if (copilotSDKMode) {
+    // The harness always generates the connection token when SDK mode is active.
+    // The token is injected into the driver subprocess env so the harness-managed
+    // sidecar and the driver's SDK client share the same token.
     copilotConnectionToken = generateCopilotConnectionToken();
-    log(`copilot-sdk mode active: COPILOT_SDK_URI=${sdkEnv.COPILOT_SDK_URI || "(not set)"}`);
     log("copilot-sdk mode active: generated per-run COPILOT_CONNECTION_TOKEN");
+    log(`copilot-sdk mode active: COPILOT_SDK_URI=${sdkEnv.COPILOT_SDK_URI || "(not set)"}`);
   }
-  // Merge SDK env additions into the child process env only when the SDK helper
-  // returned at least one variable; otherwise leave the env undefined so that
-  // runProcess inherits the full process.env (the common case).
-  // sdkEnv already contains SDK-mode variables (e.g. COPILOT_SDK_URI) when enabled.
-  // In SDK mode, also attach the generated per-run COPILOT_CONNECTION_TOKEN.
-  const sdkChildEnv = copilotSDKMode ? { ...sdkEnv, COPILOT_CONNECTION_TOKEN: copilotConnectionToken } : sdkEnv;
-  const childEnv = Object.keys(sdkChildEnv).length > 0 ? { ...process.env, ...sdkChildEnv } : undefined;
 
-  // In SDK mode, the engine pipes a JSON options payload via stdin containing the promptFile
-  // path, serverArgs (complete CLI argument list for the headless server), and optionally addWorkspaceDir.
-  // Read it before doing anything else so stdin is consumed before the process runs.
-  // In CLI mode, args are resolved normally (--prompt-file is inlined into -p <text>).
-  /** @type {{promptFile?: string, serverArgs?: string[], addWorkspaceDir?: boolean} | null} */
-  let sdkOptions = null;
+  // In driver mode the args are the driver command + copilot binary path; no stdin payload.
+  // In CLI mode, args are resolved to inline prompt text.
   let resolvedArgs;
   if (copilotSDKMode) {
-    sdkOptions = await readSDKOptionsFromStdin();
-    if (sdkOptions) {
-      log(`sdk-options: promptFile=${sdkOptions.promptFile || "(none)"} serverArgs=${(sdkOptions.serverArgs || []).length} addWorkspaceDir=${!!sdkOptions.addWorkspaceDir}`);
-    }
-    // SDK mode does not use CLI prompt args; pass args through unmodified.
     resolvedArgs = args;
   } else {
     resolvedArgs = resolvePromptFileArgs(args);
   }
 
-  // Fetch AWF API proxy reflection data before running the agent to capture initial proxy state.
-  // This is best-effort: failures are logged but do not affect the agent run.
+  // Fetch AWF API proxy reflection data before running the agent.
+  // In SDK/BYOK mode the live data is used immediately to resolve the custom provider
+  // configuration that is injected into the driver subprocess environment.
   // Skip when AWF_REFLECT_ENABLED is not "1" (e.g. sandbox.agent: false — no api-proxy running).
+  let awfReflectData = null;
   if (process.env.AWF_REFLECT_ENABLED === "1") {
-    await fetchAWFReflect({ logger: log });
+    const reflectResult = await fetchAWFReflect({ logger: log });
+    if (reflectResult.ok && reflectResult.reflectData) {
+      awfReflectData = reflectResult.reflectData;
+    }
   }
+
+  // Resolve BYOK custom provider from live reflect data (SDK mode only).
+  // BYOK is the only supported mode for SDK sessions — fail immediately if the provider
+  // cannot be resolved so retries are not wasted on a misconfigured environment.
+  let providerBaseUrl = "";
+  let resolvedModel = "";
+  if (copilotSDKMode) {
+    const configuredModel = process.env.COPILOT_MODEL || "";
+    const customProvider = resolveCopilotSDKCustomProviderFromReflect({ model: configuredModel, reflectData: awfReflectData, logger: log });
+    if (!customProvider) {
+      log("copilot-sdk driver mode: BYOK provider is required but could not be resolved from awf-reflect data — aborting");
+      process.exit(1);
+    }
+    providerBaseUrl = customProvider.provider.baseUrl;
+    resolvedModel = customProvider.model;
+    log(`copilot-sdk driver mode: BYOK provider resolved (baseUrl=${providerBaseUrl} model=${resolvedModel})`);
+  }
+
+  // Merge SDK env additions into the child process env only when the SDK helper
+  // returned at least one variable; otherwise leave the env undefined so that
+  // runProcess inherits the full process.env (the common case).
+  // sdkEnv already contains SDK-mode variables (e.g. COPILOT_SDK_URI) when enabled.
+  // Always attach the generated per-run COPILOT_CONNECTION_TOKEN so both the sidecar
+  // (started by the harness) and the SDK client share the same token.
+  // In SDK mode also inject the resolved BYOK provider base URL and model so the driver
+  // subprocess does not need to re-read the reflect file.
+  const sdkChildEnv = copilotSDKMode
+    ? {
+        ...sdkEnv,
+        COPILOT_CONNECTION_TOKEN: copilotConnectionToken,
+        GH_AW_COPILOT_SDK_PROVIDER_BASE_URL: providerBaseUrl,
+        COPILOT_MODEL: resolvedModel,
+      }
+    : sdkEnv;
+  const childEnv = Object.keys(sdkChildEnv).length > 0 ? { ...process.env, ...sdkChildEnv } : undefined;
 
   let delay = INITIAL_DELAY_MS;
   let lastExitCode = 1;
@@ -652,66 +612,38 @@ async function main() {
     agenticEngineTimeout: false,
     modelNotSupportedError: false,
   };
-  // In SDK mode the prompt is required; read it from the promptFile in sdkOptions (piped via
-  // stdin by the engine command).  Fall back to extracting from CLI args for backward compatibility.
-  let sdkPrompt = null;
-  /** @type {{ model: string, provider: { type: "openai", baseUrl: string } } | null} */
-  let sdkCustomProviderConfig = null;
-  if (copilotSDKMode) {
-    if (sdkOptions && sdkOptions.promptFile) {
-      try {
-        sdkPrompt = fs.readFileSync(sdkOptions.promptFile, "utf8");
-        log(`sdk-mode: read prompt from ${sdkOptions.promptFile} (${sdkPrompt.length} chars)`);
-      } catch (err) {
-        const readErr = /** @type {Error} */ err;
-        log(`sdk-mode: failed to read prompt from ${sdkOptions.promptFile}: ${readErr.message}`);
-      }
-    }
-    if (!sdkPrompt) {
-      // Fallback: try to extract from CLI args (backward compatibility with older engine versions)
-      sdkPrompt = extractPromptFromArgs(resolvedArgs);
-      if (sdkPrompt) {
-        log("sdk-mode: prompt extracted from CLI args (fallback)");
-      } else {
-        log("sdk-mode: no prompt found in stdin JSON payload or CLI args");
-      }
-    }
-    if (process.env.AWF_REFLECT_ENABLED === "1") {
-      sdkCustomProviderConfig = resolveCopilotSDKCustomProviderFromReflect({
-        model: process.env.COPILOT_MODEL,
-        logger: log,
-      });
-    }
-  }
   /** @type {Awaited<ReturnType<typeof startCopilotSDKServer>>} */
   let copilotSDKServer = null;
   try {
     if (copilotSDKMode) {
-      if (!sdkPrompt) {
-        log("copilot-sdk mode: no prompt found (expected promptFile in stdin JSON payload or -p/--prompt in args)");
+      // Driver mode: the harness starts the sidecar; the driver subprocess only opens a client.
+      // Server args are provided via GH_AW_COPILOT_SDK_SERVER_ARGS (JSON-encoded CLI arg list
+      // generated by the Go engine).  The copilot binary is args[1] in the driver command:
+      //   node copilot_harness.cjs $GH_AW_NODE_EXEC copilot_sdk_driver.cjs <copilot-binary>
+      const copilotBin = args[1];
+      if (!copilotBin) {
+        log("copilot-sdk driver mode: missing copilot binary path in args[1]");
         lastExitCode = 1;
       } else {
-        // Build the server args from the stdin JSON payload.
-        // serverArgs carries the complete CLI argument list for the headless server (--headless,
-        // --no-auto-update, --port, --add-dir, --log-level, etc.) generated by the Go engine.
-        // addWorkspaceDir signals that the GITHUB_WORKSPACE env var should be appended at runtime.
-        const serverArgs = [...(sdkOptions?.serverArgs ?? [])];
-        if (sdkOptions?.addWorkspaceDir && process.env.GITHUB_WORKSPACE) {
-          serverArgs.push("--add-dir", process.env.GITHUB_WORKSPACE);
+        let driverServerArgs = parseCopilotSDKServerArgsFromEnv(process.env.GH_AW_COPILOT_SDK_SERVER_ARGS, { logger: log });
+        if (process.env.GITHUB_WORKSPACE) {
+          driverServerArgs = [...driverServerArgs, "--add-dir", process.env.GITHUB_WORKSPACE];
+          log(`copilot-sdk driver mode: appended workspace --add-dir ${process.env.GITHUB_WORKSPACE}`);
         }
+        log(`copilot-sdk driver mode: starting sidecar command=${copilotBin} args=${driverServerArgs.length}`);
         copilotSDKServer = await startCopilotSDKServer({
-          command,
+          command: copilotBin,
           env: childEnv ?? process.env,
-          serverArgs: serverArgs.length > 0 ? serverArgs : undefined,
+          serverArgs: driverServerArgs.length > 0 ? driverServerArgs : undefined,
           logger: log,
         });
       }
     }
 
-    // CLI mode always enters the retry loop.  SDK mode only enters when a prompt was found;
-    // the missing-prompt case is handled above and results in lastExitCode=1 with no loop.
-    if (!copilotSDKMode || sdkPrompt) {
-      // Unified retry loop for both SDK and CLI modes.
+    // CLI mode always enters the retry loop.
+    // Driver mode always enters when the sidecar started successfully.
+    if (!copilotSDKMode || copilotSDKServer) {
+      // Unified retry loop for CLI and driver modes.
       // --continue is a CLI concept; in SDK mode retries always restart the session fresh.
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         // Add --continue flag on CLI retries so the copilot session continues from where it left off
@@ -727,23 +659,9 @@ async function main() {
 
         // Redact --prompt / -p value from logs to avoid leaking prompt content
         const safeArgs = currentArgs.map((arg, i) => (currentArgs[i - 1] === "--prompt" || currentArgs[i - 1] === "-p" ? "<redacted>" : arg));
-        let result;
-        if (copilotSDKMode) {
-          if (!sdkPrompt) {
-            throw new Error("sdk-mode invariant violated: prompt must be resolved before execution");
-          }
-          result = await runWithCopilotSDK({
-            sdkUri: sdkEnv.COPILOT_SDK_URI ?? process.env.COPILOT_SDK_URI ?? "",
-            prompt: sdkPrompt,
-            logger: log,
-            attempt,
-            model: sdkCustomProviderConfig?.model,
-            connectionToken: copilotConnectionToken,
-            provider: sdkCustomProviderConfig?.provider,
-          });
-        } else {
-          result = await runProcess({ command, args: currentArgs, attempt, log, logArgs: safeArgs, env: childEnv });
-        }
+        // Driver mode: run copilot_sdk_driver.cjs as a normal subprocess. The harness has
+        // already started the sidecar; the driver only opens an SDK client connection.
+        const result = await runProcess({ command, args: currentArgs, attempt, log, logArgs: safeArgs, env: childEnv });
         lastExitCode = result.exitCode;
         const attemptDetections = detectCopilotErrors(result.output);
         detectedCopilotErrors.inferenceAccessError ||= attemptDetections.inferenceAccessError;
@@ -963,9 +881,7 @@ if (typeof module !== "undefined" && module.exports) {
     waitForCopilotSDKServer,
     writeCopilotOutputs,
     resolvePromptFileArgs,
-    extractPromptFromArgs,
-    readSDKOptionsFromStdin,
-    runWithCopilotSDK,
+    parseCopilotSDKServerArgsFromEnv,
   };
 }
 

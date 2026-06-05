@@ -307,17 +307,28 @@ async function main() {
         }
         core.info(`Line ${i + 1}: type '${itemType}'`);
 
+        const typeConfig = expectedOutputTypes[itemType];
+        const normalizeIssueClosingKeywords = typeConfig !== null && typeof typeConfig === "object" && typeConfig.normalize_closing_keywords === true;
+
         // Use the validation engine to validate the item
         if (hasValidationConfig(itemType)) {
-          const validationResult = validateItem(item, itemType, i + 1, { allowedAliases: allowedMentions, maxBotMentions });
+          const validationResult = validateItem(item, itemType, i + 1, {
+            allowedAliases: allowedMentions,
+            maxBotMentions,
+            normalizeIssueClosingKeywords,
+          });
           if (!validationResult.isValid) {
             if (validationResult.error) {
               errors.push(validationResult.error);
             }
             continue;
           }
-          // Update item with normalized values
-          Object.assign(item, validationResult.normalizedItem);
+          // SECURITY: Use normalizedItem (which strips infrastructure-only fields
+          // like patch_path, bundle_path, base_commit, diff_size) instead of the
+          // original item, to prevent agent-injected transport metadata from
+          // reaching the privileged handler.
+          core.info(`Line ${i + 1}: Valid ${itemType} item`);
+          parsedItems.push(validationResult.normalizedItem);
         } else {
           // Fall back to validateItemWithSafeJobConfig for unknown types
           const jobOutputType = expectedOutputTypes[itemType];
@@ -334,10 +345,9 @@ async function main() {
             }
             Object.assign(item, validation.normalizedItem);
           }
+          core.info(`Line ${i + 1}: Valid ${itemType} item`);
+          parsedItems.push(item);
         }
-
-        core.info(`Line ${i + 1}: Valid ${itemType} item`);
-        parsedItems.push(item);
       } catch (error) {
         const errorMsg = getErrorMessage(error);
         errors.push(`Line ${i + 1}: Invalid JSON - ${errorMsg}`);

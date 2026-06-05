@@ -5,7 +5,7 @@
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
  */
 
-const { generateFooterWithMessages, getDetectionCautionAlert, generateXMLMarker } = require("./messages_footer.cjs");
+const { assembleMarkdownBodyParts } = require("./markdown_body_helpers.cjs");
 const { generateWorkflowCallIdMarker, matchesWorkflowId } = require("./generate_footer.cjs");
 const { getRepositoryUrl } = require("./get_repository_url.cjs");
 const { replaceTemporaryIdReferences, resolveSafeOutputIssueTarget } = require("./temporary_id.cjs");
@@ -30,6 +30,9 @@ const { resolveInvocationContext } = require("./invocation_context_helpers.cjs")
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "add_comment";
+// Keep the full list of accepted explicit wildcard target fields (including aliases
+// pre-handled by resolveSafeOutputIssueTarget) to preserve a defensive boundary check.
+const WILDCARD_TARGET_FIELDS = ["item_number", "issue_number", "pull_request_number", "pr_number", "pr", "pull_number"];
 
 /**
  * Deduplicate an array of strings using case-insensitive comparison, preserving original casing and order.
@@ -504,6 +507,16 @@ async function main(config = {}) {
 
         if (!targetResult.success) {
           if (targetResult.shouldFail) {
+            const hasExplicitWildcardTargetField = WILDCARD_TARGET_FIELDS.some(field => message[field] != null);
+            const missingWildcardTarget = commentTarget === "*" && !hasExplicitWildcardTargetField;
+            if (missingWildcardTarget) {
+              core.info(targetResult.error);
+              return {
+                success: false,
+                skipped: true,
+                error: targetResult.error,
+              };
+            }
             core.warning(targetResult.error);
             return {
               success: false,
@@ -618,8 +631,12 @@ async function main(config = {}) {
     const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE ?? "";
     const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "";
 
-    // Inject CAUTION at top of body if threat detection warning was raised
-    const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+    // Compute caution first so prefix assembly preserves the original execution order.
+    const detectionCaution = assembleMarkdownBodyParts({
+      includeFooter: false,
+      workflowName,
+      runUrl,
+    }).detectionCaution;
 
     // Inject body header if configured (placed after caution, before user content)
     const bodyHeader = getBodyHeader({ workflowName, runUrl });
@@ -650,14 +667,25 @@ async function main(config = {}) {
         serverUrl: context.serverUrl,
       }) || undefined;
 
+    const markdownParts = assembleMarkdownBodyParts({
+      includeFooter,
+      workflowName,
+      runUrl,
+      workflowSource,
+      workflowSourceURL,
+      triggeringIssueNumber,
+      triggeringPRNumber,
+      triggeringDiscussionNumber,
+      historyUrl,
+      markerWhenFooterDisabled: "xml",
+    });
+
     if (includeFooter) {
       // When footer is enabled, add full footer with attribution and XML markers.
-      // Pass skipDetectionCaution:true to avoid duplicating the caution already prepended above.
-      processedBody +=
-        "\n\n" + generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, { skipDetectionCaution: true }).trimEnd();
+      processedBody += "\n\n" + markdownParts.footer;
     } else {
       // When footer is disabled, only add XML marker for searchability (no visible attribution text)
-      processedBody += "\n\n" + generateXMLMarker(workflowName, runUrl);
+      processedBody += "\n\n" + markdownParts.noFooterMarker;
     }
 
     // Add workflow-call-id marker when available to allow close-older-comments to
