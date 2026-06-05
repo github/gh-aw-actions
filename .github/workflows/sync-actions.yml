@@ -6,7 +6,7 @@ on:
       ref:
         description: 'Ref to sync from gh-aw (tag, branch, SHA, or "latest"). Defaults to latest release.'
         required: false
-        default: 'latest'
+        default: "latest"
         type: string
 
 jobs:
