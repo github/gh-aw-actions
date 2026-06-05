@@ -258,9 +258,13 @@ jobs:
           # definitions which are not relevant to gh-aw-actions.
           mkdir -p gh-aw-actions/.github/aw
           # Remove first so that upstream deletion is reflected here (remote wins).
-          rm -f gh-aw-actions/.github/aw/compat.json gh-aw-actions/.github/aw/compat.schema.json
+          rm -f \
+            gh-aw-actions/.github/aw/compat.json \
+            gh-aw-actions/.github/aw/compat.schema.json \
+            gh-aw-actions/.github/aw/models.json \
+            gh-aw-actions/.github/aw/model-multipliers.json
           synced=0
-          for f in compat.json compat.schema.json; do
+          for f in compat.json compat.schema.json models.json model-multipliers.json; do
             src="gh-aw/.github/aw/$f"
             dst="gh-aw-actions/.github/aw/$f"
             if [ -f "$src" ]; then
@@ -284,11 +288,11 @@ jobs:
           done
           echo "::endgroup::"
           echo "::group::Destination — gh-aw-actions/.github/aw/ after sync"
-          compat_files=$(find gh-aw-actions/.github/aw -maxdepth 1 -type f -name 'compat*' | sort)
-          if [ -n "$compat_files" ]; then
-            printf '%s\n' "$compat_files"
+          matrix_files=$(find gh-aw-actions/.github/aw -maxdepth 1 -type f \( -name 'compat*' -o -name 'models.json' -o -name 'model-multipliers.json' \) | sort)
+          if [ -n "$matrix_files" ]; then
+            printf '%s\n' "$matrix_files"
           else
-            echo "(no compat files)"
+            echo "(no compatibility matrix files)"
           fi
           echo "::endgroup::"
 
@@ -310,7 +314,7 @@ jobs:
           # Guard each path so we never invoke `git add` on a non-existent + untracked file
           # (which would fail with "pathspec did not match any files" during the dormant period
           # before upstream lands the files). `git add -A` on a tracked path also stages deletions.
-          for f in .github/aw/compat.json .github/aw/compat.schema.json; do
+          for f in .github/aw/compat.json .github/aw/compat.schema.json .github/aw/models.json .github/aw/model-multipliers.json; do
             if [ -f "$f" ] || git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
               git add -A "$f"
             fi
