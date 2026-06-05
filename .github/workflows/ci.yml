@@ -93,6 +93,12 @@ jobs:
             if ('blockedVersions' in config && !Array.isArray(config.blockedVersions)) {
               errors.push(`'blockedVersions' must be an array`);
             }
+            const prefixedSemverOrEmptyRe = /^(v[0-9]+\.[0-9]+\.[0-9]+)?$/;
+            for (const key of ['minimumVersion', 'minRecommendedVersion']) {
+              if (key in config && (typeof config[key] !== 'string' || !prefixedSemverOrEmptyRe.test(config[key]))) {
+                errors.push(`'${key}' must be an empty string or a version in vMAJOR.MINOR.PATCH format`);
+              }
+            }
 
             const matrix = config['agent-compat-v1'];
             if (typeof matrix !== 'object' || matrix === null || Array.isArray(matrix)) {
