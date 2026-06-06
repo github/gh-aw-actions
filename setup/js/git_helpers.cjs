@@ -38,7 +38,12 @@ function getGitAuthEnv(token) {
 }
 
 /**
- * Safely execute git command using spawnSync with args array to prevent shell injection
+ * Safely execute git command using spawnSync with args array to prevent shell injection.
+ *
+ * Hardened against indefinite hangs: always runs git with non-interactive
+ * credential settings (GIT_TERMINAL_PROMPT=0, GCM_INTERACTIVE=Never,
+ * GIT_ASKPASS=/bin/echo) and a default 60s timeout (override via options.timeout).
+ *
  * @param {string[]} args - Git command arguments
  * @param {Object} options - Spawn options; set suppressLogs: true to avoid core.error annotations for expected failures
  * @returns {string} Command output
@@ -65,10 +70,27 @@ function execGitSync(args, options = {}) {
 
   core.debug(`Executing git command: ${gitCommand}`);
 
+  // Hard guards against indefinite hangs:
+  //  - GIT_TERMINAL_PROMPT=0 / GCM_INTERACTIVE=Never / GIT_ASKPASS make any
+  //    credential rejection fail fast instead of opening an interactive prompt.
+  //  - timeout (default 60s) ensures a stuck network/TLS handshake cannot
+  //    wedge the calling event loop. Callers can override via options.timeout.
+  const callerEnv = spawnOptions.env || process.env;
+  const safeEnv = {
+    ...callerEnv,
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
+    GIT_ASKPASS: "/bin/echo",
+  };
+  const defaultTimeoutMs = 60_000;
+
   const result = spawnSync("git", args, {
     encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024, // 100 MB — prevents ENOBUFS on large diffs (e.g. git format-patch)
+    timeout: defaultTimeoutMs,
+    killSignal: "SIGKILL",
     ...spawnOptions,
+    env: safeEnv,
   });
 
   if (result.error) {
@@ -82,10 +104,26 @@ function execGitSync(args, options = {}) {
       core.error(`Git command buffer overflow: ${gitCommand}`);
       throw bufferError;
     }
+    if (spawnError.code === "ETIMEDOUT") {
+      /** @type {NodeJS.ErrnoException} */
+      const timeoutError = new Error(`${ERR_SYSTEM}: Git command timed out after ${spawnOptions.timeout || defaultTimeoutMs}ms: ${gitCommand}`);
+      timeoutError.code = "ETIMEDOUT";
+      core.error(`Git command timed out: ${gitCommand}`);
+      throw timeoutError;
+    }
     // Spawn-level errors (e.g. ENOENT, EACCES) are always unexpected — log
     // via core.error regardless of suppressLogs.
     core.error(`Git command failed with error: ${result.error.message}`);
     throw result.error;
+  }
+
+  // spawnSync sets signal when the process was killed (including by the timeout).
+  if (result.signal === "SIGKILL" || result.signal === "SIGTERM") {
+    /** @type {NodeJS.ErrnoException} */
+    const timeoutError = new Error(`${ERR_SYSTEM}: Git command killed (${result.signal}), likely due to timeout (${spawnOptions.timeout || defaultTimeoutMs}ms): ${gitCommand}`);
+    timeoutError.code = "ETIMEDOUT";
+    core.error(`Git command killed by signal ${result.signal}: ${gitCommand}`);
+    throw timeoutError;
   }
 
   if (result.status !== 0) {
@@ -113,6 +151,49 @@ function execGitSync(args, options = {}) {
   }
 
   return result.stdout;
+}
+
+/**
+ * Ensure refs/remotes/origin/<branch> is available locally, attempting a
+ * single fetch when it is not. Returns whether the ref now exists and
+ * whether a fetch was required.
+ *
+ * Safe to call from the credential-less safe-outputs MCP server: execGitSync
+ * runs git with GIT_TERMINAL_PROMPT=0 / GIT_ASKPASS=/bin/echo and a 60s
+ * timeout, so the fetch attempt either succeeds (public repos, or when a
+ * token was provided) or fails fast (private repos without credentials).
+ * Callers MUST treat exists=false as a recoverable negative result rather
+ * than an error condition.
+ *
+ * @param {string} branch - Branch name (without origin/ prefix)
+ * @param {Object} options
+ * @param {string} options.cwd - Working directory for git commands
+ * @param {string} [options.token] - Optional auth token used for fetch
+ * @param {boolean} [options.suppressLogs=false] - Whether to suppress execGitSync error logs
+ * @returns {{ exists: boolean, fetched: boolean, fetchError?: Error }}
+ *   fetchError is populated only when exists=false after a failed fetch attempt.
+ */
+function ensureOriginRemoteTrackingRef(branch, options) {
+  const ref = `refs/remotes/origin/${branch}`;
+  try {
+    execGitSync(["show-ref", "--verify", "--quiet", ref], {
+      cwd: options.cwd,
+      suppressLogs: options.suppressLogs || false,
+    });
+    return { exists: true, fetched: false };
+  } catch {
+    try {
+      const fetchEnv = { ...process.env, ...getGitAuthEnv(options.token) };
+      execGitSync(["fetch", "origin", "--", `${branch}:refs/remotes/origin/${branch}`], {
+        cwd: options.cwd,
+        env: fetchEnv,
+        suppressLogs: options.suppressLogs || false,
+      });
+      return { exists: true, fetched: true };
+    } catch (fetchError) {
+      return { exists: false, fetched: false, fetchError: /** @type {Error} */ fetchError };
+    }
+  }
 }
 
 /**
@@ -152,21 +233,108 @@ function hasMergeCommitsInRange(baseRef, headRef, options = {}) {
 }
 
 /**
- * Probe shallow-repository status before fetching a git bundle.
+ * Deepen sequence (per call to `git fetch --deepen=N`). Each value adds N
+ * commits to the existing shallow history. Total reachable depth after the
+ * final step is the sum of these values (~7850 commits).
+ */
+const BUNDLE_DEEPEN_STEPS = [50, 100, 200, 500, 1000, 2000, 4000];
+
+/**
+ * Extract prerequisite commit SHAs declared in a git bundle file.
+ *
+ * Runs `git bundle verify <file>` (with `ignoreReturnCode`) and parses the
+ * "The bundle requires this ref:" section as well as the
+ * "Repository lacks these prerequisite commits:" error block. Both formats
+ * list the prerequisite commit SHAs.
+ *
+ * @param {{ getExecOutput: Function }} execApi
+ * @param {string} bundleFilePath
+ * @param {Object} [options]
+ * @returns {Promise<string[]>} Deduplicated lowercase 40-char SHAs, or [] on failure.
+ */
+async function getBundlePrerequisites(execApi, bundleFilePath, options = {}) {
+  try {
+    const { stdout, stderr } = await execApi.getExecOutput("git", ["bundle", "verify", bundleFilePath], { ...options, ignoreReturnCode: true, silent: true });
+    const combined = `${stdout || ""}\n${stderr || ""}`;
+    const prereqs = new Set();
+    const lines = combined.split(/\r?\n/);
+    let inRequires = false;
+    for (const line of lines) {
+      if (/the bundle (requires|records) (this|these)/i.test(line)) {
+        inRequires = true;
+        continue;
+      }
+      if (/the bundle contains/i.test(line)) {
+        inRequires = false;
+        continue;
+      }
+      if (inRequires) {
+        const match = line.match(/\b([0-9a-f]{40})\b/i);
+        if (match) {
+          prereqs.add(match[1].toLowerCase());
+          continue;
+        }
+        if (line.trim() === "") {
+          inRequires = false;
+        }
+      }
+    }
+    // Also pick up "Repository lacks these prerequisite commits:" block.
+    for (const sha of extractBundlePrerequisiteCommits(combined)) {
+      prereqs.add(sha);
+    }
+    return [...prereqs];
+  } catch (error) {
+    core.debug(`getBundlePrerequisites failed: ${getErrorMessage(error)}`);
+    return [];
+  }
+}
+
+/**
+ * Check which of the given SHAs are NOT yet ancestors of `targetRef`.
+ *
+ * @param {{ getExecOutput: Function }} execApi
+ * @param {string[]} shas
+ * @param {string} targetRef
+ * @param {Object} [options]
+ * @returns {Promise<string[]>} SHAs still missing (not ancestors / not present).
+ */
+async function findMissingAncestors(execApi, shas, targetRef, options = {}) {
+  const missing = [];
+  for (const sha of shas) {
+    const { exitCode } = await execApi.getExecOutput("git", ["merge-base", "--is-ancestor", sha, targetRef], { ...options, ignoreReturnCode: true, silent: true });
+    if (exitCode !== 0) {
+      missing.push(sha);
+    }
+  }
+  return missing;
+}
+
+/**
+ * Probe shallow-repository status before fetching a git bundle, and deepen
+ * the local clone as needed so the bundle's prerequisite commits become
+ * reachable from `origin/<baseRef>`.
  *
  * Bundles generated from a commit range can declare prerequisite commits. A
- * depth-1 checkout may not contain those prerequisites, and `git fetch <bundle>`
- * can reject the bundle before the caller can update refs.
+ * shallow checkout (e.g. `fetch-depth: 20`) may not contain those prerequisites,
+ * and `git fetch <bundle>` will reject the bundle before the caller can update
+ * refs. On a high-churn monorepo, `git fetch --unshallow` is catastrophic — it
+ * downloads the entire history. Instead we iterate `git fetch origin <baseRef>
+ * --deepen=<N>` with progressively larger N until every declared prerequisite
+ * satisfies `git merge-base --is-ancestor <prereq> origin/<baseRef>`.
  *
- * IMPORTANT: Do not unshallow here. Full-history fetches are prohibitively
- * expensive for large monorepos. Callers recover from prerequisite failures by
- * fetching only the missing commit objects from origin and retrying.
+ * When `deepenOptions.baseRef` or `deepenOptions.bundleFilePath` is missing
+ * (legacy callers), the function falls back to the previous behavior of a
+ * single `git fetch --unshallow origin`.
  *
  * @param {{ getExecOutput: Function, exec: Function }} execApi - Exec API to run git commands.
  * @param {Object} [options] - Options passed through to exec calls.
+ * @param {Object} [deepenOptions]
+ * @param {string} [deepenOptions.baseRef] - Remote branch name to deepen (no `origin/` prefix).
+ * @param {string} [deepenOptions.bundleFilePath] - Path to the bundle file whose prerequisites must become reachable.
  * @returns {Promise<void>}
  */
-async function ensureFullHistoryForBundle(execApi, options = {}) {
+async function ensureFullHistoryForBundle(execApi, options = {}, deepenOptions = {}) {
   let stdout;
   try {
     ({ stdout } = await execApi.getExecOutput("git", ["rev-parse", "--is-shallow-repository"], options));
@@ -175,8 +343,56 @@ async function ensureFullHistoryForBundle(execApi, options = {}) {
     core.warning(`Could not determine shallow repository status; skipping full-history fetch probe: ${message}`);
     return;
   }
-  if (stdout.trim() === "true") {
-    core.info("Repository is shallow; skipping full-history fetch and relying on prerequisite recovery");
+  if (stdout.trim() !== "true") {
+    return;
+  }
+
+  const { baseRef, bundleFilePath } = deepenOptions || {};
+
+  // Legacy path: no base ref / bundle info known — fall back to a single
+  // unshallow. Callers in monorepos should always supply baseRef + bundleFilePath
+  // to get incremental deepening instead.
+  if (!baseRef || !bundleFilePath) {
+    core.info("Repository is shallow; fetching full history before bundle processing (no baseRef/bundle info; using --unshallow)");
+    await execApi.exec("git", ["fetch", "--unshallow", "origin"], options);
+    return;
+  }
+
+  const prereqs = await getBundlePrerequisites(execApi, bundleFilePath, options);
+  if (prereqs.length === 0) {
+    core.info("Bundle declares no prerequisites; no deepen required");
+    return;
+  }
+
+  const targetRef = `origin/${baseRef}`;
+  const alreadyMissing = await findMissingAncestors(execApi, prereqs, targetRef, options);
+  if (alreadyMissing.length === 0) {
+    core.info(`Bundle prerequisites already reachable from ${targetRef}; no deepen required`);
+    return;
+  }
+
+  core.info(`Repository is shallow; iteratively deepening ${targetRef} to satisfy ${alreadyMissing.length} bundle prerequisite commit(s)`);
+  let missing = alreadyMissing;
+  for (const depth of BUNDLE_DEEPEN_STEPS) {
+    core.info(`Fetching origin ${baseRef} with --deepen=${depth} (${missing.length} prerequisite(s) still missing)`);
+    try {
+      await execApi.exec("git", ["fetch", `--deepen=${depth}`, "origin", baseRef], options);
+    } catch (fetchError) {
+      core.warning(`git fetch --deepen=${depth} origin ${baseRef} failed: ${getErrorMessage(fetchError)}; aborting iterative deepen`);
+      break;
+    }
+    missing = await findMissingAncestors(execApi, prereqs, targetRef, options);
+    if (missing.length === 0) {
+      core.info(`Bundle prerequisites reachable after --deepen=${depth}`);
+      return;
+    }
+  }
+
+  core.warning(`Bundle prerequisites still not reachable after iterative deepen (${missing.length} remaining); attempting --unshallow as a last resort`);
+  try {
+    await execApi.exec("git", ["fetch", "--unshallow", "origin", baseRef], options);
+  } catch (unshallowError) {
+    core.warning(`Fallback --unshallow fetch failed: ${getErrorMessage(unshallowError)}; bundle apply may still fail`);
   }
 }
 
@@ -300,6 +516,7 @@ async function linearizeRangeAsCommit(baseRef, commitMessage, execApi, opts = {}
 module.exports = {
   execGitSync,
   ensureFullHistoryForBundle,
+  ensureOriginRemoteTrackingRef,
   extractBundlePrerequisiteCommits,
   getGitAuthEnv,
   hasMergeCommitsInRange,

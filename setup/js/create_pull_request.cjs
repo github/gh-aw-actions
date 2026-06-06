@@ -37,6 +37,7 @@ const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
 const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits, isShallowOrSparseCheckout, linearizeRangeAsCommit } = require("./git_helpers.cjs");
 const { parseDiffGitHeader: parseDiffGitHeaderPaths, extractDiffGitHeaderEntries } = require("./patch_path_helpers.cjs");
+const { resolveTransportPaths } = require("./resolve_transport_paths.cjs");
 const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 const {
   MANAGED_FALLBACK_ISSUE_LABEL,
@@ -182,15 +183,16 @@ async function tryRecoverGitAmAddAddConflict(execApi) {
  * @param {string} branchName - Target branch name
  * @param {string} originalAgentBranch - Original source branch name from the agent, if different
  * @param {{ exec: Function, getExecOutput: Function }} execApi - GitHub Actions exec API
+ * @param {string} [baseBranch] - Base branch name (used for iterative shallow-clone deepening)
  * @returns {Promise<void>}
  */
-async function applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, execApi) {
+async function applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, execApi, baseBranch) {
   let bundleBranchRef = `refs/heads/${originalAgentBranch || branchName}`;
   const bundleTargetRef = `refs/heads/${branchName}`;
   const bundleTempRef = createBundleTempRef(branchName);
 
   try {
-    await ensureFullHistoryForBundle(execApi);
+    await ensureFullHistoryForBundle(execApi, {}, { baseRef: baseBranch, bundleFilePath });
     core.info(`Applying bundle ${bundleFilePath} to ${bundleTargetRef} using temp ref ${bundleTempRef} from ${bundleBranchRef}`);
 
     // Fetch from bundle into a temporary ref, then update the target branch.
@@ -796,12 +798,15 @@ async function main(config = {}) {
 
     core.info(`Processing create_pull_request: title=${pullRequestItem.title || "No title"}, bodyLength=${pullRequestItem.body?.length || 0}`);
 
-    // Determine the patch file path from the message (set by the MCP server handler)
-    const patchFilePath = pullRequestItem.patch_path;
+    // Determine the patch and bundle file paths. The MCP server sets these on
+    // the entry it writes, but the validation step strips them as a defense
+    // against agent-forged values. Recover them by re-deriving from `branch`.
+    const transportPaths = resolveTransportPaths(pullRequestItem, defaultTargetRepo);
+    const patchFilePath = transportPaths.patchPath;
     core.info(`Patch file path: ${patchFilePath || "(not set)"}`);
 
     // Determine the bundle file path from the message (set when patch-format: bundle is configured)
-    const bundleFilePath = pullRequestItem.bundle_path;
+    const bundleFilePath = transportPaths.bundlePath;
     if (bundleFilePath) {
       core.info(`Bundle file path: ${bundleFilePath}`);
     }
@@ -1478,7 +1483,7 @@ async function main(config = {}) {
         // unlike git format-patch which flattens history and drops merge resolution content.
         core.info(`Applying changes from bundle: ${bundleFilePath}`);
         try {
-          await applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, exec);
+          await applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, exec, baseBranch);
         } catch (bundleError) {
           core.error(`Failed to apply bundle: ${bundleError instanceof Error ? bundleError.message : String(bundleError)}`);
           return { success: false, error: "Failed to apply bundle" };
@@ -1502,6 +1507,7 @@ async function main(config = {}) {
               signedCommits,
               resolvedTemporaryIds,
               currentRepo: itemRepo,
+              validationConfig: config,
             });
             core.info("Changes pushed to branch (from bundle)");
 
@@ -1534,6 +1540,7 @@ async function main(config = {}) {
                   signedCommits,
                   resolvedTemporaryIds,
                   currentRepo: itemRepo,
+                  validationConfig: config,
                 });
                 core.info("Changes pushed to branch after bundle rewrite retry");
 
@@ -1665,7 +1672,7 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo
         core.info(`Created new branch from base: ${branchName} (${branchBaseRef})`);
 
         // Apply the patch using git CLI (skip if empty)
-        if (!isEmpty) {
+        if (!isEmpty && patchFilePath) {
           let postApplyBaseRef = null;
           const capturePostApplyBaseRef = async () => {
             const headResult = await exec.getExecOutput("git", ["rev-parse", "HEAD"]);
@@ -1865,6 +1872,7 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo
                 signedCommits,
                 resolvedTemporaryIds,
                 currentRepo: itemRepo,
+                validationConfig: config,
               });
               core.info("Changes pushed to branch");
 
@@ -2013,6 +2021,7 @@ ${patchPreview}`;
                 signedCommits,
                 resolvedTemporaryIds,
                 currentRepo: itemRepo,
+                validationConfig: config,
               });
               core.info("Empty branch pushed successfully");
 

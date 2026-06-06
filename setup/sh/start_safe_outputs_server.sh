@@ -32,6 +32,7 @@ fi
 # These files are required by safe_outputs_mcp_server_http.cjs and its dependencies
 REQUIRED_DEPS=(
   "safe_outputs_mcp_server_http.cjs"
+  "safe_outputs_mcp_arguments.cjs"
   "mcp_http_transport.cjs"
   "mcp_logger.cjs"
   "safe_outputs_bootstrap.cjs"
@@ -44,6 +45,7 @@ REQUIRED_DEPS=(
   "safe_outputs_tools_loader.cjs"
   "safe_outputs_config.cjs"
   "safe_outputs_config_redact.cjs"
+  "checkout_manifest.cjs"
 )
 
 MISSING_FILES=()

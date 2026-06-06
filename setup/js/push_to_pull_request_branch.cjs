@@ -22,6 +22,7 @@ const { normalizeCommitSHA } = require("./commit_sha_helpers.cjs");
 const { findRepoCheckout } = require("./find_repo_checkout.cjs");
 const { getThreatDetectedMarker } = require("./threat_detection_warning.cjs");
 const { attachExecutionState } = require("./safe_output_execution_metadata.cjs");
+const { resolveTransportPaths } = require("./resolve_transport_paths.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -183,12 +184,15 @@ async function main(config = {}) {
 
     processedCount++;
 
-    // Determine the patch file path from the message (set by the MCP server handler)
-    const patchFilePath = message.patch_path;
+    // Determine the patch and bundle file paths. The MCP server sets these on
+    // the entry it writes, but the validation step strips them as a defense
+    // against agent-forged values. Recover them by re-deriving from `branch`.
+    const transportPaths = resolveTransportPaths(message, defaultTargetRepo);
+    const patchFilePath = transportPaths.patchPath;
     core.info(`Patch file path: ${patchFilePath || "(not set)"}`);
 
     // Determine the bundle file path from the message (set when patch-format: bundle is configured)
-    const bundleFilePath = message.bundle_path;
+    const bundleFilePath = transportPaths.bundlePath;
     if (bundleFilePath) {
       core.info(`Bundle file path: ${bundleFilePath}`);
     }
@@ -737,10 +741,14 @@ async function main(config = {}) {
         core.info(`Applying changes from bundle: ${bundleFilePath}`);
         const bundleRef = `refs/bundles/push-${branchName.replace(/[^a-zA-Z0-9-]/g, "-")}`;
         try {
-          await ensureFullHistoryForBundle(exec, {
-            env: { ...process.env, ...gitAuthEnv },
-            ...baseGitOpts,
-          });
+          await ensureFullHistoryForBundle(
+            exec,
+            {
+              env: { ...process.env, ...gitAuthEnv },
+              ...baseGitOpts,
+            },
+            { baseRef: branchName, bundleFilePath }
+          );
 
           // Fetch from bundle into a temporary ref.
           // Use getExecOutput with ignoreReturnCode so we can read the actual stderr from git —
@@ -1072,6 +1080,7 @@ async function main(config = {}) {
           signedCommits,
           resolvedTemporaryIds,
           currentRepo: itemRepo,
+          validationConfig: config,
         });
         if (pushedSha) {
           pushedCommitSha = pushedSha;
