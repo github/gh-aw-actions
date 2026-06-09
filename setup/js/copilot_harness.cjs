@@ -46,7 +46,6 @@ const path = require("path");
 const crypto = require("crypto");
 const { runProcess, formatDuration, sleep, isCopilotSDKEnabled, buildCopilotSDKEnv } = require("./process_runner.cjs");
 const { buildCopilotSDKServerArgs, getCopilotSDKServerPort, startCopilotSDKServer, stopCopilotSDKServer, waitForCopilotSDKServer } = require("./copilot_sdk_sidecar.cjs");
-const { isMaxEffectiveTokensExceededError } = require("./effective_tokens_hard_rail.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
   AWF_REFLECT_OUTPUT_PATH,
@@ -59,8 +58,9 @@ const {
   fetchModelsFromUrl,
   resolveCopilotSDKCustomProviderFromReflect,
 } = require("./awf_reflect.cjs");
-const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete } = require("./safeoutputs_cli.cjs");
+const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
+const { detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
 
 // Maximum number of retry attempts after the initial run
 const MAX_RETRIES = 3;
@@ -98,7 +98,15 @@ const NO_AUTH_INFO_PATTERN = /No authentication information found|Session was no
 // Pattern to detect authentication failures returned by Copilot API.
 // After a first-attempt auth failure, retrying is futile because the entrypoint unsets
 // COPILOT_GITHUB_TOKEN between attempts.
-const AUTHENTICATION_FAILED_PATTERN = /Authentication failed(?:\s*\(Request ID:[^)]+\))?/i;
+//
+// Also matches the Copilot CAPI 400 response emitted when the supplied token is a
+// Personal Access Token (classic or fine-grained):
+//   "400 400 checking third-party user token: bad request: Personal Access Tokens
+//    are not supported for this endpoint"
+// PAT rejection is a persistent credential-type problem — retrying with the same
+// token always produces the same 400.  Treating it as an auth failure short-circuits
+// the retry loop instead of burning all 4 attempts.
+const AUTHENTICATION_FAILED_PATTERN = /Authentication failed(?:\s*\(Request ID:[^)]+\))?|checking third-party user token:[^\n]*Personal Access Tokens are not supported/i;
 // Pattern: Copilot CLI inference access denied
 const INFERENCE_ACCESS_ERROR_PATTERN = /Access denied by policy settings|invalid access to inference/;
 // Pattern: Agentic engine process killed by signal (timeout)
@@ -595,6 +603,15 @@ async function main() {
     : sdkEnv;
   const childEnv = Object.keys(sdkChildEnv).length > 0 ? { ...process.env, ...sdkChildEnv } : undefined;
 
+  // Pre-flight: skip the agent entirely when a noop has already been written by a prior step.
+  // A noop indicates the work is complete or there is nothing to do — starting the agent
+  // would be wasteful and potentially harmful.
+  const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS || "";
+  if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
+    log("pre-flight: noop message found in safe-outputs — skipping agent (work is already complete or no work needed)");
+    process.exit(0);
+  }
+
   let delay = INITIAL_DELAY_MS;
   let lastExitCode = 1;
   const isScheduledRun = process.env.GITHUB_EVENT_NAME === "schedule";
@@ -695,7 +712,6 @@ async function main() {
         const isAuthenticationFailed = isAuthenticationFailedError(result.output);
         const proxyAuthDiagnostic = buildCopilotProxyAuthFailureDiagnostic(result.output, process.env);
         const isNullTypeToolCall = isNullTypeToolCallError(result.output);
-        const isMaxEffectiveTokensExceeded = isMaxEffectiveTokensExceededError(result.output);
         const permissionDeniedCount = countPermissionDeniedIssues(result.output);
         const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
         log(
@@ -705,7 +721,6 @@ async function main() {
             ` isMCPPolicyError=${isMCPPolicy}` +
             ` isModelNotSupportedError=${isModelNotSupported}` +
             ` isNullTypeToolCallError=${isNullTypeToolCall}` +
-            ` isMaxEffectiveTokensExceededError=${isMaxEffectiveTokensExceeded}` +
             ` isAuthError=${isAuthErr}` +
             ` isAuthenticationFailedError=${isAuthenticationFailed}` +
             ` permissionDeniedCount=${permissionDeniedCount}` +
@@ -713,6 +728,24 @@ async function main() {
             ` hasOutput=${result.hasOutput}` +
             ` retriesRemaining=${MAX_RETRIES - attempt}`
         );
+
+        // If a noop was written to safe-outputs during the failed run, the agent determined
+        // there was nothing to do (or the user indicated so before the agent ran).  Retrying
+        // would not produce different results and could waste resources.
+        if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
+          log(`attempt ${attempt + 1}: noop message found in safe-outputs — not retrying (work is already complete or no work needed)`);
+          lastExitCode = 0;
+          break;
+        }
+
+        const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
+        if (nonRetryableGuard.aiCreditsExceeded || nonRetryableGuard.awfAPIProxyBlockingRequests) {
+          const reasons = [];
+          if (nonRetryableGuard.aiCreditsExceeded) reasons.push("AI credits budget exceeded");
+          if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
+          log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
+          break;
+        }
 
         if (attempt === 0 && isAuthenticationFailed) {
           if (proxyAuthDiagnostic) {
@@ -752,11 +785,6 @@ async function main() {
             log(`attempt ${attempt + 1}: refreshed awf-reflect does not include model '${configuredModel || "(none)"}' — treating as non-retryable`);
           }
           log(`attempt ${attempt + 1}: model not supported — not retrying (the requested model is unavailable for this subscription tier; specify a supported model in the workflow frontmatter)`);
-          break;
-        }
-
-        if (isMaxEffectiveTokensExceeded) {
-          log(`attempt ${attempt + 1}: AWF effective-token hard rail hit — not retrying or continuing (further inference will be refused until budget resets)`);
           break;
         }
 
@@ -864,6 +892,7 @@ if (typeof module !== "undefined" && module.exports) {
     generateCopilotConnectionToken,
     buildCopilotSDKServerArgs,
     getCopilotSDKServerPort,
+    hasNoopInSafeOutputs,
     isDetectionPhase,
     isModelAvailableInReflectData,
     isModelAvailableInReflectFile,
@@ -874,7 +903,6 @@ if (typeof module !== "undefined" && module.exports) {
     INFERENCE_ACCESS_ERROR_PATTERN,
     AGENTIC_ENGINE_TIMEOUT_PATTERN,
     buildMissingToolPermissionIssuePayload,
-    isMaxEffectiveTokensExceededError,
     isAuthenticationFailedError,
     startCopilotSDKServer,
     stopCopilotSDKServer,

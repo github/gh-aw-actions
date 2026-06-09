@@ -26,7 +26,7 @@
 
 /**
  * Split a shell command text into individual pipeline segments.
- * Splits on the following shell operators: &&, ||, |, ;
+ * Splits on the following shell operators: &&, ||, |, ; and newlines.
  *
  * The split respects:
  *   - Single-quoted strings (no escaping inside)
@@ -143,6 +143,39 @@ function splitOnPipelineOperators(commandText) {
       continue;
     }
 
+    // Newline (sequential) — treat line breaks as command separators,
+    // except when escaped as a shell line continuation ("\\" + newline).
+    // Handles LF, CRLF, and CR forms.
+    if (ch === "\n" || ch === "\r") {
+      let backslashRunLength = 0;
+      for (let j = current.length - 1; j >= 0 && current[j] === "\\"; j--) {
+        backslashRunLength++;
+      }
+
+      // Odd number of trailing backslashes means the newline is escaped.
+      if (backslashRunLength % 2 === 1) {
+        current = current.slice(0, -1);
+        i++;
+        if (ch === "\r" && i < len && commandText[i] === "\n") {
+          i++;
+        }
+        while (i < len && (commandText[i] === " " || commandText[i] === "\t")) i++;
+        if (current && !/\s$/.test(current)) {
+          current += " ";
+        }
+        continue;
+      }
+
+      segments.push(current);
+      current = "";
+      i++;
+      if (ch === "\r" && i < len && commandText[i] === "\n") {
+        i++;
+      }
+      while (i < len && /\s/.test(commandText[i])) i++;
+      continue;
+    }
+
     current += ch;
     i++;
   }
@@ -156,13 +189,26 @@ function splitOnPipelineOperators(commandText) {
 }
 
 /**
- * Shell flow-control keywords that can appear as the first word of a segment
- * but do not represent an executable command.  They must be excluded so the
- * permission checker does not attempt to look up keywords like "then" or "fi"
- * as command names and incorrectly deny (or allow) a pipeline that contains
- * them as part of a compound statement (e.g. `if …; then cat …; fi`).
+ * Clause keywords can prefix an executable command in the same segment
+ * (for example: "then cat file", "do git log"). These are skipped and
+ * scanning continues to find the command token.
  */
-const SHELL_KEYWORDS = new Set(["then", "else", "elif", "fi", "do", "done", "esac", "in", "function", "time", "coproc"]);
+const CLAUSE_KEYWORDS = new Set(["then", "else", "elif", "do"]);
+
+/**
+ * Structural shell keywords never represent an executable command token
+ * for permission matching in this parser. They introduce/close control
+ * structures and are treated as non-command segment starts.
+ */
+const STRUCTURE_KEYWORDS = new Set(["if", "fi", "for", "done", "while", "until", "case", "esac", "select", "in", "function", "time", "coproc"]);
+
+const SHELL_KEYWORDS = new Set([...CLAUSE_KEYWORDS, ...STRUCTURE_KEYWORDS]);
+
+// IDENTIFIER=VALUE where VALUE is one of:
+// - "(...)" double-quoted text (supports escapes like \")
+// - '(...)' single-quoted text
+// - an unquoted non-space token
+const ENV_ASSIGNMENT_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*=(?:"(?:\\.|[^"\\])*"|'[^']*'|\S*)\s*/;
 
 /**
  * Extract the executable command name from a single shell command segment.
@@ -186,38 +232,45 @@ function extractCommandName(segment) {
   if (!remaining) return null;
 
   // Skip leading env-var assignments: IDENTIFIER=anything  (repeat)
-  const envAssignRe = /^[A-Za-z_][A-Za-z0-9_]*=\S*\s*/;
   for (;;) {
-    const m = remaining.match(envAssignRe);
+    const m = remaining.match(ENV_ASSIGNMENT_PREFIX_RE);
     if (!m) break;
     remaining = remaining.slice(m[0].length).trim();
   }
 
   if (!remaining) return null;
 
-  // Get the first word
-  const wordMatch = remaining.match(/^(\S+)/);
-  if (!wordMatch) return null;
+  for (;;) {
+    // Get the first word
+    const wordMatch = remaining.match(/^(\S+)/);
+    if (!wordMatch) return null;
 
-  const word = wordMatch[1];
+    const word = wordMatch[1];
 
-  // Redirection operators (<, >, 2>, 2>&1, …)
-  if (/^[<>]/.test(word) || /^\d+[<>&]/.test(word)) {
-    return null;
+    // Redirection operators (<, >, 2>, 2>&1, …)
+    if (/^[<>]/.test(word) || /^\d+[<>&]/.test(word)) {
+      return null;
+    }
+
+    // Shell negation / grouping — skip and continue scanning
+    if (word === "!" || word === "{" || word === "}") {
+      remaining = remaining.slice(word.length).trim();
+      if (!remaining) return null;
+      continue;
+    }
+
+    // Flow-control keywords are not executable commands
+    if (SHELL_KEYWORDS.has(word)) {
+      if (CLAUSE_KEYWORDS.has(word)) {
+        remaining = remaining.slice(word.length).trim();
+        if (!remaining) return null;
+        continue;
+      }
+      return null;
+    }
+
+    return word;
   }
-
-  // Shell negation / grouping — recurse on the remainder
-  if (word === "!" || word === "{" || word === "}") {
-    const rest = remaining.slice(word.length).trim();
-    return extractCommandName(rest);
-  }
-
-  // Flow-control keywords are not executable commands
-  if (SHELL_KEYWORDS.has(word)) {
-    return null;
-  }
-
-  return word;
 }
 
 /**

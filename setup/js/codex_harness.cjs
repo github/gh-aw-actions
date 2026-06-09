@@ -32,7 +32,6 @@
 "use strict";
 
 const fs = require("fs");
-const { isMaxEffectiveTokensExceededError } = require("./effective_tokens_hard_rail.cjs");
 const { runProcess, formatDuration, sleep } = require("./process_runner.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
@@ -45,8 +44,9 @@ const {
   fetchAWFReflect,
   fetchModelsFromUrl,
 } = require("./awf_reflect.cjs");
-const { emitMissingToolPermissionIssue } = require("./safeoutputs_cli.cjs");
+const { emitMissingToolPermissionIssue, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
+const { detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
 
 // Maximum number of retry attempts after the initial run
 const MAX_RETRIES = 3;
@@ -311,6 +311,16 @@ async function main() {
 
   log(`starting: command=${command} maxRetries=${MAX_RETRIES} initialDelayMs=${INITIAL_DELAY_MS}` + ` backoffMultiplier=${BACKOFF_MULTIPLIER} maxDelayMs=${MAX_DELAY_MS}` + ` nodeVersion=${process.version} platform=${process.platform}`);
 
+  // Pre-flight: skip the agent entirely when a noop has already been written by a prior step.
+  // A noop indicates the work is complete or there is nothing to do — starting the agent
+  // would be wasteful and potentially harmful.  This check runs before API key validation so
+  // that a noop can be honoured even when credentials are absent.
+  const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS || "";
+  if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
+    log("pre-flight: noop message found in safe-outputs — skipping agent (work is already complete or no work needed)");
+    process.exit(0);
+  }
+
   // Diagnose API key presence so CI failures can be triaged without exposing secret values.
   const codexApiKey = process.env.CODEX_API_KEY;
   const openaiApiKey = process.env.OPENAI_API_KEY;
@@ -407,6 +417,24 @@ async function main() {
         ` retriesRemaining=${MAX_RETRIES - attempt}`
     );
 
+    // If a noop was written to safe-outputs during the failed run, the agent determined
+    // there was nothing to do (or the user indicated so before the agent ran).  Retrying
+    // would not produce different results and could waste resources.
+    if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
+      log(`attempt ${attempt + 1}: noop message found in safe-outputs — not retrying (work is already complete or no work needed)`);
+      lastExitCode = 0;
+      break;
+    }
+
+    const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
+    if (nonRetryableGuard.aiCreditsExceeded || nonRetryableGuard.awfAPIProxyBlockingRequests) {
+      const reasons = [];
+      if (nonRetryableGuard.aiCreditsExceeded) reasons.push("AI credits budget exceeded");
+      if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
+      log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
+      break;
+    }
+
     if (attempt === 0 && isAuthenticationFailed) {
       log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
       break;
@@ -421,11 +449,6 @@ async function main() {
       const deniedCommands = extractDeniedCommands(result.output);
       emitMissingToolPermissionIssue({ deniedCommands, logger: log });
       log(`attempt ${attempt + 1}: detected numerous permission-denied issues — not retrying (classified as missing tool/permission issue)`);
-      break;
-    }
-
-    if (isMaxEffectiveTokensExceededError(result.output)) {
-      log(`attempt ${attempt + 1}: AWF effective-token hard rail hit — not retrying (further inference will be refused until budget resets)`);
       break;
     }
 
@@ -459,7 +482,6 @@ if (typeof module !== "undefined" && module.exports) {
     resolveCodexPromptFileArgs,
     injectJsonFlag,
     isRateLimitError,
-    isMaxEffectiveTokensExceededError,
     isAuthenticationFailedError,
     isMissingApiKeyError,
     isServerError,
@@ -473,6 +495,7 @@ if (typeof module !== "undefined" && module.exports) {
     extractOpenAIProxyBaseURLFromToml,
     getConfiguredOpenAIPortFromReflect,
     validateCodexOpenAIBaseURLFromReflect,
+    hasNoopInSafeOutputs,
   };
 }
 

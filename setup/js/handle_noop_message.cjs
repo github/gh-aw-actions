@@ -9,6 +9,8 @@ const { generateFooterWithExpiration } = require("./ephemerals.cjs");
 const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
 const { loadAgentOutput } = require("./load_agent_output.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { generateHistoryUrl } = require("./generate_history_link.cjs");
+const { formatAIC } = require("./model_costs.cjs");
 /**
  * Search for or create the parent issue for all agentic workflow no-op runs
  * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
@@ -67,6 +69,61 @@ async function ensureAgentRunsIssue() {
     number: newIssue.number,
     node_id: newIssue.node_id,
   };
+}
+
+/**
+ * Build the AIC suffix string for use in comment footers.
+ * Includes both agent and threat-detection AIC when available.
+ * Returns a string like " · 0.001 AIC" or "" when not available.
+ * @returns {string}
+ */
+function buildAICSuffix() {
+  const agentRaw = process.env.GH_AW_AIC;
+  const detectionRaw = process.env.GH_AW_THREAT_DETECTION_AIC;
+  const agentAIC = agentRaw ? Number.parseFloat(agentRaw) : NaN;
+  const detectionAIC = detectionRaw ? Number.parseFloat(detectionRaw) : NaN;
+  const totalAIC = (Number.isFinite(agentAIC) && agentAIC > 0 ? agentAIC : 0) + (Number.isFinite(detectionAIC) && detectionAIC > 0 ? detectionAIC : 0);
+  if (totalAIC <= 0) {
+    return "";
+  }
+  return ` · ${formatAIC(totalAIC)} AIC`;
+}
+
+/**
+ * Build the ambient context suffix string for use in comment footers.
+ * Returns a string like " · ⊞ 1.2K" or "" when not available.
+ * @returns {string}
+ */
+function buildAmbientContextSuffix() {
+  const raw = process.env.GH_AW_AMBIENT_CONTEXT;
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return "";
+  }
+  // Format compact integer values: e.g. 1200 → "1.2K"
+  const formatted = parsed >= 1000 ? `${(parsed / 1000).toFixed(1)}K` : String(parsed);
+  return ` · ⊞ ${formatted}`;
+}
+
+/**
+ * Build a markdown history link for use in comment footers.
+ * Returns a string like " · [◷](url)" or "" when not available.
+ * @returns {string}
+ */
+function buildHistoryLink() {
+  const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
+  if (!workflowId) {
+    return "";
+  }
+  const { owner, repo } = context.repo;
+  const historyUrl = generateHistoryUrl({
+    owner,
+    repo,
+    itemType: "comment",
+    workflowId,
+    serverUrl: context.serverUrl,
+  });
+  return historyUrl ? ` · [◷](${historyUrl})` : "";
 }
 
 /**
@@ -187,6 +244,9 @@ async function main() {
       workflow_name: workflowName,
       message: noopMessage,
       run_url: runUrl,
+      aic_suffix: buildAICSuffix(),
+      ambient_context_suffix: buildAmbientContextSuffix(),
+      history_link: buildHistoryLink(),
     });
 
     // Sanitize the full comment body

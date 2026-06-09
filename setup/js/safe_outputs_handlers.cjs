@@ -46,6 +46,21 @@ function buildIntentErrorResponse(error) {
 }
 
 /**
+ * Build an actionable missing temporary_id error for configured tools.
+ * @param {string} toolName
+ * @param {string} configKey
+ * @returns {string}
+ */
+function buildMissingTemporaryIdError(toolName, configKey) {
+  const temporaryIdExamples = {
+    create_pull_request: "aw_pr1",
+    create_issue: "aw_issue1",
+  };
+  const example = temporaryIdExamples[toolName] || "aw_item1";
+  return `${toolName} requires 'temporary_id' when safe-outputs.${configKey}.require-temporary-id is enabled. Set temporary_id (for example "${example}") and retry.`;
+}
+
+/**
  * @param {Record<string, any>} entry
  * @returns {boolean}
  */
@@ -343,6 +358,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    */
   const createPullRequestHandler = async args => {
     const entry = { ...args, type: "create_pull_request" };
+    if (config.create_pull_request?.require_temporary_id === true && !entry.temporary_id) {
+      return buildIntentErrorResponse(buildMissingTemporaryIdError("create_pull_request", "create-pull-request"));
+    }
 
     // Resolve target repo configuration and validate the target repo early
     // This is needed before getBaseBranch to ensure we resolve the base branch
@@ -1386,6 +1404,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    */
   const createIssueHandler = args => {
     const entry = { ...(args || {}), type: "create_issue" };
+    if (createIssueConfig.require_temporary_id === true && !entry.temporary_id) {
+      return buildIntentErrorResponse(buildMissingTemporaryIdError("create_issue", "create-issue"));
+    }
     const intentValidationError = validateCreateIssueIntent(entry);
     if (intentValidationError) {
       return buildIntentErrorResponse(intentValidationError);

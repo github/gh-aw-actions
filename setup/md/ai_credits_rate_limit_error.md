@@ -1,10 +1,15 @@
+> [!WARNING]
+> **AI Credits Budget Exceeded**
+>
+> The workflow hit the configured `max-ai-credits` guardrail.{metrics_table}
+
 <details>
-<summary><strong>⚠️ AI Credits Budget Exceeded</strong></summary>
+<summary>Tips for reducing AI credit usage</summary>
 
-The workflow hit the configured `max-ai-credits` budget and the firewall rejected additional model requests.{usage_line}{budget_line}{run_line}
+- Review the [cost optimization guidance](https://github.github.com/gh-aw/reference/cost-management/).
+- Increase the `max-ai-credits` limit in the workflow frontmatter if the task legitimately requires more credits.
+- Reduce unnecessary model or tool calls in the prompt.
+- Trim large inputs or excess context that does not change the outcome.
+- Split large tasks across smaller runs when possible.
 
-To reduce recurrence:
-- Increase `max-ai-credits` for this workflow when appropriate.
-- Reduce unnecessary model/tool calls in the prompt.
-- Split large tasks across smaller runs.
 </details>

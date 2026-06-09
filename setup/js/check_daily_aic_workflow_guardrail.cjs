@@ -5,12 +5,12 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { calculateDailyAICStats, findTokenUsageFile, formatAICCredits, sumAICFromTokenUsageFile } = require("./daily_effective_workflow_helpers.cjs");
-const { parsePositiveEffectiveTokenLimitNumber } = require("./effective_token_limits.cjs");
+const { calculateDailyAICStats, findJSONLFiles, formatAICCredits, sumAICFromUsageJSONLFiles } = require("./daily_aic_workflow_helpers.cjs");
+const { parsePositiveCompactNumber } = require("./numeric_limits.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { createRateLimitAwareGithub } = require("./github_rate_limit_logger.cjs");
 
-const PRIMARY_GUARDRAIL_ARTIFACT_NAMES = ["firewall-audit-logs", "agent"];
+const PRIMARY_GUARDRAIL_ARTIFACT_NAMES = ["usage"];
 const DAILY_WORKFLOW_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_WORKFLOW_RUN_PAGES = 10;
 const RATE_LIMIT_RESERVE = 100;
@@ -33,7 +33,7 @@ async function getArtifactClient() {
  */
 function formatDailyGuardrailLogMessage(message, details) {
   if (!details || Object.keys(details).length === 0) {
-    return `[daily-workflow-et] ${message}`;
+    return `[daily-workflow-aic] ${message}`;
   }
   let serializedDetails = "";
   try {
@@ -41,11 +41,11 @@ function formatDailyGuardrailLogMessage(message, details) {
   } catch {
     serializedDetails = JSON.stringify({ error: "failed to serialize log details" });
   }
-  return `[daily-workflow-et] ${message}: ${serializedDetails}`;
+  return `[daily-workflow-aic] ${message}: ${serializedDetails}`;
 }
 
 /**
- * Emit a consistently prefixed daily workflow ET diagnostic log line.
+ * Emit a consistently prefixed daily workflow AI Credits diagnostic log line.
  *
  * @param {string} message
  * @param {Record<string, unknown>} [details]
@@ -58,12 +58,12 @@ function logDailyGuardrail(message, details) {
 /**
  * @returns {boolean}
  */
-function shouldSkipDailyEffectiveWorkflowGuardrail() {
+function shouldSkipDailyAICGuardrail() {
   const eventName = process.env.GITHUB_EVENT_NAME || "";
-  if (eventName === "workflow_call" || eventName === "repository_dispatch") {
-    return true;
-  }
-  return eventName === "workflow_dispatch" && (process.env.GH_AW_WORKFLOW_DISPATCH_AW_CONTEXT || "").trim() !== "";
+  const isWorkflowCall = eventName === "workflow_call";
+  const isRepositoryDispatch = eventName === "repository_dispatch";
+  const hasDispatchContext = (process.env.GH_AW_WORKFLOW_DISPATCH_AW_CONTEXT || "").trim() !== "";
+  return isWorkflowCall || isRepositoryDispatch || (eventName === "workflow_dispatch" && hasDispatchContext);
 }
 
 /**
@@ -134,15 +134,15 @@ async function getRunAIC(artifactClient, runId, token, owner, repo) {
     },
   });
 
-  const tokenUsageFile = findTokenUsageFile(download.downloadPath || downloadRoot);
+  const usageJSONLFiles = findJSONLFiles(download.downloadPath || downloadRoot);
   logDailyGuardrail("Downloaded guardrail artifact", {
     runId,
     artifactId: artifact.id,
     artifactName: artifact.name,
     downloadPath: download.downloadPath || downloadRoot,
-    tokenUsageFile,
+    usageJSONLFiles,
   });
-  const aic = sumAICFromTokenUsageFile(tokenUsageFile);
+  const aic = sumAICFromUsageJSONLFiles(usageJSONLFiles);
   logDailyGuardrail("Computed run AIC from artifact", {
     runId,
     artifactId: artifact.id,
@@ -156,7 +156,7 @@ async function getRunAIC(artifactClient, runId, token, owner, repo) {
  * @returns {string}
  */
 function formatInteger(value) {
-  const safeValue = Number.isFinite(value) ? Math.round(value || 0) : 0;
+  const safeValue = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : 0;
   return INTEGER_FORMATTER.format(safeValue);
 }
 
@@ -210,7 +210,7 @@ async function getCoreRateLimitSnapshot(githubClient) {
  * @param {{candidateRunsCount:number,inspectedRunsCount:number,truncatedByRateLimit:boolean}} meta
  * @returns {string}
  */
-function renderDailyEffectiveWorkflowSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, meta) {
+function renderDailyAICSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, meta) {
   const stats = calculateDailyAICStats(countedRuns);
   const remainingBudget = Math.max(0, threshold - stats.total);
   const usagePercent = threshold > 0 ? ((stats.total / threshold) * 100).toFixed(2) : "0.00";
@@ -266,8 +266,8 @@ function renderDailyEffectiveWorkflowSummary(workflowName, actorLogin, threshold
  * @param {{candidateRunsCount:number,inspectedRunsCount:number,truncatedByRateLimit:boolean}} meta
  * @returns {Promise<void>}
  */
-async function appendDailyEffectiveWorkflowSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, meta) {
-  const markdown = renderDailyEffectiveWorkflowSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, meta);
+async function appendDailyAICSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, meta) {
+  const markdown = renderDailyAICSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, meta);
   core.summary.addDetails("Daily AI Credits Usage (24h)", "\n\n" + markdown);
   await core.summary.write();
 }
@@ -278,9 +278,9 @@ async function appendDailyEffectiveWorkflowSummary(workflowName, actorLogin, thr
  * Requires github-script globals (`core`, `github`, `context`) provided by setupGlobals().
  *
  * Error handling: all GitHub API interactions after the initial guard checks are wrapped
- * in a top-level try-catch.  Any unexpected error (network failure, permission error, etc.)
+ * in a top-level try-catch. Any unexpected error (network failure, permission error, etc.)
  * is logged as a warning and the function returns cleanly with `daily_effective_workflow_exceeded`
- * left at its default value of `"false"`.  This design ensures the step never fails the
+ * left at its default value of `"false"`. This design ensures the step never fails the
  * activation job — a guardrail error results in a safe bypass (agent allowed to run) rather
  * than a confusing workflow failure that blocks the agent entirely.
  */
@@ -289,18 +289,18 @@ async function main() {
   core.setOutput("daily_effective_workflow_total_effective_tokens", "");
   core.setOutput("daily_effective_workflow_total_ai_credits", "");
   core.setOutput("daily_effective_workflow_threshold", "");
-  const threshold = parsePositiveEffectiveTokenLimitNumber(process.env.GH_AW_MAX_DAILY_AI_CREDITS);
+  const threshold = parsePositiveCompactNumber(process.env.GH_AW_MAX_DAILY_AI_CREDITS);
   if (threshold <= 0) {
     return;
   }
-  if (shouldSkipDailyEffectiveWorkflowGuardrail()) {
-    core.info("Skipping daily workflow ET guardrail for workflow_call, repository_dispatch, or workflow_dispatch with aw_context.");
+  if (shouldSkipDailyAICGuardrail()) {
+    core.info("Skipping daily workflow AI Credits guardrail for workflow_call, repository_dispatch, or workflow_dispatch with aw_context.");
     return;
   }
 
   const token = process.env.GH_AW_GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
   if (!token) {
-    core.warning("Skipping daily workflow ET guardrail because no GitHub token was available for artifact lookup.");
+    core.warning("Skipping daily workflow AI Credits guardrail because no GitHub token was available for artifact lookup.");
     return;
   }
 
@@ -324,12 +324,12 @@ async function main() {
     const workflowName = process.env.GH_AW_WORKFLOW_NAME || workflowID || "workflow";
     const actorLogin = process.env.GITHUB_TRIGGERING_ACTOR || currentRun.data.triggering_actor?.login || currentRun.data.actor?.login || process.env.GITHUB_ACTOR || "";
 
-    if (!currentRun.data.workflow_id || !actorLogin) {
-      core.warning("Skipping daily workflow ET guardrail because the current workflow or actor could not be resolved.");
+    if (!currentRun.data.workflow_id) {
+      core.warning("Skipping daily workflow AI Credits guardrail because the current workflow could not be resolved.");
       return;
     }
 
-    logDailyGuardrail("Resolved current workflow ET guardrail context", {
+    logDailyGuardrail("Resolved current workflow AI Credits guardrail context", {
       owner,
       repo,
       currentRunId: context.runId,
@@ -342,21 +342,18 @@ async function main() {
     });
     const maxInspectableRuns = computeMaxInspectableRuns(rateLimit.remaining);
     if (maxInspectableRuns <= 0) {
-      core.warning(`Skipping daily workflow ET guardrail because the GitHub API rate limit is too low (${rateLimit.remaining} remaining, reserve ${RATE_LIMIT_RESERVE}).`);
+      core.warning(`Skipping daily workflow AI Credits guardrail because the GitHub API rate limit is too low (${rateLimit.remaining} remaining, reserve ${RATE_LIMIT_RESERVE}).`);
       return;
     }
 
     const cutoffMs = Date.now() - DAILY_WORKFLOW_WINDOW_MS;
     /** @type {Array<{id:number, html_url:string, created_at:string, conclusion:string}>} */
     const candidateRuns = [];
-    /** @type {Array<any>} */
-    let runs = [];
     let page = 1;
     let truncatedByRateLimit = false;
     while (page <= MAX_WORKFLOW_RUN_PAGES) {
       logDailyGuardrail("Querying completed workflow runs", {
         workflowId: currentRun.data.workflow_id,
-        actorLogin,
         page,
         perPage: 100,
         cutoff: new Date(cutoffMs).toISOString(),
@@ -365,12 +362,11 @@ async function main() {
         owner,
         repo,
         workflow_id: currentRun.data.workflow_id,
-        actor: actorLogin,
         status: "completed",
         per_page: 100,
         page,
       });
-      runs = response.data.workflow_runs || [];
+      const runs = response.data.workflow_runs || [];
       logDailyGuardrail("Received workflow runs page", {
         page,
         runCount: runs.length,
@@ -455,6 +451,7 @@ async function main() {
       truncatedByRateLimit,
     };
     logDailyGuardrail("Completed AIC inspection window", {
+      // Keep these explicit to preserve existing log shape (exclude truncatedByRateLimit).
       candidateRunsCount: summaryMeta.candidateRunsCount,
       inspectedRunsCount: summaryMeta.inspectedRunsCount,
       countedRunIds: countedRuns.map(run => run.id),
@@ -464,30 +461,30 @@ async function main() {
     });
 
     if (totalAIC <= threshold) {
-      await appendDailyEffectiveWorkflowSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, summaryMeta);
+      await appendDailyAICSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, summaryMeta);
       core.info(`Daily workflow AIC guardrail not exceeded (${totalAIC}/${threshold}).`);
       return;
     }
 
     core.setOutput("daily_effective_workflow_exceeded", "true");
-    await appendDailyEffectiveWorkflowSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, summaryMeta);
+    await appendDailyAICSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, summaryMeta);
     core.warning(`Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold}.`);
   } catch (error) {
     // Treat any unexpected error as a non-blocking skip so the step never fails the
     // activation job.  The output stays at the default "false", allowing the agent to
     // run.  The guardrail is effectively bypassed for this invocation.
-    core.warning(`Daily workflow ET guardrail encountered an unexpected error and will be skipped: ${getErrorMessage(error)}`);
+    core.warning(`Daily workflow AI Credits guardrail encountered an unexpected error and will be skipped: ${getErrorMessage(error)}`);
   }
 }
 
 module.exports = {
   main,
-  shouldSkipDailyEffectiveWorkflowGuardrail,
+  shouldSkipDailyAICGuardrail,
   matchesGuardrailArtifactName,
-  findTokenUsageFile,
-  sumAICFromTokenUsageFile,
+  findJSONLFiles,
+  sumAICFromUsageJSONLFiles,
   calculateDailyAICStats,
   computeMaxInspectableRuns,
-  renderDailyEffectiveWorkflowSummary,
+  renderDailyAICSummary,
   formatDailyGuardrailLogMessage,
 };

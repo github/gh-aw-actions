@@ -32,7 +32,7 @@ function getWorkflowMetadata(owner, repo) {
  * cross-repo effectiveContext) so that footer links point back to the actual workflow
  * run regardless of which repository the output action targets.
  *
- * @param {any} ctx - GitHub Actions context (provides serverUrl and runId)
+ * @param {{ serverUrl?: string, runId: number | string }} ctx - GitHub Actions context (provides serverUrl and runId)
  * @param {{ owner: string, repo: string }} workflowRepo - The repository that owns the workflow run
  * @returns {string} The full workflow run URL
  */

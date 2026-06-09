@@ -11,9 +11,9 @@ const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
 const { formatMissingData, formatMissingTools } = require("./missing_info_formatter.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { AWF_INFRA_LINE_RE } = require("./log_parser_shared.cjs");
-const { resolveFirewallAuditLogPath, parseMaxEffectiveTokensFromAuditLog, parseEffectiveTokensErrorInfoFromAuditLog, resolveEffectiveTokensFailureState, resolveAICreditsFailureState } = require("./effective_tokens_context.cjs");
-const { formatET, buildETComputationTable } = require("./effective_tokens.cjs");
-const { isMaxEffectiveTokensExceededError } = require("./effective_tokens_hard_rail.cjs");
+const { resolveFirewallAuditLogPath, resolveAICreditsFailureState, parseMaxAICreditsFromAuditLog, parseAICreditsErrorInfoFromAuditLog } = require("./ai_credits_context.cjs");
+const { formatAICCredits } = require("./daily_aic_workflow_helpers.cjs");
+const { formatAIC } = require("./model_costs.cjs");
 const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp_gateway_log.cjs");
 const { readDedupedTokenUsage, TOKEN_USAGE_PATHS } = require("./parse_token_usage.cjs");
 const fs = require("fs");
@@ -25,6 +25,7 @@ const FAILURE_ISSUE_DEDUP_WINDOW_HOURS = 24;
 const FAILURE_ISSUE_CATEGORY_DAILY_CAP = 50;
 const FAILURE_ISSUE_WINDOW_MS = FAILURE_ISSUE_DEDUP_WINDOW_HOURS * 60 * 60 * 1000;
 const DEFAULT_OTEL_JSONL_PATH = "/tmp/gh-aw/otel.jsonl";
+const GITHUB_API_VERSION = "2022-11-28";
 const COPILOT_SESSION_STATE_DIR = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state");
 // Engine-side 429/rate-limit signatures:
 // - HTTP 429 accompanied by "too many requests"/"rate limit" phrasing
@@ -45,6 +46,26 @@ function getActionFailureIssueExpiresHours() {
     return parsed;
   }
   return DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS;
+}
+
+/**
+ * Build a GitHub markdown warning alert line.
+ * @param {string} title
+ * @param {string} message
+ * @returns {string}
+ */
+function buildWarningAlertLine(title, message) {
+  return `\n> [!WARNING]\n> **${title}**: ${message}\n`;
+}
+
+/**
+ * Render a prompt template from runtime prompts.
+ * @param {string} templateName
+ * @param {Record<string, string|number|boolean|undefined>} [context]
+ * @returns {string}
+ */
+function renderPromptTemplate(templateName, context = {}) {
+  return renderTemplateFromFile(getPromptPath(templateName), context);
 }
 
 /**
@@ -171,12 +192,12 @@ function buildFailureMatchCategories(options) {
   if (options.inferenceAccessError) categories.push("inference_access_error");
   if (options.mcpPolicyError) categories.push("mcp_policy_error");
   if (options.modelNotSupportedError) categories.push("model_not_supported_error");
-  if (options.effectiveTokensRateLimitError) categories.push("effective_tokens_rate_limit_error");
   if (options.aiCreditsRateLimitError) categories.push("ai_credits_rate_limit_error");
+  if (options.maxAICreditsExceeded) categories.push("max_ai_credits_exceeded");
   if (options.hasAppTokenMintingFailed) categories.push("app_token_minting_failed");
   if (options.hasLockdownCheckFailed) categories.push("lockdown_check_failed");
   if (options.hasStaleLockFileFailed) categories.push("stale_lock_file_failed");
-  if (options.hasDailyEffectiveWorkflowExceeded) categories.push("daily_effective_workflow_exceeded");
+  if (options.hasDailyAICExceeded) categories.push("daily_effective_workflow_exceeded");
 
   if (options.agentConclusion === "failure" && !options.isTimedOut) {
     categories.push("agent_failure");
@@ -551,6 +572,7 @@ gh aw audit <run-id>
       title: parentTitle,
       body: parentBody,
       labels: [parentLabel],
+      headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
     });
 
     core.info(`✓ Created parent issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
@@ -616,7 +638,7 @@ function buildCreateDiscussionErrorsContext(createDiscussionErrors) {
     return "";
   }
 
-  let context = "\n**⚠️ Create Discussion Failed**: Failed to create one or more discussions.\n\n**Discussion Errors:**\n";
+  let context = buildWarningAlertLine("Create Discussion Failed", "Failed to create one or more discussions.") + "\n**Discussion Errors:**\n";
   const errorLines = createDiscussionErrors.split("\n").filter(line => line.trim());
   for (const errorLine of errorLines) {
     const parts = errorLine.split(":");
@@ -789,9 +811,9 @@ ${runUrl ? `\nThe patch artifact is available at: [View run and download artifac
 
   // Generic code-push failure section
   if (otherErrors.length > 0) {
-    context += "\n**⚠️ Code Push Failed**: A code push safe output failed, and subsequent safe outputs were cancelled.";
+    context += buildWarningAlertLine("Code Push Failed", "A code push safe output failed, and subsequent safe outputs were cancelled.");
     if (pullRequest) {
-      context += `\n\n**Target Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
+      context += `\n**Target Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
 
       // Add PR state diagnostics
       const workflowSha = process.env.GITHUB_SHA || "";
@@ -803,14 +825,14 @@ ${runUrl ? `\nThe patch artifact is available at: [View run and download artifac
       } else if (pullRequest.mergeable_state === "dirty") {
         prDetails.push("❌ **PR is in dirty state** - likely has merge conflicts");
       } else if (pullRequest.mergeable_state === "blocked") {
-        prDetails.push("⚠️ **PR is blocked** - required status checks or reviews may be missing");
+        prDetails.push("**PR is blocked** - required status checks or reviews may be missing");
       } else if (pullRequest.mergeable_state === "behind") {
-        prDetails.push("⚠️ **PR is behind base branch** - may need to be updated");
+        prDetails.push("**PR is behind base branch** - may need to be updated");
       }
 
       // Check if branch was updated since workflow started
       if (workflowSha && pullRequest.head_sha && workflowSha !== pullRequest.head_sha) {
-        prDetails.push(`⚠️ **Branch was updated** - workflow started at \`${workflowSha.substring(0, 7)}\`, PR head is now \`${pullRequest.head_sha.substring(0, 7)}\``);
+        prDetails.push(`**Branch was updated** - workflow started at \`${workflowSha.substring(0, 7)}\`, PR head is now \`${pullRequest.head_sha.substring(0, 7)}\``);
       }
 
       // Add SHA info for debugging
@@ -867,9 +889,10 @@ function buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryP
     return context;
   }
   return (
-    "\n**⚠️ Repo-Memory Push Failed**: The push-repo-memory job failed to write memory back to the repository. This may indicate a permission issue, a configuration error, or a network problem. Check the [workflow run](" +
-    runUrl +
-    ") for details.\n\n"
+    buildWarningAlertLine(
+      "Repo-Memory Push Failed",
+      "The push-repo-memory job failed to write memory back to the repository. This may indicate a permission issue, a configuration error, or a network problem. Check the [workflow run](" + runUrl + ") for details."
+    ) + "\n"
   );
 }
 
@@ -930,16 +953,22 @@ function buildMissingDataContext(cacheMemoryEnabled, items) {
 
   core.info(`Found ${missingDataMessages.length} missing_data message(s)`);
 
-  // Format the missing data using the existing formatter
-  const formattedList = formatMissingData(missingDataMessages);
-
-  let context = "\n**⚠️ Missing Data Reported**: The agent reported missing data during execution.\n\n**Missing Data:**\n";
-  context += formattedList;
-  context += "\n\n";
-
   // Detect cache_miss: if cache-memory is available and the agent reported a cache miss,
   // this indicates the prompt is referencing an incorrect file path within the cache directory.
   const hasCacheMiss = missingDataMessages.some(m => m.reason === "cache_memory_miss");
+
+  // When cache-memory is configured and cache_miss is present, avoid repeating the same
+  // signal in the generic "Missing Data" section. Keep the specialised cache warning below.
+  const displayableMissingData = cacheMemoryEnabled && hasCacheMiss ? missingDataMessages.filter(m => m.reason !== "cache_memory_miss") : missingDataMessages;
+
+  let context = "";
+  if (displayableMissingData.length > 0) {
+    const formattedList = formatMissingData(displayableMissingData);
+    context += buildWarningAlertLine("Missing Data Reported", "The agent reported missing data during execution.") + "\n**Missing Data:**\n";
+    context += formattedList;
+    context += "\n\n";
+  }
+
   if (cacheMemoryEnabled && hasCacheMiss) {
     core.info("Cache-miss detected despite cache-memory being available — likely a configuration problem");
     const templatePath = getPromptPath("cache_memory_miss.md");
@@ -947,6 +976,97 @@ function buildMissingDataContext(cacheMemoryEnabled, items) {
   }
 
   return context;
+}
+
+/**
+ * Extract denied command entries from a missing_tool alternatives string.
+ * Handles batched command text in the form:
+ * ".... Denied commands: cmd1 | cmd2 | cmd3"
+ * while preserving internal pipes inside tool call parentheses.
+ * @param {string | null | undefined} alternatives
+ * @returns {string[]}
+ */
+function extractDeniedCommandsFromAlternatives(alternatives) {
+  if (!alternatives || typeof alternatives !== "string") {
+    return [];
+  }
+
+  const marker = "Denied commands:";
+  const markerIndex = alternatives.indexOf(marker);
+  if (markerIndex < 0) {
+    return [];
+  }
+
+  const deniedSection = alternatives.slice(markerIndex + marker.length).trim();
+  if (!deniedSection) {
+    return [];
+  }
+
+  const commands = [];
+  let current = "";
+  let depth = 0;
+
+  for (let i = 0; i < deniedSection.length; i++) {
+    const ch = deniedSection[i];
+    if (ch === "(") {
+      depth += 1;
+      current += ch;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      current += ch;
+      continue;
+    }
+
+    if (depth === 0 && deniedSection.slice(i, i + 3) === " | ") {
+      const value = current.trim();
+      if (value && !/^\.\.\. and \d+ more$/i.test(value)) {
+        commands.push(value);
+      }
+      current = "";
+      i += 2;
+      continue;
+    }
+
+    current += ch;
+  }
+
+  const last = current.trim();
+  if (last && !/^\.\.\. and \d+ more$/i.test(last)) {
+    commands.push(last);
+  }
+
+  return [...new Set(commands)];
+}
+
+/**
+ * Normalize denied command strings for permission-context deduplication.
+ * `read(path)` grants are path-agnostic once enabled, so collapse all reads.
+ * Shell heredoc programs (e.g. `shell(python3 << 'EOF'\n...\nEOF)`) are collapsed
+ * to `shell(<program> ...)` so the display stays single-line and actionable.
+ * @param {string} command
+ * @returns {string}
+ */
+function normalizeDeniedPermissionCommand(command) {
+  const trimmed = typeof command === "string" ? command.trim() : "";
+  if (!trimmed) return "";
+  // Strip optional "permission denied: " prefix present in tool_denials_exceeded reason strings.
+  const cmd = trimmed.replace(/^permission denied:\s*/i, "");
+  const readMatch = cmd.match(/^read\s*\((.*)\)$/i);
+  if (readMatch && !/[\r\n]/.test(readMatch[1] || "")) {
+    return "read(...)";
+  }
+  // Normalize shell heredoc programs: shell(python3 << 'EOF'\n...\nEOF) → shell(python3 ...)
+  // Matches any shell(...) invocation that opens a heredoc with << so the multi-line
+  // program body is replaced by an ellipsis, keeping the display single-line.
+  // Only the opening line needs to match — we don't need to parse the body or closing delimiter.
+  // The \w+ captures common heredoc markers (e.g. EOF, EOL, HEREDOC, PYTHON).
+  const shellHeredocMatch = cmd.match(/^shell\s*\(\s*(\S+)\s+<<\s*['"]?\w+['"]?[\r\n]/);
+  if (shellHeredocMatch) {
+    return `shell(${shellHeredocMatch[1]} ...)`;
+  }
+  return cmd;
 }
 
 /**
@@ -971,11 +1091,13 @@ function loadMissingToolMessages(items) {
     for (const item of resolvedItems) {
       if (item.type === "missing_tool") {
         if (item.reason) {
+          const deniedCommandsFromItem = Array.isArray(item.denied_commands) ? item.denied_commands.filter(cmd => typeof cmd === "string" && cmd.trim()) : [];
+          const deniedCommands = deniedCommandsFromItem.length > 0 ? deniedCommandsFromItem : extractDeniedCommandsFromAlternatives(item.alternatives);
           missingToolMessages.push({
             tool: item.tool || null,
             reason: item.reason,
             alternatives: item.alternatives || null,
-            denied_commands: Array.isArray(item.denied_commands) ? item.denied_commands : [],
+            denied_commands: deniedCommands,
           });
         }
       }
@@ -1004,7 +1126,7 @@ function buildMissingToolContext(items) {
 
   const formattedList = formatMissingTools(missingToolMessages);
 
-  let context = "\n**⚠️ Missing Tools Reported**: The agent reported missing tools during execution.\n\n**Missing Tools:**\n";
+  let context = buildWarningAlertLine("Missing Tools Reported", "The agent reported missing tools during execution.") + "\n**Missing Tools:**\n";
   context += formattedList;
   context += "\n\n";
 
@@ -1032,7 +1154,8 @@ function buildPermissionDeniedContext(items, workflowId) {
   const allDenied = new Set();
   for (const item of permissionItems) {
     for (const cmd of item.denied_commands) {
-      if (cmd) allDenied.add(cmd);
+      const normalized = normalizeDeniedPermissionCommand(cmd);
+      if (normalized) allDenied.add(normalized);
     }
   }
 
@@ -1047,24 +1170,13 @@ function buildPermissionDeniedContext(items, workflowId) {
   const deniedCommandsInline = deniedArray.map(cmd => `\`${cmd}\``).join(", ");
   const deniedCount = String(deniedArray.length);
 
-  try {
-    const templatePath = getPromptPath("permission_denied_context.md");
-    const template = fs.readFileSync(templatePath, "utf8");
-    const rendered = renderTemplate(template, {
-      denied_count: deniedCount,
-      denied_commands_list: deniedCommandsList,
-      denied_commands_inline: deniedCommandsInline,
-      workflow_id: workflowId || "the workflow",
-    });
-    return "\n" + rendered;
-  } catch {
-    // Template not available — return inline fallback message
-    return (
-      `\n**🚫 Repeated Permission Denied**: The agent was denied permission for ${deniedCount} command(s).\n\n` +
-      `**Denied Commands:**\n${deniedCommandsList}\n\n` +
-      `Update the workflow prompt to use built-in tools instead of the denied commands.\n`
-    );
-  }
+  const rendered = renderPromptTemplate("permission_denied_context.md", {
+    denied_count: deniedCount,
+    denied_commands_list: deniedCommandsList,
+    denied_commands_inline: deniedCommandsInline,
+    workflow_id: workflowId || "the workflow",
+  });
+  return "\n" + rendered;
 }
 
 /**
@@ -1130,6 +1242,10 @@ function buildToolDenialsExceededContext(events, workflowId) {
   const threshold = String(latestEvent.threshold);
   const reason = latestEvent.reason || "permission denied by workflow tool permissions";
 
+  // Normalize the reason for display: multi-line programs (e.g. Python 3 heredocs) are
+  // collapsed to a single-line summary so the issue body renders cleanly.
+  const normalizedReason = normalizeDeniedPermissionCommand(reason);
+
   try {
     const templatePath = getPromptPath("tool_denials_exceeded_context.md");
     const template = fs.readFileSync(templatePath, "utf8");
@@ -1138,14 +1254,14 @@ function buildToolDenialsExceededContext(events, workflowId) {
       renderTemplate(template, {
         denial_count: denialCount,
         threshold,
-        reason: `\`${reason}\``,
+        reason: `\`${normalizedReason}\``,
         workflow_id: workflowId || "the workflow",
       })
     );
   } catch {
     return (
-      `\n**⚠️ Excessive Tool Denials**: The Copilot SDK stopped the session after ${denialCount}/${threshold} permission denials.\n\n` +
-      `**Last denied request:** \`${reason}\`\n\n` +
+      buildWarningAlertLine("Excessive Tool Denials", `The Copilot SDK stopped the session after ${denialCount}/${threshold} permission denials.`) +
+      `**Last denied request:** \`${normalizedReason}\`\n\n` +
       "This is a guardrail stop (`guard.tool_denials_exceeded`) and indicates the workflow's allowed tool set does not match the prompt's requested actions.\n"
     );
   }
@@ -1201,7 +1317,7 @@ function buildReportIncompleteContext(items) {
 
   core.info(`Found ${messages.length} report_incomplete signal(s)`);
 
-  let context = "\n**⚠️ Task Could Not Be Completed**: The agent reported that the task could not be performed due to an infrastructure or tool failure.\n\n**Reasons:**\n";
+  let context = buildWarningAlertLine("Task Could Not Be Completed", "The agent reported that the task could not be performed due to an infrastructure or tool failure.") + "\n**Reasons:**\n";
   for (const msg of messages) {
     context += `- ${msg.reason}\n`;
     if (msg.details) {
@@ -1258,18 +1374,7 @@ function buildMCPPolicyErrorContext(hasMCPPolicyError) {
     return "";
   }
 
-  const templatePath = getPromptPath("mcp_policy_error.md");
-  try {
-    const template = fs.readFileSync(templatePath, "utf8");
-    return "\n" + template;
-  } catch {
-    // Template not available — return inline message
-    return (
-      "\n**🔒 MCP Servers Blocked by Policy**: The Copilot CLI blocked MCP server connections due to an organization or enterprise policy.\n\n" +
-      'An administrator must enable the **"MCP servers in Copilot"** policy. ' +
-      "See: [Configure MCP server access](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-server-access)\n"
-    );
-  }
+  return "\n" + renderPromptTemplate("mcp_policy_error.md");
 }
 
 /**
@@ -1283,18 +1388,7 @@ function buildModelNotSupportedErrorContext(hasModelNotSupportedError) {
     return "";
   }
 
-  const templatePath = getPromptPath("model_not_supported_error.md");
-  try {
-    const template = fs.readFileSync(templatePath, "utf8");
-    return "\n" + template;
-  } catch {
-    // Template not available — return inline message
-    return (
-      "\n**🚫 Model Not Supported**: The requested model is not available for your Copilot subscription tier (e.g., Copilot Pro or Education).\n\n" +
-      "Specify a supported model in the workflow frontmatter, for example `model: gpt-5-mini`. " +
-      "See: [Supported models](https://docs.github.com/en/copilot/using-github-copilot/using-github-copilot-in-the-command-line#supported-models)\n"
-    );
-  }
+  return "\n" + renderPromptTemplate("model_not_supported_error.md");
 }
 
 /**
@@ -1334,16 +1428,7 @@ function hasEngineRateLimit429InOTELMirror(otelJsonlPathOverride) {
  */
 function buildEngineRateLimit429Context(engineLabel) {
   const normalizedEngineLabel = engineLabel.trim() || "AI";
-  const templatePath = getPromptPath("engine_rate_limit_429.md");
-  try {
-    return "\n" + renderTemplateFromFile(templatePath, { engine_label: normalizedEngineLabel });
-  } catch {
-    return (
-      `\n**🚦 Engine Rate Limited (HTTP 429)**: The ${normalizedEngineLabel} engine hit provider rate limits and could not complete this run.\n\n` +
-      "This signal was detected from engine runtime logs/OTLP telemetry.\n\n" +
-      "Retry after a short delay. If this recurs, reduce concurrent runs or review provider quota/rate-limit policies.\n"
-    );
-  }
+  return "\n" + renderPromptTemplate("engine_rate_limit_429.md", { engine_label: normalizedEngineLabel });
 }
 
 /**
@@ -1375,58 +1460,6 @@ function readTokenUsageMarkdown() {
 }
 
 /**
- * Build a context string when ET budget exhaustion/rate-limit is detected from gateway logs.
- * @param {boolean} hasEffectiveTokensRateLimitError
- * @param {string} effectiveTokens
- * @param {string} maxEffectiveTokens
- * @param {string} runUrl
- * @returns {string}
- */
-function buildEffectiveTokensRateLimitErrorContext(hasEffectiveTokensRateLimitError, effectiveTokens, maxEffectiveTokens, runUrl) {
-  if (!hasEffectiveTokensRateLimitError) {
-    return "";
-  }
-
-  const formatEffectiveTokensForMessage = value => {
-    const parsed = Number.parseInt(value || "", 10);
-    if (Number.isInteger(parsed) && parsed > 0) {
-      return formatET(parsed);
-    }
-    return value;
-  };
-  const usageLine = effectiveTokens ? `\n- Effective tokens used: \`${formatEffectiveTokensForMessage(effectiveTokens)}\`` : "";
-  const budgetLine = maxEffectiveTokens ? `\n- Configured ET budget: \`${formatEffectiveTokensForMessage(maxEffectiveTokens)}\`` : "";
-  const runLine = runUrl ? `\n- Run: [${runUrl}](${runUrl})` : "";
-
-  const etTableSection = buildETComputationTable(effectiveTokens, readTokenUsageMarkdown());
-  const templateName = "effective_tokens_rate_limit_error.md";
-  let templatePath = "";
-  try {
-    templatePath = getPromptPath(templateName);
-  } catch (error) {
-    throw new Error(`failed to resolve template path for ${templateName} (${getErrorMessage(error)}); ` + "ensure RUNNER_TEMP or GH_AW_PROMPTS_DIR is set and the template file exists");
-  }
-
-  try {
-    return (
-      "\n" +
-      renderTemplateFromFile(templatePath, {
-        ai_credits_spec_link: "https://github.github.com/gh-aw/specs/ai-credits-specification/",
-        cost_management_link: "https://github.github.com/gh-aw/reference/cost-management/",
-        usage_line: usageLine,
-        budget_line: budgetLine,
-        run_line: runLine,
-        et_table_section: etTableSection,
-      })
-    );
-  } catch (error) {
-    throw new Error(
-      `failed to render template at ${templatePath}: ${getErrorMessage(error)}; ` + "verify template syntax and required placeholders: " + "ai_credits_spec_link, cost_management_link, usage_line, budget_line, run_line, et_table_section"
-    );
-  }
-}
-
-/**
  * Build a context string when AI credits budget exhaustion/rate-limit is detected from gateway logs.
  * @param {boolean} hasAICreditsRateLimitError
  * @param {string} aiCredits
@@ -1439,9 +1472,26 @@ function buildAICreditsRateLimitErrorContext(hasAICreditsRateLimitError, aiCredi
     return "";
   }
 
-  const usageLine = aiCredits ? `\n- AI credits used: \`${aiCredits}\`` : "";
-  const budgetLine = maxAICredits ? `\n- Configured AI credits budget: \`${maxAICredits}\`` : "";
-  const runLine = runUrl ? `\n- Run: [${runUrl}](${runUrl})` : "";
+  const numericAICredits = Number(aiCredits);
+  const numericMaxAICredits = Number(maxAICredits);
+  const formattedAICredits = Number.isFinite(numericAICredits) && numericAICredits > 0 ? formatAIC(numericAICredits) : "";
+  const formattedMaxAICredits = Number.isFinite(numericMaxAICredits) && numericMaxAICredits > 0 ? formatAIC(numericMaxAICredits) : "";
+  const overage = Number.isFinite(numericAICredits) && Number.isFinite(numericMaxAICredits) && numericAICredits > numericMaxAICredits ? numericAICredits - numericMaxAICredits : NaN;
+  const formattedOverage = Number.isFinite(overage) && overage > 0 ? formatAIC(overage) : "";
+  const metricsRows = [];
+  if (formattedAICredits) {
+    metricsRows.push(`| AI credits used | \`${formattedAICredits}\` |`);
+  }
+  if (formattedMaxAICredits) {
+    metricsRows.push(`| Guardrail limit (\`max-ai-credits\`) | \`${formattedMaxAICredits}\` |`);
+  }
+  if (formattedOverage) {
+    metricsRows.push(`| Over the limit by | \`${formattedOverage}\` |`);
+  }
+  if (runUrl) {
+    metricsRows.push(`| Run | [View workflow run](${runUrl}) |`);
+  }
+  const metricsTable = metricsRows.length > 0 ? `\n\n| Metric | Value |\n| --- | --- |\n${metricsRows.join("\n")}` : "";
 
   const templateName = "ai_credits_rate_limit_error.md";
   let templatePath = "";
@@ -1455,13 +1505,11 @@ function buildAICreditsRateLimitErrorContext(hasAICreditsRateLimitError, aiCredi
     return (
       "\n" +
       renderTemplateFromFile(templatePath, {
-        usage_line: usageLine,
-        budget_line: budgetLine,
-        run_line: runLine,
+        metrics_table: metricsTable,
       })
     );
   } catch (error) {
-    throw new Error(`failed to render template at ${templatePath}: ${getErrorMessage(error)}; verify template syntax and required placeholders: usage_line, budget_line, run_line`);
+    throw new Error(`failed to render template at ${templatePath}: ${getErrorMessage(error)}; verify template syntax and required placeholders: metrics_table`);
   }
 }
 
@@ -1514,22 +1562,24 @@ function buildStaleLockFileFailedContext(hasStaleLockFileFailed) {
 /**
  * Build a context string when the 24-hour per-workflow AIC guardrail prevented the agent from
  * starting in the activation job.
- * @param {boolean} hasDailyEffectiveWorkflowExceeded - Whether the daily workflow quota was exceeded
+ * @param {boolean} hasDailyAICExceeded - Whether the daily workflow quota was exceeded
  * @param {string} totalAIC - Aggregated AIC usage across the last 24 hours
  * @param {string} threshold - Configured daily workflow threshold
  * @returns {string} Formatted context string, or empty string if no failure
  */
-function buildDailyEffectiveWorkflowExceededContext(hasDailyEffectiveWorkflowExceeded, totalAIC, threshold) {
-  if (!hasDailyEffectiveWorkflowExceeded) {
+function buildDailyAICExceededContext(hasDailyAICExceeded, totalAIC, threshold) {
+  if (!hasDailyAICExceeded) {
     return "";
   }
 
-  const templatePath = getPromptPath("daily_effective_workflow_exceeded.md");
+  const templatePath = getPromptPath("daily_workflow_aic_exceeded.md");
+  const formattedTotalAIC = formatAICCredits(totalAIC);
+  const formattedThreshold = formatAICCredits(threshold);
   return (
     "\n" +
     renderTemplateFromFile(templatePath, {
-      total_effective_tokens: totalAIC || "unknown",
-      threshold: threshold || "unknown",
+      total_aic: formattedTotalAIC || "unknown",
+      threshold: formattedThreshold || "unknown",
     })
   );
 }
@@ -1779,7 +1829,8 @@ function hasAgentTerminalReasonCompleted() {
  * The log file is available in the conclusion job after the agent artifact is downloaded.
  * @returns {string} Formatted context string, or empty string if no engine failure found
  */
-function buildEngineFailureContext() {
+function buildEngineFailureContext(options = {}) {
+  const suppressEngineRateLimit429 = options.suppressEngineRateLimit429 === true;
   // Derive agent-stdio.log path from the agent output file path (same directory)
   const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
   const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
@@ -1810,14 +1861,7 @@ function buildEngineFailureContext() {
       return "";
     }
 
-    // Special handling for provider-side 429/rate-limit failures. These can appear
-    // in agent stdio output or only in mirrored OTLP telemetry payloads.
-    if (isMaxEffectiveTokensExceededError(logContent)) {
-      core.info("Detected maximum effective tokens exceeded signal — deferring to ET budget context");
-      return "";
-    }
-
-    if (hasEngineRateLimit429Signal(logContent) || hasEngineRateLimit429InOTELMirror()) {
+    if (!suppressEngineRateLimit429 && (hasEngineRateLimit429Signal(logContent) || hasEngineRateLimit429InOTELMirror())) {
       core.info("Detected engine HTTP 429/rate-limit signal — using dedicated context message");
       return buildEngineRateLimit429Context(engineLabel);
     }
@@ -1893,7 +1937,7 @@ function buildEngineFailureContext() {
         }
       }
 
-      let context = `\n**⚠️ Engine Failure**: The${engineLabel} engine terminated before producing output.\n\n**Error details:**\n`;
+      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n**Error details:**\n";
       for (const message of errorMessages) {
         context += `- ${message}\n`;
       }
@@ -1929,7 +1973,7 @@ function buildEngineFailureContext() {
         process.env.GH_AW_ENGINE_ID === "copilot"
           ? "If this failure recurs, check the GitHub Copilot status page and review the firewall audit logs.\n\n"
           : "If this failure recurs, check the provider status page (if available) and review the firewall audit logs.\n\n";
-      let context = `\n**⚠️ Engine Failure**: The${engineLabel} engine terminated before producing output.\n\n`;
+      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n";
       context += "The engine exited immediately without producing any output. This often indicates a transient infrastructure issue (e.g., service unavailable, API rate limiting). " + recurringFailureGuidance;
       return context;
     }
@@ -1937,7 +1981,7 @@ function buildEngineFailureContext() {
     const tailLines = agentLines.slice(-TAIL_LINES);
     core.info(`No specific error patterns found; including last ${tailLines.length} line(s) of agent-stdio.log as fallback`);
 
-    let context = `\n**⚠️ Engine Failure**: The${engineLabel} engine terminated unexpectedly.\n\n**Last agent output:**\n\`\`\`\n`;
+    let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated unexpectedly.`) + "\n**Last agent output:**\n\`\`\`\n";
     context += tailLines.join("\n");
     context += "\n```\n\n";
     return context;
@@ -2092,6 +2136,7 @@ async function findOrCreateDailyCapRollupIssue(owner, repo) {
       title: DAILY_CAP_ROLLUP_TITLE,
       body,
       labels: ["agentic-workflows", DAILY_CAP_ROLLUP_LABEL],
+      headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
     });
     core.info(`✓ Created daily cap rollup issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
     return { number: newIssue.data.number, html_url: newIssue.data.html_url };
@@ -2175,6 +2220,7 @@ async function detectAndHandleFailureCascade(owner, repo, triggeringIssueNumber)
         title: CASCADE_ROLLUP_TITLE,
         body: rollupBody,
         labels: ["agentic-workflows", CASCADE_ROLLUP_LABEL],
+        headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
       });
       core.info(`✓ Created cascade rollup issue #${newRollup.data.number}: ${newRollup.data.html_url}`);
     }
@@ -2223,8 +2269,7 @@ async function main() {
     const codePushFailureCount = process.env.GH_AW_CODE_PUSH_FAILURE_COUNT || "0";
     const checkoutPRSuccess = process.env.GH_AW_CHECKOUT_PR_SUCCESS || "";
     const timeoutMinutes = process.env.GH_AW_TIMEOUT_MINUTES || "";
-    const { effectiveTokens, maxEffectiveTokens, effectiveTokensRateLimitError } = resolveEffectiveTokensFailureState();
-    const { aiCredits, maxAICredits, aiCreditsRateLimitError } = resolveAICreditsFailureState();
+    const { aiCredits, maxAICredits, aiCreditsRateLimitError, maxAICreditsExceeded } = resolveAICreditsFailureState();
     const inferenceAccessError = process.env.GH_AW_INFERENCE_ACCESS_ERROR === "true";
     const mcpPolicyError = process.env.GH_AW_MCP_POLICY_ERROR === "true";
     const agenticEngineTimeout = process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT === "true";
@@ -2249,9 +2294,9 @@ async function main() {
     // stored in the compiled .lock.yml no longer matches the source .md file.
     // The agent is skipped in this case; the conclusion job runs to surface remediation guidance.
     const hasStaleLockFileFailed = process.env.GH_AW_STALE_LOCK_FILE_FAILED === "true";
-    const hasDailyEffectiveWorkflowExceeded = process.env.GH_AW_DAILY_EFFECTIVE_WORKFLOW_EXCEEDED === "true";
-    const dailyEffectiveWorkflowTotalEffectiveTokens = process.env.GH_AW_DAILY_EFFECTIVE_WORKFLOW_TOTAL_EFFECTIVE_TOKENS || "";
-    const dailyEffectiveWorkflowThreshold = process.env.GH_AW_DAILY_EFFECTIVE_WORKFLOW_THRESHOLD || "";
+    const hasDailyAICExceeded = process.env.GH_AW_DAILY_EFFECTIVE_WORKFLOW_EXCEEDED === "true";
+    const dailyAICTotal = process.env.GH_AW_DAILY_EFFECTIVE_WORKFLOW_TOTAL_EFFECTIVE_TOKENS || "";
+    const dailyAICThreshold = process.env.GH_AW_DAILY_EFFECTIVE_WORKFLOW_THRESHOLD || "";
     // Cache-memory availability flag — set when cache-memory is configured for the workflow.
     // Used to detect cache-miss misconfigurations reported by the agent.
     const cacheMemoryEnabled = process.env.GH_AW_CACHE_MEMORY_ENABLED === "true";
@@ -2286,10 +2331,11 @@ async function main() {
     core.info(`Create discussion error count: ${createDiscussionErrorCount}`);
     core.info(`Code push failure count: ${codePushFailureCount}`);
     core.info(`Checkout PR success: ${checkoutPRSuccess}`);
-    core.info(`Effective tokens: ${effectiveTokens || "(none)"}`);
-    core.info(`Configured max effective tokens: ${maxEffectiveTokens || "(none)"}`);
-    core.info(`Effective tokens rate-limit error: ${effectiveTokensRateLimitError}`);
-    core.info(`Daily workflow AIC guardrail exceeded: ${hasDailyEffectiveWorkflowExceeded}`);
+    core.info(`AI credits: ${aiCredits || "(none)"}`);
+    core.info(`Configured max AI credits: ${maxAICredits || "(none)"}`);
+    core.info(`AI credits rate-limit error: ${aiCreditsRateLimitError}`);
+    core.info(`Max AI credits exceeded (harness budget abort): ${maxAICreditsExceeded}`);
+    core.info(`Daily workflow AIC guardrail exceeded: ${hasDailyAICExceeded}`);
     core.info(`Inference access error: ${inferenceAccessError}`);
     core.info(`MCP policy error: ${mcpPolicyError}`);
     core.info(`Agentic engine timeout: ${agenticEngineTimeout}`);
@@ -2455,17 +2501,17 @@ async function main() {
       !hasAppTokenMintingFailed &&
       !hasLockdownCheckFailed &&
       !hasStaleLockFileFailed &&
-      !hasDailyEffectiveWorkflowExceeded &&
+      !hasDailyAICExceeded &&
       !hasReportIncomplete &&
       !hasCacheMissMisconfiguration &&
-      !effectiveTokensRateLimitError &&
       !aiCreditsRateLimitError &&
+      !maxAICreditsExceeded &&
       !hasMissingTool &&
       !hasMissingData &&
       !hasToolDenialsExceeded
     ) {
       core.info(
-        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/stale-lock-file/daily-workflow-et/ai-credits/report-incomplete/cache-miss/missing-tool/missing-data/tool-denials-exceeded errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
+        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/stale-lock-file/daily-workflow-aic/ai-credits/max-ai-credits-exceeded/report-incomplete/cache-miss/missing-tool/missing-data/tool-denials-exceeded errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
       );
       return;
     }
@@ -2567,12 +2613,12 @@ async function main() {
       inferenceAccessError,
       mcpPolicyError,
       modelNotSupportedError,
-      effectiveTokensRateLimitError,
       aiCreditsRateLimitError,
+      maxAICreditsExceeded,
       hasAppTokenMintingFailed,
       hasLockdownCheckFailed,
       hasStaleLockFileFailed,
-      hasDailyEffectiveWorkflowExceeded,
+      hasDailyAICExceeded,
     });
 
     core.info(`Checking for existing issue with precise failure metadata for title: "${issueTitle}"`);
@@ -2603,7 +2649,7 @@ async function main() {
         // Build assignment errors context
         let assignmentErrorsContext = "";
         if (hasAssignmentErrors && assignmentErrors) {
-          assignmentErrorsContext = "\n**⚠️ Agent Assignment Failed**: Failed to assign agent to issues due to insufficient permissions or missing token.\n\n**Assignment Errors:**\n";
+          assignmentErrorsContext = buildWarningAlertLine("Agent Assignment Failed", "Failed to assign agent to issues due to insufficient permissions or missing token.") + "\n**Assignment Errors:**\n";
           const errorLines = assignmentErrors.split("\n").filter(line => line.trim());
           for (const errorLine of errorLines) {
             const parts = errorLine.split(":");
@@ -2627,7 +2673,7 @@ async function main() {
         // Build repo-memory validation errors context
         let repoMemoryValidationContext = "";
         if (repoMemoryValidationErrors.length > 0) {
-          repoMemoryValidationContext = "\n**⚠️ Repo-Memory Validation Failed**: Invalid file types detected in repo-memory.";
+          repoMemoryValidationContext = buildWarningAlertLine("Repo-Memory Validation Failed", "Invalid file types detected in repo-memory.");
           if (pullRequest) {
             repoMemoryValidationContext += `\n\n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
           }
@@ -2644,20 +2690,22 @@ async function main() {
         // Build missing_data context (only when report-as-failure is enabled for this signal type)
         const missingDataContext = missingDataReportAsFailure ? buildMissingDataContext(cacheMemoryEnabled, agentOutputResult.items) : "";
 
-        // Build missing_tool context (only when report-as-failure is enabled for this signal type)
-        const missingToolContext = missingToolReportAsFailure ? buildMissingToolContext(agentOutputResult.items) : "";
-
-        // Build permission denied context (denied commands list + fix prompt)
-        const permissionDeniedContext = buildPermissionDeniedContext(agentOutputResult.items, workflowID);
         // Build tool-denials-exceeded guard context from events.jsonl
         const toolDenialsExceededContext = buildToolDenialsExceededContext(toolDenialsExceededEvents, workflowID);
+        // Build missing_tool context (only when report-as-failure is enabled for this signal type).
+        // Suppress when tool-denials-exceeded is present: excessive tool denials take precedence.
+        const missingToolContext = missingToolReportAsFailure && !hasToolDenialsExceeded ? buildMissingToolContext(agentOutputResult.items) : "";
+
+        // Build permission denied context (denied commands list + fix prompt).
+        // Suppress when tool-denials-exceeded is present: that context already covers the denied errors.
+        const permissionDeniedContext = hasToolDenialsExceeded ? "" : buildPermissionDeniedContext(agentOutputResult.items, workflowID);
         // Build report_incomplete context
         const reportIncompleteContext = buildReportIncompleteContext(agentOutputResult.items);
 
         // Build missing safe outputs context
         let missingSafeOutputsContext = "";
         if (hasMissingSafeOutputs) {
-          missingSafeOutputsContext = "\n**⚠️ No Safe Outputs Generated**: The agent job succeeded but did not produce any safe outputs.";
+          missingSafeOutputsContext = buildWarningAlertLine("No Safe Outputs Generated", "The agent job succeeded but did not produce any safe outputs.");
           if (pullRequest) {
             missingSafeOutputsContext += `\n\n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
           }
@@ -2670,8 +2718,11 @@ async function main() {
         // Build fork context hint
         const forkContext = buildForkContextHint();
 
-        // Build engine failure context (surfaces terminal errors from agent-stdio.log)
-        const engineFailureContext = agentConclusion === "failure" ? buildEngineFailureContext() : "";
+        // Build engine failure context (surfaces terminal errors from agent-stdio.log).
+        // Suppress when tool-denials-exceeded is present: the engine termination is a
+        // direct consequence of the SDK hitting the denial threshold, so the tool-denials
+        // context is the more actionable signal.
+        const engineFailureContext = agentConclusion === "failure" && !hasToolDenialsExceeded ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded }) : "";
 
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
@@ -2684,8 +2735,7 @@ async function main() {
 
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
-        const effectiveTokensRateLimitErrorContext = buildEffectiveTokensRateLimitErrorContext(effectiveTokensRateLimitError, effectiveTokens, maxEffectiveTokens, runUrl);
-        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError, aiCredits, maxAICredits, runUrl);
+        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl);
 
         // Build GitHub App token minting failure context
         const appTokenMintingFailedContext = buildAppTokenMintingFailedContext(hasAppTokenMintingFailed);
@@ -2695,7 +2745,7 @@ async function main() {
 
         // Build stale lock file failure context
         const staleLockFileFailedContext = buildStaleLockFileFailedContext(hasStaleLockFileFailed);
-        const dailyEffectiveWorkflowExceededContext = buildDailyEffectiveWorkflowExceededContext(hasDailyEffectiveWorkflowExceeded, dailyEffectiveWorkflowTotalEffectiveTokens, dailyEffectiveWorkflowThreshold);
+        const dailyAICExceededContext = buildDailyAICExceededContext(hasDailyAICExceeded, dailyAICTotal, dailyAICThreshold);
 
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
@@ -2713,7 +2763,8 @@ async function main() {
           secret_verification_failed: String(secretVerificationResult === "failed"),
           secret_verification_context:
             secretVerificationResult === "failed"
-              ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
+              ? buildWarningAlertLine("Secret Verification Failed", "The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.") +
+                "\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
           credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
@@ -2734,12 +2785,11 @@ async function main() {
           inference_access_error_context: inferenceAccessErrorContext,
           mcp_policy_error_context: mcpPolicyErrorContext,
           model_not_supported_error_context: modelNotSupportedErrorContext,
-          effective_tokens_rate_limit_error_context: effectiveTokensRateLimitErrorContext,
           ai_credits_rate_limit_error_context: aiCreditsRateLimitErrorContext,
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
           stale_lock_file_failed_context: staleLockFileFailedContext,
-          daily_effective_workflow_exceeded_context: dailyEffectiveWorkflowExceededContext,
+          daily_effective_workflow_exceeded_context: dailyAICExceededContext,
         };
 
         // Render the comment template
@@ -2822,7 +2872,7 @@ async function main() {
         // Build assignment errors context
         let assignmentErrorsContext = "";
         if (hasAssignmentErrors && assignmentErrors) {
-          assignmentErrorsContext = "\n**⚠️ Agent Assignment Failed**: Failed to assign agent to issues due to insufficient permissions or missing token.\n\n**Assignment Errors:**\n";
+          assignmentErrorsContext = buildWarningAlertLine("Agent Assignment Failed", "Failed to assign agent to issues due to insufficient permissions or missing token.") + "\n**Assignment Errors:**\n";
           const errorLines = assignmentErrors.split("\n").filter(line => line.trim());
           for (const errorLine of errorLines) {
             const parts = errorLine.split(":");
@@ -2846,7 +2896,7 @@ async function main() {
         // Build repo-memory validation errors context
         let repoMemoryValidationContext = "";
         if (repoMemoryValidationErrors.length > 0) {
-          repoMemoryValidationContext = "\n**⚠️ Repo-Memory Validation Failed**: Invalid file types detected in repo-memory.";
+          repoMemoryValidationContext = buildWarningAlertLine("Repo-Memory Validation Failed", "Invalid file types detected in repo-memory.");
           if (pullRequest) {
             repoMemoryValidationContext += `\n\n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
           }
@@ -2863,21 +2913,23 @@ async function main() {
         // Build missing_data context (only when report-as-failure is enabled for this signal type)
         const missingDataContext = missingDataReportAsFailure ? buildMissingDataContext(cacheMemoryEnabled, agentOutputResult.items) : "";
 
-        // Build missing_tool context (only when report-as-failure is enabled for this signal type)
-        const missingToolContext = missingToolReportAsFailure ? buildMissingToolContext(agentOutputResult.items) : "";
+        // Build tool-denials-exceeded guard context from events.jsonl
+        const toolDenialsExceededContext = buildToolDenialsExceededContext(toolDenialsExceededEvents, workflowID);
+        // Build missing_tool context (only when report-as-failure is enabled for this signal type).
+        // Suppress when tool-denials-exceeded is present: excessive tool denials take precedence.
+        const missingToolContext = missingToolReportAsFailure && !hasToolDenialsExceeded ? buildMissingToolContext(agentOutputResult.items) : "";
 
         // Build report_incomplete context
         const reportIncompleteContext = buildReportIncompleteContext(agentOutputResult.items);
 
-        // Build permission denied context (denied commands list + fix prompt)
-        const permissionDeniedContext = buildPermissionDeniedContext(agentOutputResult.items, workflowID);
-        // Build tool-denials-exceeded guard context from events.jsonl
-        const toolDenialsExceededContext = buildToolDenialsExceededContext(toolDenialsExceededEvents, workflowID);
+        // Build permission denied context (denied commands list + fix prompt).
+        // Suppress when tool-denials-exceeded is present: that context already covers the denied errors.
+        const permissionDeniedContext = hasToolDenialsExceeded ? "" : buildPermissionDeniedContext(agentOutputResult.items, workflowID);
 
         // Build missing safe outputs context
         let missingSafeOutputsContext = "";
         if (hasMissingSafeOutputs) {
-          missingSafeOutputsContext = "\n**⚠️ No Safe Outputs Generated**: The agent job succeeded but did not produce any safe outputs.";
+          missingSafeOutputsContext = buildWarningAlertLine("No Safe Outputs Generated", "The agent job succeeded but did not produce any safe outputs.");
           if (pullRequest) {
             missingSafeOutputsContext += `\n\n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})`;
           }
@@ -2890,8 +2942,11 @@ async function main() {
         // Build fork context hint
         const forkContext = buildForkContextHint();
 
-        // Build engine failure context (surfaces terminal errors from agent-stdio.log)
-        const engineFailureContext = agentConclusion === "failure" ? buildEngineFailureContext() : "";
+        // Build engine failure context (surfaces terminal errors from agent-stdio.log).
+        // Suppress when tool-denials-exceeded is present: the engine termination is a
+        // direct consequence of the SDK hitting the denial threshold, so the tool-denials
+        // context is the more actionable signal.
+        const engineFailureContext = agentConclusion === "failure" && !hasToolDenialsExceeded ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded }) : "";
 
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
@@ -2904,8 +2959,7 @@ async function main() {
 
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
-        const effectiveTokensRateLimitErrorContext = buildEffectiveTokensRateLimitErrorContext(effectiveTokensRateLimitError, effectiveTokens, maxEffectiveTokens, runUrl);
-        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError, aiCredits, maxAICredits, runUrl);
+        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl);
 
         // Build GitHub App token minting failure context
         const appTokenMintingFailedContext = buildAppTokenMintingFailedContext(hasAppTokenMintingFailed);
@@ -2915,7 +2969,7 @@ async function main() {
 
         // Build stale lock file failure context
         const staleLockFileFailedContext = buildStaleLockFileFailedContext(hasStaleLockFileFailed);
-        const dailyEffectiveWorkflowExceededContext = buildDailyEffectiveWorkflowExceededContext(hasDailyEffectiveWorkflowExceeded, dailyEffectiveWorkflowTotalEffectiveTokens, dailyEffectiveWorkflowThreshold);
+        const dailyAICExceededContext = buildDailyAICExceededContext(hasDailyAICExceeded, dailyAICTotal, dailyAICThreshold);
 
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
@@ -2934,7 +2988,8 @@ async function main() {
           secret_verification_failed: String(secretVerificationResult === "failed"),
           secret_verification_context:
             secretVerificationResult === "failed"
-              ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
+              ? buildWarningAlertLine("Secret Verification Failed", "The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.") +
+                "\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
           credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
@@ -2955,12 +3010,11 @@ async function main() {
           inference_access_error_context: inferenceAccessErrorContext,
           mcp_policy_error_context: mcpPolicyErrorContext,
           model_not_supported_error_context: modelNotSupportedErrorContext,
-          effective_tokens_rate_limit_error_context: effectiveTokensRateLimitErrorContext,
           ai_credits_rate_limit_error_context: aiCreditsRateLimitErrorContext,
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
           stale_lock_file_failed_context: staleLockFileFailedContext,
-          daily_effective_workflow_exceeded_context: dailyEffectiveWorkflowExceededContext,
+          daily_effective_workflow_exceeded_context: dailyAICExceededContext,
         };
 
         // Render the issue template
@@ -3002,6 +3056,7 @@ async function main() {
           title: issueTitle,
           body: issueBody,
           labels: ["agentic-workflows"],
+          headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
         });
 
         core.info(`✓ Created new issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
@@ -3036,7 +3091,7 @@ module.exports = {
   buildAppTokenMintingFailedContext,
   buildLockdownCheckFailedContext,
   buildStaleLockFileFailedContext,
-  buildDailyEffectiveWorkflowExceededContext,
+  buildDailyAICExceededContext,
   buildTimeoutContext,
   buildAssignCopilotFailureContext,
   buildEngineFailureContext,
@@ -3046,17 +3101,18 @@ module.exports = {
   buildMissingDataContext,
   buildMissingToolContext,
   buildPermissionDeniedContext,
+  normalizeDeniedPermissionCommand,
   loadToolDenialsExceededEvents,
   buildToolDenialsExceededContext,
   buildCredentialAuthErrorContext,
-  buildEffectiveTokensRateLimitErrorContext,
+  buildAICreditsRateLimitErrorContext,
   hasEngineRateLimit429Signal,
   hasEngineRateLimit429InOTELMirror,
   buildEngineRateLimit429Context,
   readTokenUsageMarkdown,
   parseFirewallAuthErrors,
-  parseMaxEffectiveTokensFromAuditLog,
-  parseEffectiveTokensErrorInfoFromAuditLog,
+  parseMaxAICreditsFromAuditLog,
+  parseAICreditsErrorInfoFromAuditLog,
   getActionFailureIssueExpiresHours,
   hasAgentTerminalReasonCompleted,
   detectAndHandleFailureCascade,
