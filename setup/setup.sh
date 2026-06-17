@@ -210,6 +210,7 @@ MCP_SCRIPTS_FILES=(
   "mcp_scripts_tool_factory.cjs"
   "mcp_scripts_validation.cjs"
   "mcp_server_core.cjs"
+  "mcp_dependencies_manager.cjs"
   "mcp_logger.cjs"
   "mcp_http_transport.cjs"
   "mcp_http_server_runner.cjs"
@@ -273,6 +274,7 @@ SAFE_OUTPUTS_FILES=(
   "allowed_extensions_helpers.cjs"
   "safe_outputs_append.cjs"
   "mcp_server_core.cjs"
+  "mcp_dependencies_manager.cjs"
   "mcp_logger.cjs"
   "mcp_http_transport.cjs"
   "mcp_http_server_runner.cjs"
@@ -393,6 +395,31 @@ fi
 if [ ! -f "${SAFE_OUTPUTS_DEST}/config.json" ]; then
   echo "{}" > "${SAFE_OUTPUTS_DEST}/config.json"
   debug_log "Created empty config.json for safe-outputs server"
+fi
+
+# Copy configure_git_credentials.sh to safeoutputs so the gh-aw-node container can run it
+# The container's entrypoint (start_safe_outputs_mcp.sh) calls this script to configure
+# git identity and safe.directory
+GIT_CREDENTIALS_SCRIPT="${SH_SOURCE_DIR}/configure_git_credentials.sh"
+if [ -f "${GIT_CREDENTIALS_SCRIPT}" ]; then
+  cp "${GIT_CREDENTIALS_SCRIPT}" "${SAFE_OUTPUTS_DEST}/configure_git_credentials.sh"
+  chmod +x "${SAFE_OUTPUTS_DEST}/configure_git_credentials.sh"
+  debug_log "Copied git credentials script to safe-outputs: configure_git_credentials.sh"
+else
+  echo "::error::configure_git_credentials.sh not found at ${GIT_CREDENTIALS_SCRIPT}"
+  exit 1
+fi
+
+# Copy start_safe_outputs_mcp.sh to safeoutputs so the gh-aw-node container entrypoint can run it
+# This script configures git (via configure_git_credentials.sh) and launches the MCP server
+START_SAFE_OUTPUTS_SCRIPT="${SH_SOURCE_DIR}/start_safe_outputs_mcp.sh"
+if [ -f "${START_SAFE_OUTPUTS_SCRIPT}" ]; then
+  cp "${START_SAFE_OUTPUTS_SCRIPT}" "${SAFE_OUTPUTS_DEST}/start_safe_outputs_mcp.sh"
+  chmod +x "${SAFE_OUTPUTS_DEST}/start_safe_outputs_mcp.sh"
+  debug_log "Copied safe-outputs entrypoint script: start_safe_outputs_mcp.sh"
+else
+  echo "::error::start_safe_outputs_mcp.sh not found at ${START_SAFE_OUTPUTS_SCRIPT}"
+  exit 1
 fi
 
 echo "Successfully copied ${SAFE_OUTPUTS_COUNT} safe-outputs files to ${SAFE_OUTPUTS_DEST}"
