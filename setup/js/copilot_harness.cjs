@@ -44,6 +44,7 @@ require("./shim.cjs");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { renderTemplateFromFile } = require("./messages_core.cjs");
 const { runProcess, formatDuration, sleep, isCopilotSDKEnabled, buildCopilotSDKEnv } = require("./process_runner.cjs");
 const { buildCopilotSDKServerArgs, getCopilotSDKServerPort, startCopilotSDKServer, stopCopilotSDKServer, waitForCopilotSDKServer } = require("./copilot_sdk_sidecar.cjs");
 const {
@@ -78,6 +79,9 @@ const MAX_SCHEDULED_EXIT2_RETRIES = 1;
 const PROMPT_FILE_INLINE_THRESHOLD_BYTES = 100 * 1024;
 const PROMPT_FILE_INLINE_THRESHOLD_LABEL = "100KB";
 const MAX_ENV_VAR_PREVIEW_LENGTH = 120;
+const OUTPUT_TAIL_MAX_CHARS = 600;
+const OUTPUT_TAIL_MAX_LINES = 12;
+const COPILOT_REQUESTS_PROXY_AUTH_403_TEMPLATE_PATH = path.join(__dirname, "../md/copilot_requests_proxy_auth_403.md");
 // Pattern to detect transient CAPIError 400 in copilot output
 const CAPI_ERROR_400_PATTERN = /CAPIError:\s*400/;
 
@@ -112,6 +116,13 @@ const AUTHENTICATION_FAILED_PATTERN = /Authentication failed(?:\s*\(Request ID:[
 const INFERENCE_ACCESS_ERROR_PATTERN = /Access denied by policy settings|invalid access to inference/;
 // Pattern: Agentic engine process killed by signal (timeout)
 const AGENTIC_ENGINE_TIMEOUT_PATTERN = /signal=SIG(?:TERM|KILL|INT)/;
+// Pattern: Copilot SDK driver timed out waiting for the session to become idle.
+const SDK_SESSION_IDLE_TIMEOUT_PATTERN = /Timeout after \d+ms waiting for session\.idle/;
+// Pattern: MCP gateway shutdown surfaced in agent output.
+// Anchored to the JSON "message" key emitted by the MCP gateway driver to
+// avoid false positives from any process that logs "Gateway shutdown initiated"
+// as plain text.
+const MCP_GATEWAY_SHUTDOWN_PATTERN = /"message"\s*:\s*"Gateway shutdown initiated"/;
 
 // Pattern to detect null-type tool_call error that poisons conversation history.
 // Matches the Copilot API 400 error:
@@ -261,6 +272,82 @@ function isAuthenticationFailedError(output) {
 }
 
 /**
+ * Determines if the collected output contains a Copilot SDK session.idle timeout.
+ * @param {string} output
+ * @returns {boolean}
+ */
+function isSDKSessionIdleTimeoutError(output) {
+  return SDK_SESSION_IDLE_TIMEOUT_PATTERN.test(output);
+}
+
+/**
+ * Determines if the collected output contains an MCP gateway shutdown message.
+ * @param {string} output
+ * @returns {boolean}
+ */
+function isMCPGatewayShutdownError(output) {
+  return MCP_GATEWAY_SHUTDOWN_PATTERN.test(output);
+}
+
+/**
+ * Extract a compact tail preview from combined process output for failure logs.
+ * @param {string} output
+ * @param {{ maxChars?: number, maxLines?: number }} [options]
+ * @returns {string}
+ */
+function extractOutputTail(output, options) {
+  if (typeof output !== "string" || !output) return "";
+  const maxChars = options?.maxChars ?? OUTPUT_TAIL_MAX_CHARS;
+  const maxLines = options?.maxLines ?? OUTPUT_TAIL_MAX_LINES;
+  const normalized = output.replace(/\0/g, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  if (!normalized) return "";
+  // filter(Boolean) removes empty strings from blank lines after trimEnd(); maxLines therefore counts non-empty lines.
+  const tailLines = normalized
+    .split("\n")
+    .map(line => line.trimEnd())
+    .filter(Boolean)
+    .slice(-maxLines);
+  if (tailLines.length === 0) return "";
+  let tail = tailLines.join("\n");
+  if (tail.length > maxChars) {
+    const keep = maxChars - 1;
+    tail = keep > 0 ? `…${tail.slice(-keep)}` : "…";
+  }
+  return tail;
+}
+
+/**
+ * Classify a failed Copilot attempt into a short, named failure class.
+ * @param {{
+ *   hasOutput: boolean,
+ *   isAuthErr?: boolean,
+ *   isAuthenticationFailed?: boolean,
+ *   isTransientCAPIError?: boolean,
+ *   isMCPGatewayShutdown?: boolean,
+ *   isMCPPolicy?: boolean,
+ *   isModelNotSupported?: boolean,
+ *   isNullTypeToolCall?: boolean,
+ *   isQuotaExceeded?: boolean,
+ *   isSDKSessionIdleTimeout?: boolean,
+ *   hasNumerousPermissionDenied?: boolean,
+ * }} detection
+ * @returns {string}
+ */
+function classifyCopilotFailure(detection) {
+  if (detection.isQuotaExceeded) return "capi_quota_exceeded";
+  if (detection.isMCPPolicy) return "mcp_policy_blocked";
+  if (detection.isModelNotSupported) return "model_not_supported";
+  if (detection.isNullTypeToolCall) return "null_type_tool_call";
+  if (detection.isAuthErr) return "no_auth_info";
+  if (detection.isAuthenticationFailed) return "authentication_failed";
+  if (detection.isSDKSessionIdleTimeout) return "sdk_session_idle_timeout";
+  if (detection.isMCPGatewayShutdown) return "mcp_gateway_shutdown";
+  if (detection.hasNumerousPermissionDenied) return "permission_denied";
+  if (detection.isTransientCAPIError) return "capi_error_400";
+  return detection.hasOutput ? "partial_execution" : "no_output";
+}
+
+/**
  * Extract provider auth failure details from Copilot output when available.
  * @param {string} output
  * @returns {{ providerUrl: string, statusCode: string } | null}
@@ -318,19 +405,40 @@ function detectCopilotAuthFailureStage(output) {
 }
 
 /**
- * Build a more actionable Copilot auth diagnostic when a 401 came from the gh-aw API proxy.
+ * @param {string | undefined} value
+ * @returns {boolean}
+ */
+function envFlagEnabled(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized === "true" || normalized === "1" || normalized === "yes";
+}
+
+/**
+ * Build a more actionable Copilot auth diagnostic when a 401/403 came from the gh-aw API proxy.
  * @param {string} output
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {string}
  */
 function buildCopilotProxyAuthFailureDiagnostic(output, env = process.env) {
   const authFailure = parseProviderAuthFailure(output);
-  if (!authFailure || authFailure.statusCode !== "401" || !isLikelyAWFAPIProxyURL(authFailure.providerUrl)) {
+  if (!authFailure || !isLikelyAWFAPIProxyURL(authFailure.providerUrl)) {
     return "";
   }
 
   const selectedModel = typeof env.COPILOT_MODEL === "string" && env.COPILOT_MODEL.trim() ? env.COPILOT_MODEL.trim() : "(unset)";
   const stage = detectCopilotAuthFailureStage(output);
+  if (authFailure.statusCode === "403" && envFlagEnabled(env.S2STOKENS)) {
+    return renderTemplateFromFile(COPILOT_REQUESTS_PROXY_AUTH_403_TEMPLATE_PATH, {
+      selected_model: selectedModel,
+      stage,
+    });
+  }
+  if (authFailure.statusCode !== "401") {
+    return "";
+  }
   return (
     `Copilot authentication failed through the gh-aw API proxy (HTTP 401, model=${selectedModel}, stage=${stage}). ` +
     "Check that COPILOT_GITHUB_TOKEN is present, unexpired, and authorized for the selected COPILOT_MODEL. " +
@@ -714,16 +822,35 @@ async function main() {
         const isAuthenticationFailed = isAuthenticationFailedError(result.output);
         const proxyAuthDiagnostic = buildCopilotProxyAuthFailureDiagnostic(result.output, process.env);
         const isNullTypeToolCall = isNullTypeToolCallError(result.output);
+        const isSDKSessionIdleTimeout = isSDKSessionIdleTimeoutError(result.output);
+        const isMCPGatewayShutdown = isMCPGatewayShutdownError(result.output);
         const permissionDeniedCount = countPermissionDeniedIssues(result.output);
         const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
+        const failureClass = classifyCopilotFailure({
+          hasOutput: result.hasOutput,
+          isAuthErr,
+          isAuthenticationFailed,
+          isTransientCAPIError: isCAPIError,
+          isMCPGatewayShutdown,
+          isMCPPolicy,
+          isModelNotSupported,
+          isNullTypeToolCall,
+          isQuotaExceeded,
+          isSDKSessionIdleTimeout,
+          hasNumerousPermissionDenied,
+        });
+        const outputTail = extractOutputTail(result.output);
         log(
           `attempt ${attempt + 1} failed:` +
             ` exitCode=${result.exitCode}` +
+            ` failureClass=${failureClass}` +
             ` isCAPIError400=${isCAPIError}` +
             ` isCAPIQuotaExceededError=${isQuotaExceeded}` +
             ` isMCPPolicyError=${isMCPPolicy}` +
             ` isModelNotSupportedError=${isModelNotSupported}` +
             ` isNullTypeToolCallError=${isNullTypeToolCall}` +
+            ` isSDKSessionIdleTimeoutError=${isSDKSessionIdleTimeout}` +
+            ` isMCPGatewayShutdownError=${isMCPGatewayShutdown}` +
             ` isAuthError=${isAuthErr}` +
             ` isAuthenticationFailedError=${isAuthenticationFailed}` +
             ` permissionDeniedCount=${permissionDeniedCount}` +
@@ -731,6 +858,9 @@ async function main() {
             ` hasOutput=${result.hasOutput}` +
             ` retriesRemaining=${MAX_RETRIES - attempt}`
         );
+        if (outputTail) {
+          log(`attempt ${attempt + 1}: outputTail=${JSON.stringify(outputTail)}`);
+        }
 
         // If a noop was written to safe-outputs during the failed run, the agent determined
         // there was nothing to do (or the user indicated so before the agent ran).  Retrying
@@ -898,6 +1028,7 @@ if (typeof module !== "undefined" && module.exports) {
     fetchAWFReflect,
     fetchModelsFromUrl,
     buildCopilotProxyAuthFailureDiagnostic,
+    envFlagEnabled,
     generateCopilotConnectionToken,
     buildCopilotSDKServerArgs,
     getCopilotSDKServerPort,
@@ -908,11 +1039,15 @@ if (typeof module !== "undefined" && module.exports) {
     resolveCopilotSDKCustomProviderFromReflect,
     countPermissionDeniedIssues,
     detectCopilotErrors,
+    classifyCopilotFailure,
+    extractOutputTail,
     hasNumerousPermissionDeniedIssues,
     INFERENCE_ACCESS_ERROR_PATTERN,
     AGENTIC_ENGINE_TIMEOUT_PATTERN,
     buildMissingToolPermissionIssuePayload,
     isAuthenticationFailedError,
+    isMCPGatewayShutdownError,
+    isSDKSessionIdleTimeoutError,
     startCopilotSDKServer,
     stopCopilotSDKServer,
     waitForCopilotSDKServer,
