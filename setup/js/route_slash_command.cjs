@@ -3,6 +3,7 @@
 // @safe-outputs-exempt SEC-004 — event body text is read only for slash-command parsing; outbound /help comments are built from internal metadata.
 
 const { REACTION_MAP } = require("./add_reaction.cjs");
+const { createOrReuseStatusComment } = require("./add_workflow_run_comment.cjs");
 const nodePath = require("node:path");
 const { matchesCommandName, parseSlashCommand } = require("./slash_command_matcher.cjs");
 // Keep this aligned with the current default stable GitHub REST API version used by workflows.
@@ -141,6 +142,10 @@ function normalizeReaction(reaction) {
   return trimmed;
 }
 
+function maintainsStatusComment(route) {
+  return route?.status_comment === true;
+}
+
 /**
  * Returns the first valid non-"none" ai_reaction configured on matching routes.
  * @param {Array<{ai_reaction?: unknown}>} routes
@@ -267,6 +272,26 @@ async function addImmediateReaction(reaction) {
     }
   } catch (error) {
     core.warning(`Immediate reaction '${normalized}' failed: ${String(error)}`);
+  }
+}
+
+async function addImmediateStatusComment() {
+  try {
+    const comment = await createOrReuseStatusComment({
+      ...context,
+      nonFatalStatusCommentErrors: true,
+    });
+    if (!comment?.id) {
+      return null;
+    }
+    return {
+      status_comment_id: String(comment.id),
+      ...(comment.url ? { status_comment_url: comment.url } : {}),
+      ...(comment.repo?.owner && comment.repo?.repo ? { status_comment_repo: `${comment.repo.owner}/${comment.repo.repo}` } : {}),
+    };
+  } catch (error) {
+    core.warning(`Immediate status comment failed: ${String(error)}`);
+    return null;
   }
 }
 
@@ -493,12 +518,12 @@ function isDisabledWorkflowDispatchError(error) {
 }
 
 /**
- * @param {Record<string, Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown}>>} slashRouteMap
+ * @param {Record<string, Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>>} slashRouteMap
  * @param {string} actualCommand
- * @returns {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown}>}
+ * @returns {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>}
  */
 function resolveMatchingSlashRoutes(slashRouteMap, actualCommand) {
-  /** @type {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown}>} */
+  /** @type {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>} */
   const matchedRoutes = [];
   const seen = new Set();
 
@@ -508,7 +533,9 @@ function resolveMatchingSlashRoutes(slashRouteMap, actualCommand) {
     }
 
     for (const route of configuredRoutes) {
-      const key = JSON.stringify([route?.workflow ?? "", route?.ai_reaction ?? "", Array.isArray(route?.events) ? route.events : []]);
+      // Keep the de-duplication key explicit so routes that differ only by
+      // status-comment behavior remain distinct dispatch targets.
+      const key = JSON.stringify([route?.workflow ?? "", route?.ai_reaction ?? "", route?.status_comment === true, Array.isArray(route?.events) ? route.events : []]);
       if (seen.has(key)) {
         continue;
       }
@@ -618,6 +645,11 @@ async function main() {
     core.info(`Adding immediate '${immediateReaction}' reaction for '/${commandName}'.`);
     await addImmediateReaction(immediateReaction);
   }
+  let statusCommentContext = null;
+  if (routes.some(maintainsStatusComment)) {
+    core.info(`Adding immediate status comment for '/${commandName}'.`);
+    statusCommentContext = await addImmediateStatusComment();
+  }
 
   core.info(`Dispatch ref resolved to '${ref}'.`);
   for (const route of routes) {
@@ -631,6 +663,7 @@ async function main() {
       ...buildAwContext(),
       command_name: commandName,
       ...(routeReaction ? { desired_ai_reaction: routeReaction } : {}),
+      ...(maintainsStatusComment(route) && statusCommentContext ? statusCommentContext : {}),
     };
     core.info(`Dispatching workflow '${workflowID}' for '/${commandName}'.`);
     const dispatched = await dispatchWorkflow(workflowID, ref, {
