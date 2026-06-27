@@ -58,7 +58,7 @@ const {
   fetchModelsFromUrl,
   resolveCopilotSDKCustomProviderFromReflect,
 } = require("./awf_reflect.cjs");
-const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
+const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
 const { detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
 const { isCAPIQuotaExceededError } = require("./detect_agent_errors.cjs");
@@ -448,6 +448,21 @@ function buildCopilotProxyAuthFailureDiagnostic(output, env = process.env, optio
 }
 
 /**
+ * Determine whether an authentication_failed error came from the gh-aw API proxy after
+ * partial execution, making a one-time fresh-run retry worthwhile.
+ * @param {string} output
+ * @param {boolean} hasOutput
+ * @returns {boolean}
+ */
+function isRetryableProxyAuthenticationFailure(output, hasOutput) {
+  if (!hasOutput || !isAuthenticationFailedError(output)) {
+    return false;
+  }
+  const authFailure = parseProviderAuthFailure(output);
+  return Boolean(authFailure && isLikelyAWFAPIProxyURL(authFailure.providerUrl));
+}
+
+/**
  * Detect known Copilot error patterns for workflow outputs.
  * @param {string} output
  * @returns {{ inferenceAccessError: boolean, mcpPolicyError: boolean, agenticEngineTimeout: boolean, modelNotSupportedError: boolean }}
@@ -823,6 +838,7 @@ async function main() {
         const isAuthErr = isNoAuthInfoError(result.output);
         const isAuthenticationFailed = isAuthenticationFailedError(result.output);
         const proxyAuthDiagnostic = buildCopilotProxyAuthFailureDiagnostic(result.output, process.env);
+        const retryableProxyAuthenticationFailure = isRetryableProxyAuthenticationFailure(result.output, result.hasOutput);
         const isNullTypeToolCall = isNullTypeToolCallError(result.output);
         const isSDKSessionIdleTimeout = isSDKSessionIdleTimeoutError(result.output);
         const isMCPGatewayShutdown = isMCPGatewayShutdownError(result.output);
@@ -882,16 +898,32 @@ async function main() {
           break;
         }
 
-        if (attempt === 0 && isAuthenticationFailed) {
+        // attempt === 0 makes this a one-time fresh-run recovery path.
+        if (attempt === 0 && retryableProxyAuthenticationFailure) {
+          useContinueOnRetry = false;
+          continueDisabledPermanently = true;
+          log(`attempt ${attempt + 1}: provider authentication failed after partial execution - will retry once as fresh run to avoid losing completed agent work`);
+          continue;
+        }
+
+        if (isAuthenticationFailed) {
           if (proxyAuthDiagnostic) {
-            log(`attempt ${attempt + 1}: ${proxyAuthDiagnostic} — not retrying (first-attempt auth failure is non-retryable)`);
+            log(`attempt ${attempt + 1}: ${proxyAuthDiagnostic} — not retrying`);
           } else {
-            log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
+            log(`attempt ${attempt + 1}: authentication failed — not retrying`);
           }
           break;
         }
 
         if (hasNumerousPermissionDenied) {
+          // If the agent already produced expected safe-outputs, the permission-denied
+          // signals are from optional/exploratory commands — not from the core task work.
+          // Suppress the terminal verdict and exit 0 to avoid a false-red run.
+          if (safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
+            log(`attempt ${attempt + 1}: detected numerous permission-denied issues but safe-outputs already contain expected output — suppressing terminal verdict (false-red: core work succeeded)`);
+            lastExitCode = 0;
+            break;
+          }
           const deniedCommands = extractDeniedCommands(result.output);
           emitMissingToolPermissionIssue({ deniedCommands, logger: log });
           log(`attempt ${attempt + 1}: detected numerous permission-denied issues — not retrying (classified as missing tool/permission issue)`);
@@ -1035,6 +1067,7 @@ if (typeof module !== "undefined" && module.exports) {
     buildCopilotSDKServerArgs,
     getCopilotSDKServerPort,
     hasNoopInSafeOutputs,
+    hasExpectedSafeOutputs,
     isDetectionPhase,
     isModelAvailableInReflectData,
     isModelAvailableInReflectFile,
@@ -1043,6 +1076,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectCopilotErrors,
     classifyCopilotFailure,
     extractOutputTail,
+    isRetryableProxyAuthenticationFailure,
     hasNumerousPermissionDeniedIssues,
     INFERENCE_ACCESS_ERROR_PATTERN,
     AGENTIC_ENGINE_TIMEOUT_PATTERN,
