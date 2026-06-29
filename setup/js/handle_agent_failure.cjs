@@ -14,6 +14,7 @@ const { AWF_INFRA_LINE_RE } = require("./log_parser_shared.cjs");
 const { resolveFirewallAuditLogPath, resolveAICreditsFailureState, parseMaxAICreditsFromAuditLog, parseAICreditsErrorInfoFromAuditLog, parseUnknownModelAICreditsFromAuditLog } = require("./ai_credits_context.cjs");
 const { formatAICCredits } = require("./daily_aic_workflow_helpers.cjs");
 const { formatAIC } = require("./model_costs.cjs");
+const { parseBoolTemplatable } = require("./templatable.cjs");
 const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp_gateway_log.cjs");
 const { readDedupedTokenUsage, TOKEN_USAGE_PATHS } = require("./parse_token_usage.cjs");
 const { extractShellCommandFromToolData } = require("./tool_call_details.cjs");
@@ -210,6 +211,7 @@ function buildFailureMatchCategories(options) {
   if (options.inferenceAccessError) categories.push("inference_access_error");
   if (options.mcpPolicyError) categories.push("mcp_policy_error");
   if (options.modelNotSupportedError) categories.push("model_not_supported_error");
+  if (options.http400ResponseError) categories.push("http_400_response_error");
   if (options.aiCreditsRateLimitError) categories.push("ai_credits_rate_limit_error");
   if (options.unknownModelAICredits) categories.push("unknown_model_ai_credits");
   if (options.maxAICreditsExceeded) categories.push("max_ai_credits_exceeded");
@@ -245,6 +247,7 @@ function buildFailureMatchCategories(options) {
  * @param {boolean} options.aiCreditsRateLimitError
  * @param {boolean} options.maxAICreditsExceeded
  * @param {boolean} options.hasAssignmentErrors
+ * @param {boolean} options.http400ResponseError
  * @returns {string}
  */
 function buildFailureIssueTitle(options) {
@@ -252,6 +255,9 @@ function buildFailureIssueTitle(options) {
   if (options.hasDailyAICExceeded) return `[aw] ${workflowName} exceeded daily AI credits budget`;
   if (options.maxAICreditsExceeded) return `[aw] ${workflowName} exceeded max AI credits`;
   if (options.aiCreditsRateLimitError) return `[aw] ${workflowName} hit AI credits rate limit`;
+  // Keep HTTP 400 below AI-credits signals: quota/rate-limit indicates an account-level
+  // budget state that should take precedence when both classes are detected.
+  if (options.http400ResponseError) return `[aw] ${workflowName} hit HTTP 400 bad request`;
   if (options.hasAppTokenMintingFailed) return `[aw] ${workflowName} failed to mint GitHub App token`;
   if (options.hasLockdownCheckFailed) return `[aw] ${workflowName} failed lockdown check`;
   if (options.hasStaleLockFileFailed) return `[aw] ${workflowName} has stale lock file`;
@@ -1591,6 +1597,19 @@ function buildModelNotSupportedErrorContext(hasModelNotSupportedError) {
 }
 
 /**
+ * Build a context string when the agentic engine returned a generic HTTP 400 Bad Request response.
+ * @param {boolean} hasHTTP400ResponseError - Whether a generic HTTP 400 response error was detected
+ * @returns {string} Formatted context string, or empty string if no error
+ */
+function buildHTTP400ResponseErrorContext(hasHTTP400ResponseError) {
+  if (!hasHTTP400ResponseError) {
+    return "";
+  }
+
+  return "\n" + renderPromptTemplate("http_400_response_error.md");
+}
+
+/**
  * Builds the unknown_model_ai_credits failure context block for templates.
  * @param {boolean} hasUnknownModelAICreditsError
  * @returns {string}
@@ -2688,11 +2707,12 @@ async function main() {
     const mcpPolicyError = process.env.GH_AW_MCP_POLICY_ERROR === "true";
     const agenticEngineTimeout = process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT === "true";
     const modelNotSupportedError = process.env.GH_AW_MODEL_NOT_SUPPORTED_ERROR === "true";
+    const http400ResponseError = process.env.GH_AW_HTTP_400_RESPONSE_ERROR === "true";
     const unknownModelAICreditsFromOutput = process.env.GH_AW_UNKNOWN_MODEL_AI_CREDITS === "true";
     const unknownModelAICreditsFromAudit = parseUnknownModelAICreditsFromAuditLog();
     const unknownModelAICredits = unknownModelAICreditsFromAudit || (unknownModelAICreditsFromOutput && agentConclusion === "failure");
     const pushRepoMemoryResult = process.env.GH_AW_PUSH_REPO_MEMORY_RESULT || "";
-    const reportFailureAsIssue = process.env.GH_AW_FAILURE_REPORT_AS_ISSUE !== "false"; // Default to true
+    const reportFailureAsIssue = parseBoolTemplatable(process.env.GH_AW_FAILURE_REPORT_AS_ISSUE, true);
     // Parse included categories filter for report-failure-as-issue (optional JSON array of category strings)
     const failureCategoriesFilterRaw = process.env.GH_AW_FAILURE_CATEGORIES_FILTER || "";
     let failureCategoriesFilter = null;
@@ -2792,6 +2812,7 @@ async function main() {
     core.info(`MCP policy error: ${mcpPolicyError}`);
     core.info(`Agentic engine timeout: ${agenticEngineTimeout}`);
     core.info(`Model not supported error: ${modelNotSupportedError}`);
+    core.info(`HTTP 400 response error: ${http400ResponseError}`);
     core.info(`Unknown model AI credits error: ${unknownModelAICredits}`);
     core.info(`Unknown model AI credits sources (audit/output): ${unknownModelAICreditsFromAudit}/${unknownModelAICreditsFromOutput}`);
     core.info(`Push repo-memory result: ${pushRepoMemoryResult}`);
@@ -3068,6 +3089,7 @@ async function main() {
       aiCreditsRateLimitError,
       maxAICreditsExceeded,
       hasAssignmentErrors,
+      http400ResponseError,
     });
     const failureCategories = buildFailureMatchCategories({
       agentConclusion,
@@ -3088,6 +3110,7 @@ async function main() {
       inferenceAccessError,
       mcpPolicyError,
       modelNotSupportedError,
+      http400ResponseError,
       aiCreditsRateLimitError,
       unknownModelAICredits,
       maxAICreditsExceeded,
@@ -3249,6 +3272,7 @@ async function main() {
 
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
+        const http400ResponseErrorContext = buildHTTP400ResponseErrorContext(http400ResponseError);
         const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl);
         const unknownModelAICreditsContext = buildUnknownModelAICreditsContext(unknownModelAICredits);
 
@@ -3296,6 +3320,7 @@ async function main() {
           inference_access_error_context: inferenceAccessErrorContext,
           mcp_policy_error_context: mcpPolicyErrorContext,
           model_not_supported_error_context: modelNotSupportedErrorContext,
+          http_400_response_error_context: http400ResponseErrorContext,
           ai_credits_rate_limit_error_context: aiCreditsRateLimitErrorContext,
           unknown_model_ai_credits_context: unknownModelAICreditsContext,
           app_token_minting_failed_context: appTokenMintingFailedContext,
@@ -3458,6 +3483,7 @@ async function main() {
 
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
+        const http400ResponseErrorContext = buildHTTP400ResponseErrorContext(http400ResponseError);
         const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl);
         const unknownModelAICreditsContext = buildUnknownModelAICreditsContext(unknownModelAICredits);
 
@@ -3509,6 +3535,7 @@ async function main() {
           inference_access_error_context: inferenceAccessErrorContext,
           mcp_policy_error_context: mcpPolicyErrorContext,
           model_not_supported_error_context: modelNotSupportedErrorContext,
+          http_400_response_error_context: http400ResponseErrorContext,
           ai_credits_rate_limit_error_context: aiCreditsRateLimitErrorContext,
           unknown_model_ai_credits_context: unknownModelAICreditsContext,
           app_token_minting_failed_context: appTokenMintingFailedContext,
@@ -3609,6 +3636,7 @@ module.exports = {
   buildReportIncompleteContext,
   buildMCPPolicyErrorContext,
   buildModelNotSupportedErrorContext,
+  buildHTTP400ResponseErrorContext,
   buildMissingDataContext,
   resolveCacheMemoryRestored,
   buildMissingToolContext,
