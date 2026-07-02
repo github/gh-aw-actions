@@ -22,33 +22,35 @@ function parseSkillSpecs(rawSkills) {
 /**
  * @param {string} skillSpec
  * @param {string} skillsDst
+ * @param {string} skillInstallAgent
  * @returns {SkillInstallCommand}
  */
-function buildSkillInstallCommand(skillSpec, skillsDst) {
+function buildSkillInstallCommand(skillSpec, skillsDst, skillInstallAgent = "") {
   const atIndex = skillSpec.lastIndexOf("@");
   const hasPin = atIndex >= 0;
   const skillBase = hasPin ? skillSpec.slice(0, atIndex) : skillSpec;
   const skillRef = hasPin ? skillSpec.slice(atIndex + 1) : "";
   const parts = skillBase.split("/");
   const pinArgs = skillRef ? ["--pin", skillRef] : [];
+  const agentArgs = skillInstallAgent ? ["--agent", skillInstallAgent] : [];
 
   if (parts.length >= 3) {
     return {
       displaySpec: skillSpec,
-      args: ["skill", "install", `${parts[0]}/${parts[1]}`, parts.slice(2).join("/"), ...pinArgs, "--dir", skillsDst, "--force"],
+      args: ["skill", "install", `${parts[0]}/${parts[1]}`, parts.slice(2).join("/"), ...pinArgs, ...agentArgs, "--dir", skillsDst, "--force"],
     };
   }
 
   if (parts.length === 2) {
     return {
       displaySpec: skillSpec,
-      args: ["skill", "install", skillBase, "--all", ...pinArgs, "--dir", skillsDst, "--force"],
+      args: ["skill", "install", skillBase, "--all", ...pinArgs, ...agentArgs, "--dir", skillsDst, "--force"],
     };
   }
 
   return {
     displaySpec: skillSpec,
-    args: ["skill", "install", skillSpec, "--dir", skillsDst, "--force"],
+    args: ["skill", "install", skillSpec, ...agentArgs, "--dir", skillsDst, "--force"],
   };
 }
 
@@ -83,40 +85,96 @@ function countInstalledSkillFiles(skillsDst) {
   return count;
 }
 
+/** Path to the shared skill install failures JSON file within the activation job's runner. */
+const SKILL_FAILURES_FILE = "/tmp/gh-aw/skill_install_failures.json";
+
+/**
+ * Append a skill install failure record to the shared failures file.
+ * All install steps within the same activation job share the same runner,
+ * so this file persists across steps and is read by the collect step.
+ * @param {string} skillSpec
+ * @param {string} errorMessage
+ */
+function appendSkillInstallFailure(skillSpec, errorMessage) {
+  let failures = [];
+  try {
+    if (fs.existsSync(SKILL_FAILURES_FILE)) {
+      const raw = fs.readFileSync(SKILL_FAILURES_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      failures = Array.isArray(parsed) ? parsed.filter(entry => entry && typeof entry.skill === "string" && typeof entry.error === "string") : [];
+    }
+  } catch (parseErr) {
+    // If reading/parsing fails, start fresh and warn so the issue is visible in logs
+    core.warning(`Could not read skill install failures file, starting fresh: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
+    failures = [];
+  }
+  failures.push({ skill: skillSpec, error: errorMessage });
+  try {
+    fs.mkdirSync(path.dirname(SKILL_FAILURES_FILE), { recursive: true });
+    fs.writeFileSync(SKILL_FAILURES_FILE, JSON.stringify(failures, null, 2), "utf8");
+  } catch (writeErr) {
+    core.warning(`Could not write skill install failures file: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+  }
+}
+
 /**
  * @param {string} skillDir
  * @param {string[]} skills
  * @param {number} installedSkillCount
+ * @param {Array<{skill: string; error: string}>} failures
  * @returns {Promise<void>}
  */
-async function writeSkillSummary(skillDir, skills, installedSkillCount) {
+async function writeSkillSummary(skillDir, skills, installedSkillCount, failures) {
   core.summary
     .addRaw("### Frontmatter skills installed\n\n")
     .addRaw(`- Engine skill directory: \`${skillDir}\`\n`)
     .addRaw(`- Requested references: \`${JSON.stringify(skills)}\`\n`)
     .addRaw(`- Installed SKILL.md files: ${installedSkillCount}\n`);
+  if (failures.length > 0) {
+    core.summary.addRaw("\n#### ⚠️ Skill install failures\n\n");
+    for (const f of failures) {
+      core.summary.addRaw(`- \`${f.skill}\`: ${f.error}\n`);
+    }
+  }
   await core.summary.write();
 }
 
 async function main() {
   const skillDir = process.env.GH_AW_SKILL_DIR || "";
+  const skillInstallAgent = process.env.GH_AW_GH_SKILL_AGENT_NAME || "";
   const skills = parseSkillSpecs(process.env.GH_AW_FRONTMATTER_SKILLS || "");
   const skillsDst = path.join("/tmp/gh-aw", skillDir);
 
   fs.mkdirSync(skillsDst, { recursive: true });
 
   core.info(`Installing frontmatter skills to ${skillsDst}`);
+  if (skillInstallAgent) {
+    core.info(`Installing frontmatter skills for gh skill agent ${skillInstallAgent}`);
+  }
   core.info("Existing skills at destination may be replaced (--force) to ensure pinned refs are up to date");
+
+  /** @type {Array<{skill: string; error: string}>} */
+  const failures = [];
 
   for (const skillSpec of skills) {
     core.info(`Installing skill reference: ${skillSpec}`);
-    const command = buildSkillInstallCommand(skillSpec, skillsDst);
-    await exec.exec("gh", command.args);
+    const command = buildSkillInstallCommand(skillSpec, skillsDst, skillInstallAgent);
+    try {
+      await exec.exec("gh", command.args);
+    } catch (err) {
+      const errorMessage = (err instanceof Error ? err.message : String(err)).replace(/\r?\n/g, " ");
+      core.warning(`Failed to install skill '${skillSpec}': ${errorMessage}`);
+      failures.push({ skill: skillSpec, error: errorMessage });
+      appendSkillInstallFailure(skillSpec, errorMessage);
+    }
   }
 
   const installedSkillCount = countInstalledSkillFiles(skillsDst);
   core.info(`Installed ${installedSkillCount} skill file(s)`);
-  await writeSkillSummary(skillDir, skills, installedSkillCount);
+  if (failures.length > 0) {
+    core.warning(`${failures.length} skill(s) failed to install — details will be reported in the agent failure issue/comment`);
+  }
+  await writeSkillSummary(skillDir, skills, installedSkillCount, failures);
 }
 
-module.exports = { main, parseSkillSpecs, buildSkillInstallCommand, countInstalledSkillFiles };
+module.exports = { main, parseSkillSpecs, buildSkillInstallCommand, countInstalledSkillFiles, appendSkillInstallFailure };

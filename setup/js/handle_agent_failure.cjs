@@ -4,7 +4,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getDetectionCautionAlert, getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateXMLMarker } = require("./messages.cjs");
-const { renderTemplate, renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
+const { renderTemplate, renderTemplateFromFile, getPromptPath, renderFilesList } = require("./messages_core.cjs");
 const { getCurrentBranch } = require("./get_current_branch.cjs");
 const { createExpirationLine, extractExpirationDate, generateFooterWithExpiration } = require("./ephemerals.cjs");
 const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
@@ -42,6 +42,7 @@ const ELLIPSIS_LENGTH = ELLIPSIS.length;
 const ENGINE_RATE_LIMIT_429_RE =
   /(?:\b429\b[\s\S]{0,120}(?:too many requests|rate[\s-]*limit)|\brate_limit_(?:error|exceeded)\b|capierror:\s*429|failed to get response from the ai model[\s\S]{0,120}\b429\b|exceeded your rate limit for utility models)/i;
 const ENGINE_MAX_RUNS_EXCEEDED_RE = /(?:\bmax_runs_exceeded\b|\bmaximum\s+llm\s+invocations\s+exceeded\b)/i;
+const ALLOWED_FILES_ERROR_RE = /^(?<summary>.*outside the allowed-files list) \((?<files>.+?)\)\. (?<remediation>Add the files to the allowed-files configuration field or remove them from the (?:patch|bundle)\.)$/;
 
 /**
  * Parse action failure issue expiration from environment.
@@ -75,6 +76,35 @@ function extractRunId(runUrl) {
  */
 function buildWarningAlertLine(title, message) {
   return `\n> [!WARNING]\n> **${title}**: ${message}\n`;
+}
+
+/**
+ * Render an allowed-files error using progressive disclosure for the file list.
+ * @param {string} type
+ * @param {string} error
+ * @returns {string|null}
+ */
+function renderAllowedFilesError(type, error) {
+  const match = error.match(ALLOWED_FILES_ERROR_RE);
+  if (!match?.groups) {
+    return null;
+  }
+
+  const summary = match.groups.summary;
+  const files = match.groups.files.split(",").map(file => file.trim());
+  const remediation = match.groups.remediation;
+  const fileCount = files.length;
+  const fileWord = fileCount === 1 ? "file" : "files";
+
+  return `- \`${type}\`: ${summary}. ${remediation}
+
+<details>
+<summary>Show ${fileCount} blocked ${fileWord}</summary>
+
+${renderFilesList(files)}
+
+</details>
+`;
 }
 
 /**
@@ -197,6 +227,7 @@ function buildFailureMatchCategories(options) {
   if (options.isTimedOut) categories.push("timed_out");
   if (options.hasAssignmentErrors) categories.push("assignment_errors");
   if (options.hasAssignCopilotFailures) categories.push("assign_copilot_failures");
+  if (options.hasSkillInstallFailures) categories.push("skill_install_failures");
   if (options.hasCreateDiscussionErrors) categories.push("create_discussion_errors");
   if (options.hasCodePushFailures) categories.push("code_push_failures");
   if (options.hasRepoMemoryValidationErrors) categories.push("repo_memory_validation_errors");
@@ -946,7 +977,7 @@ gh pr create --head aw/manual-apply
     }
     context += "\n**Code Push Errors:**\n";
     for (const { type, error } of otherErrors) {
-      context += `- \`${type}\`: ${error}\n`;
+      context += renderAllowedFilesError(type, error) || `- \`${type}\`: ${error}\n`;
     }
     context += "\n";
   } else if (manifestErrors.length > 0 || patchSizeErrors.length > 0 || patchApplyErrors.length > 0) {
@@ -2116,7 +2147,44 @@ function buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilo
 }
 
 /**
- * Build the secret verification failure context for the agent failure issue/comment.
+ * Build a context string when frontmatter skill installation failed.
+ * @param {boolean} hasSkillInstallFailures - Whether any skill installs failed
+ * @param {string} skillInstallErrors - Newline-separated list of "skill<TAB>error" entries
+ * @returns {string} Formatted context string, or empty string if no failures
+ */
+function buildSkillInstallFailureContext(hasSkillInstallFailures, skillInstallErrors) {
+  if (!hasSkillInstallFailures) {
+    return "";
+  }
+
+  let skillList = "";
+  if (skillInstallErrors) {
+    const errorLines = skillInstallErrors.split("\n").filter(line => line.trim());
+    for (const errorLine of errorLines) {
+      // New format uses tab delimiter; keep colon parsing as a backward-compatible fallback.
+      const tabIdx = errorLine.indexOf("\t");
+      if (tabIdx >= 0) {
+        const skill = errorLine.slice(0, tabIdx);
+        const error = errorLine.slice(tabIdx + 1);
+        skillList += `- \`${skill}\`: ${error}\n`;
+        continue;
+      }
+      const colonIdx = errorLine.indexOf(":");
+      if (colonIdx >= 0) {
+        const skill = errorLine.slice(0, colonIdx);
+        const error = errorLine.slice(colonIdx + 1);
+        skillList += `- \`${skill}\`: ${error}\n`;
+      } else {
+        skillList += `- ${errorLine}\n`;
+      }
+    }
+  }
+
+  const templatePath = getPromptPath("skill_install_failure.md");
+  return "\n" + renderTemplateFromFile(templatePath, { skills: skillList });
+}
+
+/**
  * For the Copilot engine, adds a suggestion to use `permissions.copilot-requests: write`
  * to enable Copilot inference through the org without a personal access token.
  * @param {string} secretVerificationResult - The secret verification result ("failed" or other)
@@ -2696,6 +2764,8 @@ async function main() {
     const assignmentErrorCount = process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0";
     const assignCopilotErrors = process.env.GH_AW_ASSIGN_COPILOT_ERRORS || "";
     const assignCopilotFailureCount = process.env.GH_AW_ASSIGN_COPILOT_FAILURE_COUNT || "0";
+    const skillInstallErrors = process.env.GH_AW_SKILL_INSTALL_ERRORS || "";
+    const skillInstallFailureCount = process.env.GH_AW_SKILL_INSTALL_FAILURE_COUNT || "0";
     const createDiscussionErrors = process.env.GH_AW_CREATE_DISCUSSION_ERRORS || "";
     const createDiscussionErrorCount = process.env.GH_AW_CREATE_DISCUSSION_ERROR_COUNT || "0";
     const codePushFailureErrors = process.env.GH_AW_CODE_PUSH_FAILURE_ERRORS || "";
@@ -2800,6 +2870,7 @@ async function main() {
     core.info(`Secret verification result: ${secretVerificationResult}`);
     core.info(`Assignment error count: ${assignmentErrorCount}`);
     core.info(`Assign copilot failure count: ${assignCopilotFailureCount}`);
+    core.info(`Skill install failure count: ${skillInstallFailureCount}`);
     core.info(`Create discussion error count: ${createDiscussionErrorCount}`);
     core.info(`Code push failure count: ${codePushFailureCount}`);
     core.info(`Checkout PR success: ${checkoutPRSuccess}`);
@@ -2838,6 +2909,9 @@ async function main() {
 
     // Check if there are copilot assignment failures for created issues (regardless of agent job status)
     const hasAssignCopilotFailures = parseInt(assignCopilotFailureCount, 10) > 0;
+
+    // Check if any frontmatter skill installs failed (regardless of agent job status)
+    const hasSkillInstallFailures = parseInt(skillInstallFailureCount, 10) > 0;
 
     // Check if there are create_discussion errors (regardless of agent job status)
     const hasCreateDiscussionErrors = parseInt(createDiscussionErrorCount, 10) > 0;
@@ -2974,6 +3048,7 @@ async function main() {
       !isTimedOut &&
       !hasAssignmentErrors &&
       !hasAssignCopilotFailures &&
+      !hasSkillInstallFailures &&
       !hasCreateDiscussionErrors &&
       !hasCodePushFailures &&
       !hasPushRepoMemoryFailure &&
@@ -3096,6 +3171,7 @@ async function main() {
       isTimedOut,
       hasAssignmentErrors,
       hasAssignCopilotFailures,
+      hasSkillInstallFailures,
       hasCreateDiscussionErrors,
       hasCodePushFailures,
       hasRepoMemoryValidationErrors: repoMemoryValidationErrors.length > 0,
@@ -3289,6 +3365,9 @@ async function main() {
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
 
+        // Build skill install failure context
+        const skillInstallFailureContext = buildSkillInstallFailureContext(hasSkillInstallFailures, skillInstallErrors);
+
         // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
         const credentialAuthErrorContext = buildCredentialAuthErrorContext();
 
@@ -3304,6 +3383,7 @@ async function main() {
           credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
+          skill_install_failure_context: skillInstallFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
           code_push_failure_context: codePushFailureContext,
           repo_memory_validation_context: repoMemoryValidationContext,
@@ -3500,6 +3580,9 @@ async function main() {
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
 
+        // Build skill install failure context
+        const skillInstallFailureContext = buildSkillInstallFailureContext(hasSkillInstallFailures, skillInstallErrors);
+
         // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
         const credentialAuthErrorContext = buildCredentialAuthErrorContext();
 
@@ -3519,6 +3602,7 @@ async function main() {
           credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
+          skill_install_failure_context: skillInstallFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
           code_push_failure_context: codePushFailureContext,
           repo_memory_validation_context: repoMemoryValidationContext,
