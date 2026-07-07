@@ -63,7 +63,7 @@ async function main() {
 
     // Generate step summary
     const summary = generateMCPScriptsSummary(allLogEntries);
-    core.summary.addRaw(summary).write();
+    await core.summary.addRaw(summary).write();
   } catch (error) {
     core.setFailed(`${ERR_PARSE}: ${getErrorMessage(error)}`);
   }
@@ -412,5 +412,8 @@ if (typeof module !== "undefined" && module.exports) {
 
 // Run main if called directly
 if (require.main === module) {
-  main();
+  main().catch(err => {
+    console.error(err && err.stack ? err.stack : String(err));
+    process.exitCode = 1;
+  });
 }

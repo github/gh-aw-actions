@@ -5,6 +5,7 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { unfenceMarkdown } = require("./markdown_unfencing.cjs");
 const { ERR_PARSE } = require("./error_codes.cjs");
 const createLogParserFormatters = require("./log_parser_format.cjs");
+const { buildStepSummaryDetailsSection } = require("./log_parser_step_summary_builder.cjs");
 
 /**
  * Shared utility functions for log parsers
@@ -42,7 +43,7 @@ const MAX_AGENT_TEXT_LENGTH = 2000;
  * This message is added directly to markdown (not tracked) to ensure it's always visible.
  * The message is small (~70 bytes) and won't cause practical issues with the 8MB limit.
  */
-const SIZE_LIMIT_WARNING = "\n\n⚠️ *Step summary size limit reached. Additional content truncated.*\n\n";
+const SIZE_LIMIT_WARNING = "\n\n*Step summary size limit reached. Additional content truncated.*\n\n";
 
 /**
  * Matches AWF infrastructure lines written by the firewall/container wrapper.
@@ -116,6 +117,14 @@ class StepSummaryTracker {
    */
   isLimitReached() {
     return this.limitReached;
+  }
+
+  /**
+   * Gets the remaining byte capacity before the limit.
+   * @returns {number} Remaining bytes available (0 when limit is reached)
+   */
+  remaining() {
+    return Math.max(0, this.maxSize - this.currentSize);
   }
 
   /**
@@ -272,10 +281,10 @@ function isLikelyCustomAgent(toolName) {
 function generateInformationSection(lastEntry, options = {}) {
   const { additionalInfoCallback } = options;
 
-  let markdown = "\n## 📊 Information\n\n";
+  let markdown = "";
 
   if (!lastEntry) {
-    return markdown;
+    return buildStepSummaryDetailsSection("Information", "", { emptyBodyMessage: "No information available." });
   }
 
   if (lastEntry.num_turns) {
@@ -333,7 +342,7 @@ function generateInformationSection(lastEntry, options = {}) {
     markdown += `**Permission Denials:** ${lastEntry.permission_denials.length}\n\n`;
   }
 
-  return markdown;
+  return buildStepSummaryDetailsSection("Information", markdown, { emptyBodyMessage: "No information available." });
 }
 
 /**
@@ -831,6 +840,28 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
     return "";
   };
 
+  // Builds the tool_use `input` object for a Copilot SDK tool event.
+  // Copilot SDK bash events carry the executed command as a top-level `data.command`
+  // field rather than nesting it inside `data.input`/`data.parameters`, so fall back
+  // to it (and merge it in when structured input lacks a command) to avoid dropping
+  // the command from the rendered summary.
+  // Pass { includeCommand: false } when normalizing orphaned completion events that
+  // may still carry structured input but cannot reliably recover the original command.
+  const buildToolInput = (data, options = {}) => {
+    const { includeCommand = true } = options;
+    const base = data.input || data.parameters;
+    if (base && typeof base === "object" && !Array.isArray(base)) {
+      if (includeCommand && base.command === undefined && typeof data.command === "string") {
+        return { ...base, command: data.command };
+      }
+      return base;
+    }
+    if (includeCommand && typeof data.command === "string") {
+      return { command: data.command };
+    }
+    return {};
+  };
+
   for (const entry of logEntries) {
     if (!entry || typeof entry !== "object") continue;
     const data = entry.data && typeof entry.data === "object" ? entry.data : {};
@@ -891,7 +922,7 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
         normalizedEntries.push({
           type: "assistant",
           message: {
-            content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: data.input || data.parameters || {} }],
+            content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: buildToolInput(data) }],
           },
         });
         break;
@@ -917,7 +948,9 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
           normalizedEntries.push({
             type: "assistant",
             message: {
-              content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: data.input || data.parameters || {} }],
+              // Orphaned completion events have no corresponding start event, so keep
+              // structured input but do not synthesize a command from completion data.
+              content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: buildToolInput(data, { includeCommand: false }) }],
             },
           });
         }
@@ -1372,6 +1405,7 @@ module.exports = {
   estimateTokens,
   formatMcpName,
   isLikelyCustomAgent,
+  buildStepSummaryDetailsSection,
   generateConversationMarkdown,
   generateInformationSection,
   formatMcpParameters,

@@ -16,8 +16,10 @@
  *     any partial-execution failure is retried — not just those specific errors.
  *   - If the process produced no output (failed to start / auth error before any work), the
  *     driver does not retry because there is nothing to resume.
- *   - Retries use exponential backoff: 5s → 10s → 20s (capped at 60s).
- *   - Maximum 3 retry attempts after the initial run.
+ *   - Retries use exponential backoff: 5s → 10s → 20s (capped at 60s) by default.
+ *   - Maximum 3 retry attempts after the initial run by default.
+ *   - Override via GH_AW_HARNESS_MAX_RETRIES, GH_AW_HARNESS_INITIAL_DELAY_MS,
+ *     GH_AW_HARNESS_BACKOFF_MULTIPLIER, GH_AW_HARNESS_MAX_DELAY_MS.
  *
  * Prompt handling:
  *   - The harness expects a `--prompt-file <path>` argument in the args list.
@@ -31,6 +33,7 @@
 
 "use strict";
 
+const { getErrorMessage } = require("./error_helpers.cjs");
 const fs = require("fs");
 const { runProcess, formatDuration, sleep } = require("./process_runner.cjs");
 const {
@@ -46,17 +49,9 @@ const {
 } = require("./awf_reflect.cjs");
 const { emitMissingToolPermissionIssue, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
-const { detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
+const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal } = require("./harness_retry_guard.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
-
-// Maximum number of retry attempts after the initial run
-const MAX_RETRIES = 3;
-// Initial delay in milliseconds before the first retry
-const INITIAL_DELAY_MS = 5000;
-// Multiplier applied to delay after each retry
-const BACKOFF_MULTIPLIER = 2;
-// Maximum delay cap in milliseconds
-const MAX_DELAY_MS = 60000;
+const { resolveRetryConfig } = require("./harness_retry_config.cjs");
 
 // Pattern to detect OpenAI rate-limit errors.
 // Matches the JSON error type field ("rate_limit_exceeded"), the HTTP status code
@@ -358,6 +353,7 @@ async function main() {
     process.exit(1);
   }
 
+  const { maxRetries: MAX_RETRIES, initialDelayMs: INITIAL_DELAY_MS, backoffMultiplier: BACKOFF_MULTIPLIER, maxDelayMs: MAX_DELAY_MS } = resolveRetryConfig(process.env, log);
   log(`starting: command=${command} maxRetries=${MAX_RETRIES} initialDelayMs=${INITIAL_DELAY_MS}` + ` backoffMultiplier=${BACKOFF_MULTIPLIER} maxDelayMs=${MAX_DELAY_MS}` + ` nodeVersion=${process.version} platform=${process.platform}`);
 
   // Pre-flight: skip the agent entirely when a noop has already been written by a prior step.
@@ -424,17 +420,33 @@ async function main() {
   let delay = INITIAL_DELAY_MS;
   let lastExitCode = 1;
   const driverStartTime = Date.now();
+  // Soft-timeout guard: polled at the top of the retry loop and after each backoff sleep.
+  // It does not preempt a running attempt — if a single invocation runs past the soft
+  // deadline the guard fires on the next iteration. Individual attempts are expected to
+  // complete within the SOFT_TIMEOUT_BUFFER_MS window.
+  const softTimeoutGuard = buildSoftTimeoutGuard(driverStartTime);
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     // Codex does not support --continue: every retry is a fresh run from scratch.
     // Context from the interrupted session is not recoverable, but transient API
     // failures (rate limits, server errors) may resolve on the next attempt.
 
+    if (softTimeoutGuard && Date.now() >= softTimeoutGuard.softDeadlineMs) {
+      emitSoftTimeoutSignal(softTimeoutGuard, `before attempt ${attempt + 1}`, "Codex harness", log);
+      lastExitCode = 1;
+      break;
+    }
+
     if (attempt > 0) {
       log(`retry ${attempt}/${MAX_RETRIES}: sleeping ${delay}ms before next attempt (fresh run)`);
       await sleep(delay);
       delay = Math.min(delay * BACKOFF_MULTIPLIER, MAX_DELAY_MS);
       log(`retry ${attempt}/${MAX_RETRIES}: woke up, next delay cap will be ${Math.min(delay * BACKOFF_MULTIPLIER, MAX_DELAY_MS)}ms`);
+      if (softTimeoutGuard && Date.now() >= softTimeoutGuard.softDeadlineMs) {
+        emitSoftTimeoutSignal(softTimeoutGuard, "after backoff sleep", "Codex harness", log);
+        lastExitCode = 1;
+        break;
+      }
     }
 
     const result = await runProcess({ command, args: resolvedArgs, attempt, log, logArgs: safeArgs, env: codexChildEnv });
@@ -585,12 +597,13 @@ if (typeof module !== "undefined" && module.exports) {
     validateCodexOpenAIBaseURLFromReflect,
     hasNoopInSafeOutputs,
     hasExpectedSafeOutputs,
+    resolveRetryConfig,
   };
 }
 
 if (require.main === module) {
   main().catch(err => {
-    log(`unexpected error: ${err.message}`);
+    log(`unexpected error: ${getErrorMessage(err)}`);
     process.exit(1);
   });
 }

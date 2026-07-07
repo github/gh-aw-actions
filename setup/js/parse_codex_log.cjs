@@ -1,7 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { createEngineLogParser, truncateString, estimateTokens, formatToolCallAsDetails, convertLegacyLogEntriesToCopilotEvents } = require("./log_parser_shared.cjs");
+const { createEngineLogParser, truncateString, estimateTokens, formatToolCallAsDetails, buildStepSummaryDetailsSection, convertLegacyLogEntriesToCopilotEvents } = require("./log_parser_shared.cjs");
 
 const main = createEngineLogParser({
   parserName: "Codex",
@@ -29,7 +29,7 @@ function extractMCPInitialization(lines) {
     // Match: Found N MCP servers in configuration
     const countMatch = line.match(/Found (\d+) MCP servers? in configuration/i);
     if (countMatch) {
-      serverCount = parseInt(countMatch[1]);
+      serverCount = parseInt(countMatch[1], 10);
     }
 
     // Match: Connecting to MCP server: <name>
@@ -142,8 +142,8 @@ function extractCodexErrorMessages(lines) {
     // Match: Reconnecting... N/M (error message) - reconnect attempts with error details
     const reconnectMatch = line.match(/^Reconnecting\.\.\.\s+(\d+)\/(\d+)\s*\((.+)\)$/);
     if (reconnectMatch) {
-      const attempt = parseInt(reconnectMatch[1]);
-      const total = parseInt(reconnectMatch[2]);
+      const attempt = parseInt(reconnectMatch[1], 10);
+      const total = parseInt(reconnectMatch[2], 10);
       if (attempt > reconnectCount) reconnectCount = attempt;
       if (total > maxReconnects) maxReconnects = total;
       messages.add(reconnectMatch[3].trim());
@@ -414,15 +414,15 @@ function parseCodexJsonl(logContent) {
 
   // Build markdown so the parser returns a truthy result and core.info has a
   // readable fallback. The step summary itself is rendered from logEntries.
-  let markdown = "## 🤖 Reasoning\n\n";
+  let markdown = "<details>\n<summary>Reasoning</summary>\n\n";
   for (const item of parsedData) {
     if (item.type === "text") {
       markdown += `${item.content}\n\n`;
     } else if (item.type === "thinking") {
-      markdown += `<sub>◐ <em>${item.content}</em></sub>\n\n`;
+      markdown += `<sub><em>${item.content}</em></sub>\n\n`;
     }
   }
-  markdown += "## 🤖 Commands and Tools\n\n";
+  markdown += "</details>\n\n<details>\n<summary>Commands and Tools</summary>\n\n";
   for (const item of parsedData) {
     if (item.type === "tool") {
       const toolNameValue = item.toolName || "unknown-server__unknown-tool";
@@ -432,7 +432,7 @@ function parseCodexJsonl(logContent) {
       markdown += formatCodexBashCall(item.content || "", item.response || "", item.statusIcon || DEFAULT_STATUS_ICON);
     }
   }
-  markdown += "\n## 📊 Information\n\n";
+  markdown += "</details>\n\n<details>\n<summary>Information</summary>\n\n";
   if (usage) {
     const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
     const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
@@ -441,6 +441,7 @@ function parseCodexJsonl(logContent) {
       markdown += `**Total Tokens Used:** ${totalTokens.toLocaleString()}\n\n`;
     }
   }
+  markdown += "</details>\n\n";
 
   const logEntries = convertToLogEntries(parsedData);
 
@@ -490,7 +491,7 @@ function parseCodexLog(logContent) {
   }
   if (!logContent) {
     return {
-      markdown: "## 🤖 Commands and Tools\n\nNo log content provided.\n\n## 🤖 Reasoning\n\nUnable to parse reasoning from log.\n\n",
+      markdown: buildStepSummaryDetailsSection("Commands and Tools", "No log content provided.") + buildStepSummaryDetailsSection("Reasoning", "Unable to parse reasoning from log."),
       logEntries: [],
       mcpFailures: [],
       maxTurnsHit: false,
@@ -509,23 +510,23 @@ function parseCodexLog(logContent) {
   // Extract MCP initialization information
   const mcpInfo = extractMCPInitialization(lines);
   if (mcpInfo.hasInfo) {
-    markdown += "## 🚀 Initialization\n\n";
-    markdown += mcpInfo.markdown;
+    markdown += buildStepSummaryDetailsSection("Initialization", mcpInfo.markdown);
   }
 
   // Extract error messages (e.g., model access blocked, cyber_policy_violation)
   const errorInfo = extractCodexErrorMessages(lines);
   if (errorInfo.hasErrors) {
-    markdown += "## ⚠️ Errors\n\n";
+    markdown += "<details>\n<summary>Errors</summary>\n\n";
     for (const message of errorInfo.messages) {
       markdown += `> ${message}\n\n`;
     }
     if (errorInfo.reconnectCount > 0) {
       markdown += `> Reconnect attempts: ${errorInfo.reconnectCount}/${errorInfo.maxReconnects}\n\n`;
     }
+    markdown += "</details>\n\n";
   }
 
-  markdown += "## 🤖 Reasoning\n\n";
+  markdown += "<details>\n<summary>Reasoning</summary>\n\n";
 
   // Second pass: process full conversation flow with interleaved reasoning and tools
   let inThinkingSection = false;
@@ -648,7 +649,7 @@ function parseCodexLog(logContent) {
       const trimmed = line.trim();
       thinkingContent.push(trimmed);
       // Add thinking content directly to markdown with open circle icon and italic styling
-      markdown += `<sub>◐ <em>${trimmed}</em></sub>\n\n`;
+      markdown += `<sub><em>${trimmed}</em></sub>\n\n`;
     }
   }
 
@@ -660,7 +661,7 @@ function parseCodexLog(logContent) {
     });
   }
 
-  markdown += "## 🤖 Commands and Tools\n\n";
+  markdown += "</details>\n\n<details>\n<summary>Commands and Tools</summary>\n\n";
 
   // First pass: collect tool calls with details
   for (let i = 0; i < lines.length; i++) {
@@ -787,7 +788,7 @@ function parseCodexLog(logContent) {
   }
 
   // Add Information section
-  markdown += "\n## 📊 Information\n\n";
+  markdown += "</details>\n\n<details>\n<summary>Information</summary>\n\n";
 
   // Extract metadata from Codex logs
   let totalTokens = 0;
@@ -795,7 +796,7 @@ function parseCodexLog(logContent) {
   // TokenCount(TokenCountEvent { ... total_tokens: 13281 ...
   const tokenCountMatches = logContent.matchAll(/total_tokens:\s*(\d+)/g);
   for (const match of tokenCountMatches) {
-    const tokens = parseInt(match[1]);
+    const tokens = parseInt(match[1], 10);
     totalTokens = Math.max(totalTokens, tokens); // Use the highest value (final total)
   }
 
@@ -803,7 +804,7 @@ function parseCodexLog(logContent) {
   const finalTokensMatch = logContent.match(/tokens used\n([\d,]+)/);
   if (finalTokensMatch) {
     // Remove commas before parsing
-    totalTokens = parseInt(finalTokensMatch[1].replace(/,/g, ""));
+    totalTokens = parseInt(finalTokensMatch[1].replace(/,/g, ""), 10);
   }
 
   if (totalTokens > 0) {
@@ -816,6 +817,7 @@ function parseCodexLog(logContent) {
   if (toolCalls > 0) {
     markdown += `**Tool Calls:** ${toolCalls}\n\n`;
   }
+  markdown += "</details>\n\n";
 
   // Convert parsed data to logEntries format
   const logEntries = convertToLogEntries(parsedData);

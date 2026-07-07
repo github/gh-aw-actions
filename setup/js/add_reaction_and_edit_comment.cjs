@@ -7,9 +7,9 @@ const { generateWorkflowIdMarker } = require("./generate_footer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { ERR_API, ERR_NOT_FOUND, ERR_VALIDATION } = require("./error_codes.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
-const { resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
+const { createDiscussionComment, resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
-const { addReaction, addDiscussionReaction, getDiscussionNodeId } = require("./add_reaction.cjs");
+const { addReaction, addDiscussionReaction, getDiscussionNodeId, REACTION_MAP } = require("./add_reaction.cjs");
 
 /**
  * Event type descriptions for comment messages
@@ -25,7 +25,7 @@ const EVENT_TYPE_DESCRIPTIONS = {
 };
 
 /** Valid GitHub reaction types */
-const VALID_REACTIONS = Object.freeze(["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"]);
+const VALID_REACTIONS = Object.freeze(Object.keys(REACTION_MAP));
 
 /**
  * Resolve the reaction and comment API endpoints for a given event.
@@ -140,7 +140,14 @@ async function resolveEventEndpoints(eventName, owner, repo, payload) {
 async function main() {
   const reaction = process.env.GH_AW_REACTION || "eyes";
   const commandsJSON = process.env.GH_AW_COMMANDS;
-  const command = commandsJSON ? (JSON.parse(commandsJSON)[0] ?? null) : null; // Only present for command workflows
+  let command = null; // Only present for command workflows
+  if (commandsJSON) {
+    try {
+      command = JSON.parse(commandsJSON)[0] ?? null;
+    } catch (err) {
+      throw new Error("Failed to parse GH_AW_COMMANDS: " + getErrorMessage(err), { cause: err });
+    }
+  }
   const invocationContext = resolveInvocationContext(context);
   const runUrl = buildWorkflowRunUrl(context, invocationContext.workflowRepo);
 
@@ -250,19 +257,7 @@ async function addCommentWithWorkflowLink(endpoint, runUrl, eventName, invocatio
       // For discussion_comment events, thread the reply under the triggering comment.
       // GitHub Discussions only supports two nesting levels, so resolve the top-level parent node ID.
       const replyToId = eventName === "discussion_comment" ? await resolveTopLevelDiscussionCommentId(github, eventPayload?.comment?.node_id) : null;
-      const mutation = replyToId
-        ? `mutation($dId: ID!, $body: String!, $replyToId: ID!) {
-            addDiscussionComment(input: { discussionId: $dId, body: $body, replyToId: $replyToId }) {
-              comment { id url }
-            }
-          }`
-        : `mutation($dId: ID!, $body: String!) {
-            addDiscussionComment(input: { discussionId: $dId, body: $body }) {
-              comment { id url }
-            }
-          }`;
-      const result = await github.graphql(mutation, { dId: discussionId, body: commentBody, ...(replyToId ? { replyToId } : {}) });
-      const comment = result.addDiscussionComment.comment;
+      const comment = await createDiscussionComment(github, discussionId, commentBody, replyToId);
       setCommentOutputs(comment.id, comment.url, eventRepo);
       return;
     }

@@ -49,6 +49,7 @@ const HANDLER_MAP = {
   update_release: "./update_release.cjs",
   create_pull_request_review_comment: "./create_pr_review_comment.cjs",
   submit_pull_request_review: "./submit_pr_review.cjs",
+  dismiss_pull_request_review: "./dismiss_pull_request_review.cjs",
   reply_to_pull_request_review_comment: "./reply_to_pr_review_comment.cjs",
   resolve_pull_request_review_thread: "./resolve_pr_review_thread.cjs",
   create_pull_request: "./create_pull_request.cjs",
@@ -164,6 +165,7 @@ const THREAT_WARNING_ABORT_TYPES = new Set([
   "merge_pull_request",
   "mark_pull_request_as_ready_for_review",
   "resolve_pull_request_review_thread",
+  "dismiss_pull_request_review",
   "add_labels",
   "remove_labels",
   "add_reviewer",
@@ -719,7 +721,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
           // This mirrors the precedence order used by individual safe output handlers.
           const rawNumber = message.item_number ?? message.issue_number ?? message.pull_request_number;
           const itemNumber = rawNumber != null ? parseInt(String(rawNumber), 10) : undefined;
-          const validNumber = itemNumber != null && !isNaN(itemNumber) ? itemNumber : undefined;
+          const validNumber = itemNumber != null && !Number.isNaN(itemNumber) ? itemNumber : undefined;
 
           const messageResult = {
             ...(validNumber != null ? { number: validNumber } : {}),
@@ -1377,7 +1379,7 @@ async function main() {
       core.info("No safe-output messages available - nothing to process");
       if (!isStaged) ensureManifestExists();
       core.setOutput("temporary_id_map", "{}");
-      core.setOutput("processed_count", 0);
+      core.setOutput("processed_count", "0");
       return;
     }
 
@@ -1408,7 +1410,7 @@ async function main() {
       if (!isStaged) ensureManifestExists();
       // Set empty outputs for downstream steps
       core.setOutput("temporary_id_map", "{}");
-      core.setOutput("processed_count", 0);
+      core.setOutput("processed_count", "0");
       return;
     }
 
@@ -1452,7 +1454,7 @@ async function main() {
           core.error(`✗ Failed to submit PR review: ${reviewFailureError}`);
         }
       } catch (reviewError) {
-        reviewFailureError = reviewError instanceof Error ? reviewError.message : String(reviewError);
+        reviewFailureError = getErrorMessage(reviewError);
         core.error(`✗ Exception while submitting PR review: ${reviewFailureError}`);
       }
 
@@ -1564,7 +1566,7 @@ async function main() {
     }
 
     // Export processed count for consistency with project handler
-    core.setOutput("processed_count", successCount);
+    core.setOutput("processed_count", String(successCount));
 
     // Export assign_to_agent outputs when the handler was loaded
     if (messageHandlers.has("assign_to_agent")) {

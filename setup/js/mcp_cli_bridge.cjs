@@ -1,4 +1,5 @@
 // @ts-check
+const { getErrorMessage } = require("./error_helpers.cjs");
 
 /**
  * mcp_cli_bridge.cjs
@@ -59,6 +60,7 @@ const TOP_HELP_MAX_LINES = 20;
 const TOOL_HELP_MAX_LINES = 30;
 const TOOL_DESC_MAX_LEN = 90;
 const COMPACT_NAME_LINE_TARGET_WIDTH = 110;
+const SAFEOUTPUTS_SERVER_NAME = "safeoutputs";
 
 // ---------------------------------------------------------------------------
 // Audit logging
@@ -72,7 +74,7 @@ function ensureAuditDir() {
     fs.mkdirSync(AUDIT_LOG_DIR, { recursive: true });
   } catch (err) {
     const core = global.core;
-    core.warning(`Failed to create audit log directory ${AUDIT_LOG_DIR}: ${err instanceof Error ? err.message : String(err)}`);
+    core.warning(`Failed to create audit log directory ${AUDIT_LOG_DIR}: ${getErrorMessage(err)}`);
   }
 }
 
@@ -93,7 +95,7 @@ function auditLog(serverName, entry) {
     fs.appendFileSync(logPath, JSON.stringify(record) + "\n", { mode: 0o644 });
   } catch (err) {
     const core = global.core;
-    core.warning(`Failed to write audit log for ${serverName}: ${err instanceof Error ? err.message : String(err)}`);
+    core.warning(`Failed to write audit log for ${serverName}: ${getErrorMessage(err)}`);
   }
 }
 
@@ -253,7 +255,7 @@ async function mcpInitialize(serverUrl, apiKey, serverName) {
     return sessionId;
   } catch (err) {
     const elapsedMs = Date.now() - startMs;
-    const message = err instanceof Error ? err.message : String(err);
+    const message = getErrorMessage(err);
     core.warning(`[${serverName}] MCP initialize failed (${elapsedMs}ms): ${message}`);
     auditLog(serverName, { event: "initialize_error", error: message, elapsedMs });
     return "";
@@ -289,7 +291,7 @@ async function mcpNotifyInitialized(serverUrl, apiKey, sessionId, serverName) {
     auditLog(serverName, { event: "notify_initialized_done", elapsedMs });
   } catch (err) {
     const elapsedMs = Date.now() - startMs;
-    const message = err instanceof Error ? err.message : String(err);
+    const message = getErrorMessage(err);
     core.warning(`[${serverName}] MCP notifications/initialized failed (${elapsedMs}ms): ${message}`);
     auditLog(serverName, { event: "notify_initialized_error", error: message, elapsedMs });
   }
@@ -401,7 +403,7 @@ function startMcpKeepalivePings(serverUrl, apiKey, sessionId, serverName) {
       auditLog(serverName, { event: "keepalive_ping_done", pingId: currentPingId, elapsedMs });
     } catch (err) {
       const elapsedMs = Date.now() - startMs;
-      const message = err instanceof Error ? err.message : String(err);
+      const message = getErrorMessage(err);
       core.warning(`[${serverName}] MCP keepalive ping failed: ${message}`);
       auditLog(serverName, { event: "keepalive_ping_error", pingId: currentPingId, error: message, elapsedMs });
     }
@@ -823,12 +825,37 @@ function coerceToolArgValue(key, rawValue, schemaProperty, existingValue, allowN
 function loadTools(toolsFile) {
   try {
     if (fs.existsSync(toolsFile)) {
-      return JSON.parse(fs.readFileSync(toolsFile, "utf8"));
+      const parsed = JSON.parse(fs.readFileSync(toolsFile, "utf8"));
+      return Array.isArray(parsed) ? parsed : [];
     }
   } catch {
     // Fall through to empty array
   }
   return [];
+}
+
+/**
+ * Ensure safeoutputs CLI always has a non-empty tool schema available.
+ *
+ * @param {Array<{name: string, description?: string, inputSchema?: {properties?: Record<string, {description?: string, type?: string}>, required?: string[]}}>} tools
+ * @param {string} serverName
+ * @param {string} toolsFile
+ * @returns {Array<{name: string, description?: string, inputSchema?: {properties?: Record<string, {description?: string, type?: string}>, required?: string[]}}>}
+ */
+function ensureSafeOutputsTools(tools, serverName, toolsFile) {
+  if (serverName !== SAFEOUTPUTS_SERVER_NAME || tools.length > 0) {
+    return tools;
+  }
+  const runnerTemp = process.env.RUNNER_TEMP || path.resolve(path.dirname(toolsFile), "../../..");
+  const fallbackPath = process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH || path.join(runnerTemp, "gh-aw", "safeoutputs", "tools.json");
+  if (fallbackPath !== toolsFile) {
+    const fallbackTools = loadTools(fallbackPath);
+    if (fallbackTools.length > 0) {
+      global.core?.warning(`[${serverName}] tools cache ${toolsFile} is empty; recovered ${fallbackTools.length} tool(s) from ${fallbackPath}`);
+      return fallbackTools;
+    }
+  }
+  throw new Error(`[${serverName}] tool schema is empty (${toolsFile}). ` + "Failing fast to prevent runs where safe-output tools cannot be discovered.");
 }
 
 /**
@@ -896,6 +923,22 @@ function showToolHelp(serverName, toolName, tools) {
   }
 
   process.stdout.write(lines.join("\n") + "\n");
+}
+
+/**
+ * Determine whether the bridge should show tool help instead of invoking the tool
+ * with an empty arguments object.
+ *
+ * safeoutputs tools always require arguments, so any call with an empty argument
+ * object is a schema-discovery probe that would otherwise trigger a -32602
+ * validation error and encourage wasteful retries.
+ *
+ * @param {string} serverName
+ * @param {Record<string, unknown>} toolArgs
+ * @returns {boolean}
+ */
+function shouldShowToolHelpForEmptyArgs(serverName, toolArgs) {
+  return serverName === SAFEOUTPUTS_SERVER_NAME && Object.keys(toolArgs).length === 0;
 }
 
 /**
@@ -1083,9 +1126,10 @@ function isResultMessage(message) {
  *
  * @param {unknown} responseBody - Parsed JSON-RPC response body
  * @param {string} serverName - Server name (for logging)
+ * @param {string} [toolName] - Tool name, when known
  * @returns {Promise<void>}
  */
-async function formatResponse(responseBody, serverName) {
+async function formatResponse(responseBody, serverName, toolName = "") {
   const core = global.core;
   const messages = extractJSONRPCMessages(responseBody);
   renderProgressMessages(messages);
@@ -1097,11 +1141,17 @@ async function formatResponse(responseBody, serverName) {
     const errRecord = resp.error;
     const message = "message" in errRecord ? String(errRecord.message || "Unknown error") : "Unknown error";
     const code = "code" in errRecord && errRecord.code != null ? String(errRecord.code) : "";
+    const isSafeOutputsEmptyArgs = serverName === SAFEOUTPUTS_SERVER_NAME && code === "-32602" && /Empty arguments are not allowed/i.test(message);
+    const hint =
+      isSafeOutputsEmptyArgs && toolName
+        ? `Hint: do not retry '${serverName} ${toolName}' with empty arguments. Run '${serverName} ${toolName} --help' to inspect the required options, or call 'noop' with a message if no action is needed.`
+        : "";
     const errText = code ? `Error [${code}]: ${message}` : `Error: ${message}`;
     process.stderr.write(errText + "\n");
     core.error(`[${serverName}] Tool call error: ${errText}`);
     auditLog(serverName, { event: "tool_error", error: errText });
     process.exitCode = 1;
+    if (hint) process.stderr.write(hint + "\n");
     return;
   }
 
@@ -1176,7 +1226,7 @@ async function main() {
   });
 
   // Load cached tools for help display
-  const tools = loadTools(toolsFile);
+  const tools = ensureSafeOutputsTools(loadTools(toolsFile), serverName, toolsFile);
 
   // Route: --help or no args → show top-level help
   if (userArgs.length === 0 || userArgs[0] === "--help" || userArgs[0] === "-h") {
@@ -1204,6 +1254,13 @@ async function main() {
   // Pre-read stdin when JSON payload mode is triggered ('.' sentinel or no args with piped stdin).
   const stdinContent = hasStdinJsonPayload(toolUserArgs) ? readStdinSync() : null;
   const { args: toolArgs, json: jsonOutput } = parseToolArgs(toolUserArgs, schemaProperties, stdinContent);
+
+  if (shouldShowToolHelpForEmptyArgs(serverName, toolArgs)) {
+    core.warning(`[${serverName}] No arguments provided for '${toolName}'; showing command help instead of calling the tool`);
+    auditLog(serverName, { event: "show_tool_help_empty_args", tool: toolName });
+    showToolHelp(serverName, toolName, tools);
+    return;
+  }
 
   core.info(`[${serverName}] Calling tool '${toolName}' with args: ${JSON.stringify(toolArgs)}${jsonOutput ? " (--json)" : ""}`);
   auditLog(serverName, { event: "call_start", tool: toolName, arguments: toolArgs });
@@ -1237,11 +1294,11 @@ async function main() {
       // --json: print the raw JSON-RPC response body
       await writeStdoutAndFlush(JSON.stringify(resp.body, null, 2) + "\n");
     } else {
-      await formatResponse(resp.body, serverName);
+      await formatResponse(resp.body, serverName, toolName);
     }
   } catch (err) {
     const totalMs = Date.now() - callStartMs;
-    const message = err instanceof Error ? err.message : String(err);
+    const message = getErrorMessage(err);
     core.error(`[${serverName}] Tool call failed (${totalMs}ms): ${message}`);
     auditLog(serverName, {
       event: "call_error",
@@ -1274,7 +1331,9 @@ module.exports = {
   writeStdoutAndFlush,
   showHelp,
   showToolHelp,
+  shouldShowToolHelpForEmptyArgs,
   hasStdinJsonPayload,
   readStdinSync,
+  ensureSafeOutputsTools,
   main,
 };
