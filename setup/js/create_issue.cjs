@@ -5,7 +5,7 @@ const { sanitizeLabelContent } = require("./sanitize_label_content.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
-const { getBodyHeader } = require("./messages_header.cjs");
+const { getBodyHeader, getDisclosureHeader } = require("./messages_header.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
@@ -18,7 +18,7 @@ const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { renderTemplateFromFile } = require("./messages_core.cjs");
 const { createExpirationLine, addExpirationToFooter } = require("./ephemerals.cjs");
-const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
+const { MAX_SUB_ISSUES, getSubIssueCount, linkSubIssue } = require("./sub_issue_helpers.cjs");
 const { closeOlderIssues, searchOlderIssues, addIssueComment } = require("./close_older_issues.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
@@ -883,6 +883,12 @@ async function main(config = {}) {
       bodyLines.unshift(...bodyHeader.split("\n"), "");
     }
 
+    // Inject disclosure header (this runs after body-header, but appears before it because unshift prepends)
+    const disclosureHeader = getDisclosureHeader({ workflowName, runUrl });
+    if (disclosureHeader) {
+      bodyLines.unshift(...disclosureHeader.split("\n"), "");
+    }
+
     // Inject CAUTION at top of body if threat detection warning was raised
     // (unshifted after header so it appears first in the final output)
     const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
@@ -1157,57 +1163,17 @@ async function main(config = {}) {
       if (effectiveParentIssueNumber && effectiveParentRepo === qualifiedItemRepo) {
         core.info(`Attempting to link issue #${issue.number} as sub-issue of #${effectiveParentIssueNumber}`);
         try {
-          // First, get the node IDs for both parent and child issues
-          core.info(`Fetching node ID for parent issue #${effectiveParentIssueNumber}...`);
-          const getIssueNodeIdQuery = `
-            query($owner: String!, $repo: String!, $issueNumber: Int!) {
-              repository(owner: $owner, name: $repo) {
-                issue(number: $issueNumber) {
-                  id
-                }
-              }
-            }
-          `;
-
-          // Get parent issue node ID
-          const parentResult = await githubClient.graphql(getIssueNodeIdQuery, {
-            owner: repoParts.owner,
-            repo: repoParts.repo,
-            issueNumber: effectiveParentIssueNumber,
-          });
-          const parentNodeId = parentResult.repository.issue.id;
+          const { parentNodeId, subIssueNodeId } = await linkSubIssue(
+            {
+              owner: repoParts.owner,
+              repo: repoParts.repo,
+              parentIssueNumber: effectiveParentIssueNumber,
+              subIssueNumber: issue.number,
+            },
+            githubClient
+          );
           core.info(`Parent issue node ID: ${parentNodeId}`);
-
-          // Get child issue node ID
-          core.info(`Fetching node ID for child issue #${issue.number}...`);
-          const childResult = await githubClient.graphql(getIssueNodeIdQuery, {
-            owner: repoParts.owner,
-            repo: repoParts.repo,
-            issueNumber: issue.number,
-          });
-          const childNodeId = childResult.repository.issue.id;
-          core.info(`Child issue node ID: ${childNodeId}`);
-
-          // Link the child issue as a sub-issue of the parent
-          core.info(`Executing addSubIssue mutation...`);
-          const addSubIssueMutation = `
-            mutation($issueId: ID!, $subIssueId: ID!) {
-              addSubIssue(input: {
-                issueId: $issueId,
-                subIssueId: $subIssueId
-              }) {
-                subIssue {
-                  id
-                  number
-                }
-              }
-            }
-          `;
-
-          await githubClient.graphql(addSubIssueMutation, {
-            issueId: parentNodeId,
-            subIssueId: childNodeId,
-          });
+          core.info(`Child issue node ID: ${subIssueNodeId}`);
 
           core.info("✓ Successfully linked issue #" + issue.number + " as sub-issue of #" + effectiveParentIssueNumber);
         } catch (error) {
