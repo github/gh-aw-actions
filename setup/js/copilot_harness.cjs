@@ -63,7 +63,7 @@ const {
 } = require("./awf_reflect.cjs");
 const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
-const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal } = require("./harness_retry_guard.cjs");
+const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal, isAuthenticationFailedError: isCommonAuthenticationFailedError } = require("./harness_retry_guard.cjs");
 const { isCAPIQuotaExceededError } = require("./detect_agent_errors.cjs");
 const { loadModelsJson } = require("./model_costs.cjs");
 const { resolveConfiguredCopilotModel } = require("./resolve_model_alias.cjs");
@@ -113,14 +113,16 @@ const NO_AUTH_INFO_PATTERN = /No authentication information found|Session was no
 // After a first-attempt auth failure, retrying is futile because the entrypoint unsets
 // COPILOT_GITHUB_TOKEN between attempts.
 //
-// Also matches the Copilot CAPI 400 response emitted when the supplied token is a
+// This pattern covers the Copilot CAPI 400 response emitted when the supplied token is a
 // Personal Access Token (classic or fine-grained):
 //   "400 400 checking third-party user token: bad request: Personal Access Tokens
 //    are not supported for this endpoint"
 // PAT rejection is a persistent credential-type problem — retrying with the same
 // token always produces the same 400.  Treating it as an auth failure short-circuits
 // the retry loop instead of burning all 4 attempts.
-const AUTHENTICATION_FAILED_PATTERN = /Authentication failed(?:\s*\(Request ID:[^)]+\))?|checking third-party user token:[^\n]*Personal Access Tokens are not supported/i;
+// Common auth failure signals ("Authentication failed", "authentication_failed", "not logged in")
+// are handled by isCommonAuthenticationFailedError from harness_retry_guard.cjs.
+const COPILOT_PAT_AUTH_FAILED_PATTERN = /checking third-party user token:[^\n]*Personal Access Tokens are not supported/i;
 // Pattern: Copilot CLI inference access denied
 const INFERENCE_ACCESS_ERROR_PATTERN = /Access denied by policy settings|invalid access to inference/;
 // Pattern: Agentic engine process killed by signal (timeout)
@@ -368,11 +370,13 @@ function isNoAuthInfoError(output) {
 
 /**
  * Determines if the collected output contains an authentication failed error.
+ * Covers both the common signals (from harness_retry_guard) and the Copilot-specific
+ * PAT rejection error.
  * @param {string} output - Collected stdout+stderr from the process
  * @returns {boolean}
  */
 function isAuthenticationFailedError(output) {
-  return AUTHENTICATION_FAILED_PATTERN.test(output);
+  return isCommonAuthenticationFailedError(output) || COPILOT_PAT_AUTH_FAILED_PATTERN.test(output);
 }
 
 /**
@@ -431,6 +435,7 @@ function extractOutputTail(output, options) {
  *   isMCPPolicy?: boolean,
  *   isModelNotSupported?: boolean,
  *   isHTTP400ResponseError?: boolean,
+ *   isInvocationCapExceeded?: boolean,
  *   isNullTypeToolCall?: boolean,
  *   isQuotaExceeded?: boolean,
  *   isSDKSessionIdleTimeout?: boolean,
@@ -439,6 +444,7 @@ function extractOutputTail(output, options) {
  * @returns {string}
  */
 function classifyCopilotFailure(detection) {
+  if (detection.isInvocationCapExceeded) return "invocation_cap_exceeded";
   if (detection.isQuotaExceeded) return "capi_quota_exceeded";
   if (detection.isMCPPolicy) return "mcp_policy_blocked";
   if (detection.isModelNotSupported) return "model_not_supported";
@@ -451,6 +457,21 @@ function classifyCopilotFailure(detection) {
   if (detection.hasNumerousPermissionDenied) return "permission_denied";
   if (detection.isTransientCAPIError) return "capi_error_400";
   return detection.hasOutput ? "partial_execution" : "no_output";
+}
+
+/**
+ * Shared retry predicate for the generic partial-execution branch.
+ * Used by the runtime loop and unit tests to avoid divergence.
+ * @param {{ exitCode: number, hasOutput: boolean, output: string, attempt: number, maxRetries: number }} params
+ *   output must be the combined stdout/stderr text for the failed attempt.
+ * @returns {boolean}
+ */
+function shouldRetryFailedExecution(params) {
+  if (params.exitCode === 0) return false;
+  if (hasNumerousPermissionDeniedIssues(params.output)) return false;
+  if (isCAPIQuotaExceededError(params.output)) return false;
+  if (detectNonRetryableHarnessGuard(params.output).maxRunsExceeded) return false;
+  return params.attempt < params.maxRetries && params.hasOutput;
 }
 
 /**
@@ -1050,6 +1071,8 @@ async function main() {
         const isMCPGatewayShutdown = isMCPGatewayShutdownError(result.output);
         const permissionDeniedCount = countPermissionDeniedIssues(result.output);
         const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
+        const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
+        const isInvocationCapExceeded = nonRetryableGuard.maxRunsExceeded;
         const failureClass = classifyCopilotFailure({
           hasOutput: result.hasOutput,
           isAuthErr,
@@ -1059,6 +1082,7 @@ async function main() {
           isMCPPolicy,
           isModelNotSupported,
           isHTTP400ResponseError: hasHTTP400ResponseError,
+          isInvocationCapExceeded,
           isNullTypeToolCall,
           isQuotaExceeded,
           isSDKSessionIdleTimeout,
@@ -1071,6 +1095,7 @@ async function main() {
             ` failureClass=${failureClass}` +
             ` isCAPIError400=${isCAPIError}` +
             ` isCAPIQuotaExceededError=${isQuotaExceeded}` +
+            ` isInvocationCapExceeded=${isInvocationCapExceeded}` +
             ` isMCPPolicyError=${isMCPPolicy}` +
             ` isModelNotSupportedError=${isModelNotSupported}` +
             ` isHTTP400ResponseError=${hasHTTP400ResponseError}` +
@@ -1097,11 +1122,13 @@ async function main() {
           break;
         }
 
-        const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
-        if (nonRetryableGuard.aiCreditsExceeded || nonRetryableGuard.awfAPIProxyBlockingRequests) {
+        if (nonRetryableGuard.aiCreditsExceeded || nonRetryableGuard.awfAPIProxyBlockingRequests || isInvocationCapExceeded) {
           const reasons = [];
           if (nonRetryableGuard.aiCreditsExceeded) reasons.push("AI credits budget exceeded");
           if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
+          if (isInvocationCapExceeded) {
+            reasons.push("LLM invocation cap saturated — the pooled per-run budget is fully exhausted; retries cannot make progress");
+          }
           log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
           break;
         }
@@ -1226,7 +1253,7 @@ async function main() {
           break;
         }
 
-        if (attempt < maxRetries && result.hasOutput) {
+        if (shouldRetryFailedExecution({ ...result, attempt, maxRetries })) {
           const reason = isCAPIError ? "CAPIError 400 (transient)" : "partial execution";
           // --continue is only meaningful in CLI mode; SDK mode always restarts fresh.
           useContinueOnRetry = !copilotSDKMode && !continueDisabledPermanently;
@@ -1299,6 +1326,7 @@ if (typeof module !== "undefined" && module.exports) {
     countPermissionDeniedIssues,
     detectCopilotErrors,
     classifyCopilotFailure,
+    shouldRetryFailedExecution,
     extractOutputTail,
     isRetryableProxyAuthenticationFailure,
     hasNumerousPermissionDeniedIssues,
