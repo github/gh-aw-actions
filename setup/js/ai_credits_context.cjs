@@ -44,27 +44,11 @@ function parsePositiveNumberString(value) {
 }
 
 /**
- * @param {string} left
- * @param {string} right
- * @returns {boolean}
- */
-function isNumberStringGreaterThanOrEqual(left, right) {
-  if (!left || !right) return false;
-  const leftNumber = Number.parseFloat(left);
-  const rightNumber = Number.parseFloat(right);
-  return Number.isFinite(leftNumber) && Number.isFinite(rightNumber) && leftNumber >= rightNumber;
-}
-
-/**
  * @param {boolean} hasRateLimitSignal
- * @param {string} aiCredits
- * @param {string} maxAICredits
  * @returns {boolean}
  */
-function shouldReportAICreditsRateLimitError(hasRateLimitSignal, aiCredits, maxAICredits) {
-  if (!hasRateLimitSignal) return false;
-  if (!aiCredits || !maxAICredits) return true;
-  return isNumberStringGreaterThanOrEqual(aiCredits, maxAICredits);
+function shouldReportAICreditsRateLimitError(hasRateLimitSignal) {
+  return hasRateLimitSignal;
 }
 
 /**
@@ -222,22 +206,7 @@ function parseAICreditsErrorInfoFromAuditEntry(entry) {
 function iterateAuditEntries(auditJsonlPathOverride, defaultValue, contentGuard, accumulate) {
   try {
     const auditJsonlPath = resolveFirewallAuditLogPath(auditJsonlPathOverride);
-    if (!fs.existsSync(auditJsonlPath)) return defaultValue;
-    const content = fs.readFileSync(auditJsonlPath, "utf8");
-    if (!content.trim()) return defaultValue;
-    if (contentGuard && !contentGuard(content)) return defaultValue;
-    let result = defaultValue;
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed[0] !== "{") continue;
-      try {
-        const nextResult = accumulate(result, JSON.parse(trimmed));
-        if (nextResult !== undefined) result = nextResult;
-      } catch {
-        // ignore malformed lines
-      }
-    }
-    return result;
+    return iterateJSONLFiles([auditJsonlPath], defaultValue, contentGuard, accumulate);
   } catch {
     return defaultValue;
   }
@@ -525,7 +494,7 @@ function resolveAICreditsFailureState({ logProvenance = true } = {}) {
   const aiCredits = auditAICredits || stdioSignals.aiCredits || envAICredits || "";
   const maxAICredits = auditMaxAICredits || stdioSignals.maxAICredits || envMaxAICredits || "";
   const rawAICreditsRateLimitError = auditRateLimitError || stdioSignals.rateLimitError || envRateLimitSignalHasEvidence;
-  const aiCreditsRateLimitError = shouldReportAICreditsRateLimitError(rawAICreditsRateLimitError, aiCredits, maxAICredits);
+  const aiCreditsRateLimitError = shouldReportAICreditsRateLimitError(rawAICreditsRateLimitError);
   return { aiCredits, maxAICredits, aiCreditsRateLimitError, maxAICreditsExceeded: auditMaxAICreditsExceeded || stdioSignals.maxAICreditsExceeded };
 }
 

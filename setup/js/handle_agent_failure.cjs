@@ -253,6 +253,7 @@ function buildFailureMatchCategories(options) {
   if (options.modelNotSupportedError) categories.push("model_not_supported_error");
   if (options.http400ResponseError) categories.push("http_400_response_error");
   if (options.aiCreditsRateLimitError) categories.push("ai_credits_rate_limit_error");
+  if (options.hasEngineRateLimit429) categories.push("engine_rate_limit_429");
   if (options.unknownModelAICredits) categories.push("unknown_model_ai_credits");
   if (options.missingModelPricingError) categories.push("missing_model_pricing");
   if (options.maxAICreditsExceeded) categories.push("max_ai_credits_exceeded");
@@ -291,6 +292,7 @@ function buildFailureMatchCategories(options) {
  * @param {boolean} options.hasStaleLockFileFailed
  * @param {boolean} options.hasDailyAICExceeded
  * @param {boolean} options.aiCreditsRateLimitError
+ * @param {boolean} options.hasEngineRateLimit429
  * @param {boolean} options.maxAICreditsExceeded
  * @param {boolean} options.hasAssignmentErrors
  * @param {boolean} options.http400ResponseError
@@ -304,6 +306,7 @@ function buildFailureIssueTitle(options) {
   if (options.hasDailyAICExceeded) return `[aw] ${workflowName} exceeded daily AI credits budget`;
   if (options.maxAICreditsExceeded) return `[aw] ${workflowName} exceeded max AI credits`;
   if (options.aiCreditsRateLimitError) return `[aw] ${workflowName} hit AI credits rate limit`;
+  if (options.hasEngineRateLimit429) return `[aw] ${workflowName} hit engine rate limit (HTTP 429)`;
   // Missing model pricing is surfaced by the proxy as HTTP 400, so prefer the
   // specialized title before falling back to the generic transport-level error.
   if (options.missingModelPricingError) {
@@ -2050,9 +2053,10 @@ function readTokenUsageMarkdown() {
  * @param {string} aiCredits
  * @param {string} maxAICredits
  * @param {string} runUrl
+ * @param {boolean} [isBudgetExceeded] - true when the agent exceeded the configured max-ai-credits budget; false when the 429 was a throughput throttle
  * @returns {string}
  */
-function buildAICreditsRateLimitErrorContext(hasAICreditsRateLimitError, aiCredits, maxAICredits, runUrl) {
+function buildAICreditsRateLimitErrorContext(hasAICreditsRateLimitError, aiCredits, maxAICredits, runUrl, isBudgetExceeded = false) {
   if (!hasAICreditsRateLimitError) {
     return "";
   }
@@ -2076,16 +2080,21 @@ function buildAICreditsRateLimitErrorContext(hasAICreditsRateLimitError, aiCredi
     metricsSummary = ` Used \`${formattedAICredits}\`.`;
   }
 
-  // Suggest a new limit: 2x current max, or 2x actual usage if max is unknown, or a reasonable default
-  const baseForSuggestion = Number.isFinite(numericMaxAICredits) && numericMaxAICredits > 0 ? numericMaxAICredits : Number.isFinite(numericAICredits) && numericAICredits > 0 ? numericAICredits : 0;
-  const suggestedCredits = baseForSuggestion > 0 ? Math.ceil(baseForSuggestion * 2) : 2000;
-
-  const templateName = "ai_credits_rate_limit_error.md";
+  // Use the budget-exceeded template when the agent exhausted its configured limit;
+  // use the throughput-throttle template when the 429 arrived before the budget was spent.
+  const templateName = isBudgetExceeded ? "ai_credits_rate_limit_error.md" : "ai_credits_rate_limit_throttle.md";
   let templatePath = "";
   try {
     templatePath = getPromptPath(templateName);
   } catch (error) {
     throw new Error(`failed to resolve template path for ${templateName} (${getErrorMessage(error)}); ensure RUNNER_TEMP or GH_AW_PROMPTS_DIR is set and the template file exists`, { cause: error });
+  }
+
+  let suggestedCredits;
+  if (isBudgetExceeded) {
+    // Suggest a new limit: 2x current max, or 2x actual usage if max is unknown, or a reasonable default.
+    const baseForSuggestion = Number.isFinite(numericMaxAICredits) && numericMaxAICredits > 0 ? numericMaxAICredits : Number.isFinite(numericAICredits) && numericAICredits > 0 ? numericAICredits : 0;
+    suggestedCredits = baseForSuggestion > 0 ? Math.ceil(baseForSuggestion * 2) : 2000;
   }
 
   try {
@@ -2606,6 +2615,33 @@ function detectAWFFirewallStartupFailureFromLog() {
   } catch {
     return false;
   }
+}
+
+/**
+ * Detect whether the agent failure was caused by engine HTTP 429/rate limiting.
+ * Checks agent-stdio.log first, then falls back to OTLP mirror payloads.
+ * @returns {boolean}
+ */
+function detectEngineRateLimit429Failure() {
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
+  try {
+    if (fs.existsSync(stdioLogPath)) {
+      const logContent = fs.readFileSync(stdioLogPath, "utf8");
+      // If the agent completed successfully (terminal_reason: "completed"), the failure
+      // was caused by something other than the agent itself. Suppress the 429 signal to
+      // avoid giving a rate-limit title to an unrelated post-processing failure.
+      if (/"terminal_reason"[ ]?:[ ]?"completed"/.test(logContent)) {
+        return false;
+      }
+      if (hasEngineRateLimit429Signal(logContent)) {
+        return true;
+      }
+    }
+  } catch {
+    // Ignore read errors and continue with OTLP mirror fallback.
+  }
+  return hasEngineRateLimit429InOTELMirror();
 }
 
 /**
@@ -3383,6 +3419,7 @@ async function main() {
     if (hasToolDenialsExceeded) {
       core.info(`Detected ${toolDenialsExceededEvents.length} guard.tool_denials_exceeded event(s) from Copilot SDK events.jsonl`);
     }
+    const hasEngineRateLimit429 = agentConclusion === "failure" && !maxAICreditsExceeded && !aiCreditsRateLimitError && detectEngineRateLimit429Failure();
 
     // Detect cache-miss misconfiguration: the agent reported a missing_data with reason
     // "cache_memory_miss" after a cache restore matched. This indicates the prompt
@@ -3531,6 +3568,7 @@ async function main() {
       hasStaleLockFileFailed,
       hasDailyAICExceeded,
       aiCreditsRateLimitError,
+      hasEngineRateLimit429,
       maxAICreditsExceeded,
       hasAssignmentErrors,
       http400ResponseError,
@@ -3560,6 +3598,7 @@ async function main() {
       modelNotSupportedError,
       http400ResponseError,
       aiCreditsRateLimitError,
+      hasEngineRateLimit429,
       unknownModelAICredits,
       missingModelPricingError,
       maxAICreditsExceeded,
@@ -3733,7 +3772,7 @@ async function main() {
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
         const http400ResponseErrorContext = buildHTTP400ResponseErrorContext(http400ResponseError);
-        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl);
+        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl, maxAICreditsExceeded);
         const unknownModelAICreditsContext = buildUnknownModelAICreditsContext(unknownModelAICredits);
 
         // Build GitHub App token minting failure context
@@ -3955,7 +3994,7 @@ async function main() {
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
         const http400ResponseErrorContext = buildHTTP400ResponseErrorContext(http400ResponseError);
-        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl);
+        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl, maxAICreditsExceeded);
         const unknownModelAICreditsContext = buildUnknownModelAICreditsContext(unknownModelAICredits);
 
         // Build GitHub App token minting failure context
@@ -4135,6 +4174,7 @@ module.exports = {
   hasEngineMaxRunsExceededSignal,
   hasEngineRateLimit429Signal,
   hasEngineRateLimit429InOTELMirror,
+  detectEngineRateLimit429Failure,
   buildEngineMaxRunsExceededContext,
   buildEngineRateLimit429Context,
   hasEngineMaxCacheMissesExceededSignal,
