@@ -7,10 +7,12 @@
 //   session: aggregate Copilot session event counters
 //   gateway: total/failed tool-call counters with per-server breakdown
 //   safe_outputs: total item count and per-type breakdown from safe-output-items manifest
+//   experiments: A/B experiment variant assignments for the current run
 
 const fs = require("fs");
 const { globSync } = require("node:fs");
 const path = require("path");
+const { readExperimentAssignments } = require("./experiment_helpers.cjs");
 
 require("./shim.cjs");
 
@@ -381,6 +383,12 @@ function parseGatewayLogs() {
  * Reads the JSONL file written by the safe_outputs job and downloaded into
  * the conclusion job via the safe-outputs-items artifact.
  *
+ * Three distinct return states let callers distinguish artifact provenance:
+ *   • returns null                          → manifest file not found
+ *   • returns { total_items: 0, ... }       → manifest present but contained no loggable items
+ *   • returns { total_items: N, ... }       → manifest present with N items
+ *   • throws                                → manifest file exists but could not be read
+ *
  * @param {string} [manifestPath] - Path to the manifest file (defaults to MANIFEST_FILE_PATH)
  * @returns {{ total_items: number, items_by_type: Record<string, number> } | null}
  */
@@ -391,12 +399,9 @@ function parseSafeOutputsManifest(manifestPath = MANIFEST_FILE_PATH) {
     return null;
   }
 
-  let content;
-  try {
-    content = fs.readFileSync(manifestPath, "utf-8");
-  } catch (err) {
-    return null;
-  }
+  // Let read errors propagate so the caller can distinguish "unreadable file"
+  // from "file present but no items" — both previously collapsed to null.
+  const content = fs.readFileSync(manifestPath, "utf-8");
 
   const itemsByType = {};
   let totalItems = 0;
@@ -423,14 +428,25 @@ function parseSafeOutputsManifest(manifestPath = MANIFEST_FILE_PATH) {
     itemsByType[itemType] = (itemsByType[itemType] || 0) + 1;
   }
 
-  if (totalItems === 0) {
-    return null;
-  }
-
   return {
     total_items: totalItems,
     items_by_type: itemsByType,
   };
+}
+
+/**
+ * Parse A/B experiment assignments for the current run.
+ * Reads the assignments.json file written by pick_experiment.cjs.
+ * Returns null when no experiments are active for this run.
+ *
+ * @returns {{ assignments: Record<string, string> } | null}
+ */
+function parseExperimentsData() {
+  const assignments = readExperimentAssignments();
+  if (!assignments || Object.keys(assignments).length === 0) {
+    return null;
+  }
+  return { assignments };
 }
 
 /**
@@ -457,10 +473,34 @@ function main() {
     summary.gateway = gateway;
   }
 
-  // Parse safe outputs manifest
-  const safeOutputs = parseSafeOutputsManifest();
-  if (safeOutputs) {
-    summary.safe_outputs = safeOutputs;
+  // Parse safe outputs manifest.
+  // parseSafeOutputsManifest() has three distinct outcomes that drive the three
+  // states downstream consumers need to distinguish:
+  //   • safe_outputs absent        → manifest not found (artifact download failed or job never ran)
+  //   • safe_outputs.total_items == 0 → manifest present, no items logged
+  //   • safe_outputs.total_items > 0  → manifest present with N items
+  // A read error is kept separate: it logs a warning but omits safe_outputs so
+  // the consumer cannot mistake a broken artifact for a legitimately empty one.
+  try {
+    const safeOutputs = parseSafeOutputsManifest();
+    if (safeOutputs === null) {
+      core.info(`safe-output-items manifest not found at ${MANIFEST_FILE_PATH} — safe-outputs-items artifact may not have been downloaded`);
+    } else {
+      summary.safe_outputs = safeOutputs;
+      if (safeOutputs.total_items === 0) {
+        core.info(`safe-output-items manifest: 0 item(s) logged (file present but contained no loggable items)`);
+      } else {
+        core.info(`safe-output-items manifest: ${safeOutputs.total_items} item(s) logged (types: ${Object.keys(safeOutputs.items_by_type).join(", ")})`);
+      }
+    }
+  } catch (err) {
+    core.warning(`safe-output-items manifest could not be read from ${MANIFEST_FILE_PATH}: ${String(err)} — safe_outputs omitted from summary`);
+  }
+
+  // Include A/B experiment assignments so the CLI can read them from the usage artifact.
+  const experiments = parseExperimentsData();
+  if (experiments) {
+    summary.experiments = experiments;
   }
 
   // Write summary to file
@@ -478,4 +518,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { parseFirewallLogs, parseSessionLogs, parseGatewayLogs, parseSafeOutputsManifest, MANIFEST_FILE_PATH };
+module.exports = { parseFirewallLogs, parseSessionLogs, parseGatewayLogs, parseSafeOutputsManifest, parseExperimentsData, MANIFEST_FILE_PATH };

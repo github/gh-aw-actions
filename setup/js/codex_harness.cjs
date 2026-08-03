@@ -39,7 +39,6 @@ const { runProcess, formatDuration, sleep, MIN_POST_RESULT_WATCHDOG_TIMEOUT_MS, 
 const {
   AWF_API_PROXY_REFLECT_URL,
   AWF_REFLECT_OUTPUT_PATH,
-  AWF_REFLECT_TIMEOUT_MS,
   AWF_MODELS_URL_TIMEOUT_MS,
   GEMINI_MODEL_NAME_PREFIX,
   enrichReflectModels,
@@ -55,6 +54,7 @@ const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSi
 const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
 const { resolveRetryConfig } = require("./harness_retry_config.cjs");
 const { applyModelFallback, injectModelFlagAfterExec } = require("./model_fallback.cjs");
+const { parseMaxAICreditsExceededFromAuditLog } = require("./ai_credits_context.cjs");
 
 // Pattern to detect OpenAI rate-limit errors.
 // Matches the JSON error type field ("rate_limit_exceeded"), the HTTP status code
@@ -535,7 +535,10 @@ async function main() {
 
   // Fetch AWF API proxy reflection data before running the agent to capture initial proxy state.
   // This is best-effort: failures are logged but do not affect the agent run.
-  await fetchAWFReflect({ logger: log });
+  // Skip when AWF_REFLECT_ENABLED is not "1" (e.g. no api-proxy running in sandbox or test mode).
+  if (process.env.AWF_REFLECT_ENABLED === "1") {
+    await fetchAWFReflect({ logger: log });
+  }
   const codexHome = process.env.CODEX_HOME || "";
   let codexEnv = codexChildEnv;
   const providerConfig = configureCodexProviderFromReflect({
@@ -661,13 +664,27 @@ async function main() {
     }
 
     const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
-    if (nonRetryableGuard.aiCreditsExceeded || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.goalAlreadyActive || nonRetryableGuard.maxRunsExceeded) {
+    const trustedAICreditsExceeded = nonRetryableGuard.aiCreditsExceeded && parseMaxAICreditsExceededFromAuditLog();
+    if (nonRetryableGuard.aiCreditsExceeded && !trustedAICreditsExceeded) {
+      log(`attempt ${attempt + 1}: AI credits marker found in CLI output without trusted firewall audit confirmation — preserving normal failure handling`);
+    }
+    const shouldTreatAICreditsExceededAsSuccess = trustedAICreditsExceeded && !isAuthenticationFailed && !isMissingApiKey;
+    if (shouldTreatAICreditsExceededAsSuccess || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.goalAlreadyActive || nonRetryableGuard.maxRunsExceeded) {
       const reasons = [];
-      if (nonRetryableGuard.aiCreditsExceeded) reasons.push("AI credits budget exceeded");
+      if (shouldTreatAICreditsExceededAsSuccess) reasons.push("AI credits budget exceeded");
       if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
       if (nonRetryableGuard.goalAlreadyActive) reasons.push("goal is already active for this thread (use update_goal when the current goal is complete)");
       if (nonRetryableGuard.maxRunsExceeded) reasons.push("maximum LLM invocations exceeded");
       log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
+      // When the per-run AI credits budget is exceeded the AWF firewall intentionally
+      // stopped the agent — this is controlled budget enforcement, not an unexpected
+      // error.  Exit 0 so the agent step and job succeed; the ai_credits_rate_limit_error
+      // output surfaced by parse-mcp-gateway will inform downstream handlers (e.g.
+      // handle_agent_failure) of the budget exceedance.
+      if (shouldTreatAICreditsExceededAsSuccess) {
+        log(`attempt ${attempt + 1}: AI credits budget enforced — exiting 0 (budget control, not an error)`);
+        lastExitCode = 0;
+      }
       break;
     }
 
@@ -737,7 +754,10 @@ async function main() {
   }
 
   // Fetch AWF API proxy reflection data and persist to disk for post-run step summary.
-  await fetchAWFReflect({ logger: log });
+  // Skip when AWF_REFLECT_ENABLED is not "1" (e.g. no api-proxy running in sandbox or test mode).
+  if (process.env.AWF_REFLECT_ENABLED === "1") {
+    await fetchAWFReflect({ logger: log });
+  }
 
   log(`done: exitCode=${lastExitCode} totalDuration=${formatDuration(Date.now() - driverStartTime)}`);
   process.exit(lastExitCode);
