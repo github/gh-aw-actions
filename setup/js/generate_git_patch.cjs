@@ -251,12 +251,29 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
           }
 
           if (defaultBranchRef) {
-            baseRef = execGitSync(["merge-base", "--", defaultBranchRef, tipRef], { cwd }).trim();
+            try {
+              baseRef = execGitSync(["merge-base", "--", defaultBranchRef, tipRef], { cwd }).trim();
+            } catch (mergeBaseError) {
+              // A shallow clone (or a `--depth` fetch that grafted history onto an
+              // otherwise complete clone) can make the merge-base unreachable.
+              // Surface that explicitly instead of the misleading "branch does not
+              // exist locally" message.
+              if (fs.existsSync(path.join(cwd || process.cwd(), ".git", "shallow"))) {
+                /** @type {any} */
+                const shallowCloneError = new Error(
+                  `${ERR_SYSTEM}: Could not compute merge-base between ${defaultBranchRef} and ${tipRef} because the repository is a shallow clone (.git/shallow exists). ` +
+                    "Deepen the clone (checkout.fetch-depth: 0) so the common ancestor is reachable."
+                );
+                shallowCloneError.isShallowCloneDiagnostic = true;
+                throw shallowCloneError;
+              }
+              throw mergeBaseError;
+            }
             debugLog(`Strategy 1 (full): Computed merge-base: ${baseRef}`);
           } else {
             // No remote refs available - fall through to Strategy 2
             debugLog(`Strategy 1 (full): No remote refs available, falling through to Strategy 2`);
-            throw new Error(`${ERR_SYSTEM}: No remote refs available for merge-base calculation`);
+            throw new Error(`No remote refs available for merge-base calculation`);
           }
         }
 
@@ -309,6 +326,19 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
       } catch (branchError) {
         // Branch does not exist locally (or pinnedSha failed)
         debugLog(`Strategy 1: Branch '${branchName}' does not exist locally - ${getErrorMessage(branchError)}`);
+        // Shallow-clone diagnostics (thrown explicitly from the merge-base block
+        // above, marked with isShallowCloneDiagnostic) must reach callers immediately —
+        // falling through to Strategy 2 or 3 would produce a misleading "No changes
+        // to commit" result instead. Other ERR_SYSTEM-prefixed errors (e.g. an
+        // expected "branch not found" failure from show-ref/rev-parse) must still
+        // fall through to the later strategies.
+        if (branchError && branchError.isShallowCloneDiagnostic) {
+          return {
+            success: false,
+            error: getErrorMessage(branchError),
+            patchPath: patchPath,
+          };
+        }
         if (options.pinnedSha) {
           // SECURITY: When pinnedSha is set, fail closed — do not fall through to
           // other strategies that would resolve a different commit.
