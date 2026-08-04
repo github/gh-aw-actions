@@ -7,7 +7,7 @@ const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
 const { execGitSync, getGitAuthEnv } = require("./git_helpers.cjs");
-const { getStagedPatchAdditionsSizeBytes } = require("./repo_memory_patch_size.cjs");
+const { getStagedPatchDiffSizeBytes } = require("./git_patch_utils.cjs");
 const { parseAllowedRepos, validateRepo } = require("./repo_helpers.cjs");
 const { pushSignedCommits } = require("./push_signed_commits.cjs");
 
@@ -498,10 +498,20 @@ async function main() {
     }
   }
 
-  // Check if we have any changes to commit
+  // Build literal pathspecs from the relative paths of files to copy.
+  // The :(literal) magic prefix tells Git to treat each entry as a plain string,
+  // preventing glob expansion or pathspec-magic interpretation (e.g. :(top),
+  // wildcards) even when a filename happens to contain those characters.
+  const literalPathspecs = Array.from(new Set(filesToCopy.map(file => `:(literal)${file.relativePath}`))).sort();
+
+  // Check if we have any changes to commit, scoped to managed memory files only.
   let changedFileCount = 0;
   try {
-    const status = execGitSync(["status", "--porcelain"]);
+    const statusArgs = ["status", "--porcelain"];
+    if (literalPathspecs.length > 0) {
+      statusArgs.push("--", ...literalPathspecs);
+    }
+    const status = execGitSync(statusArgs, { cwd: workspaceDir });
     const changedEntries = status
       .split("\n")
       .map(line => line.trim())
@@ -534,38 +544,45 @@ async function main() {
   // sparse-checkout, causing a plain "git add ." to silently skip or reject
   // files on the first run for a new memory branch.
   try {
-    execGitSync(["add", "--sparse", "."], { stdio: "inherit" });
+    const addArgs = ["add", "--sparse"];
+    if (literalPathspecs.length > 0) {
+      addArgs.push("--", ...literalPathspecs);
+    } else {
+      addArgs.push(".");
+    }
+    execGitSync(addArgs, { stdio: "inherit", cwd: workspaceDir });
   } catch (error) {
     core.setFailed(`Failed to stage changes: ${getErrorMessage(error)}`);
     return;
   }
 
-  // Validate total patch size before committing
-  // Only additions (new content) are counted toward the patch size limit.
-  // Deletions are ignored since removing content is acceptable and does not
-  // contribute to the size of the content being pushed.
+  // Validate total patch size before committing.
+  // The patch diff size is the net bytes added (additions minus deletions, clamped to zero).
+  // Using the net value prevents files that are rewritten with similar-sized content
+  // (e.g. a regenerated JSON object) from being counted as "entire source code size"
+  // even though only a small portion of the data actually changed.
   try {
-    const patchSizeBytes = getStagedPatchAdditionsSizeBytes({ execGitSyncFn: execGitSync });
+    const patchSizeBytes = getStagedPatchDiffSizeBytes({ execGitSyncFn: execGitSync, cwd: workspaceDir });
     const patchSizeKb = Math.ceil(patchSizeBytes / 1024);
     const maxPatchSizeKb = Math.floor(maxPatchSize / 1024);
     // Allow 20% overhead to account for git diff format (headers, context lines, etc.)
     const effectiveMaxPatchSize = Math.floor(maxPatchSize * 1.2);
     const effectiveMaxPatchSizeKb = Math.floor(effectiveMaxPatchSize / 1024);
-    const patchSizeMessage = `Patch additions size: ${patchSizeKb} KB (${patchSizeBytes} bytes) (configured limit: ${maxPatchSizeKb} KB (${maxPatchSize} bytes), effective with 20% overhead: ${effectiveMaxPatchSizeKb} KB (${effectiveMaxPatchSize} bytes))`;
+    const patchSizeMessage = `Patch diff size: ${patchSizeKb} KB (${patchSizeBytes} bytes) (configured limit: ${maxPatchSizeKb} KB (${maxPatchSize} bytes), effective with 20% overhead: ${effectiveMaxPatchSizeKb} KB (${effectiveMaxPatchSize} bytes))`;
     if (patchSizeBytes > effectiveMaxPatchSize) {
       // Warn at warning level so the size is visible even without verbose mode
       core.warning(patchSizeMessage);
       // Add per-file diff stats to diagnose what's causing the large patch
       // (e.g. a full rewrite of an accumulated history file shows old + new content in the diff)
       try {
-        const diffStat = execGitSync(["diff", "--cached", "--stat"], { stdio: "pipe" });
+        const diffStat = execGitSync(["diff", "--cached", "--stat"], { stdio: "pipe", cwd: workspaceDir });
         core.warning(`Patch content breakdown (git diff --stat):\n${diffStat}`);
       } catch (statError) {
         core.warning(`Could not retrieve diff stat: ${getErrorMessage(statError)}`);
       }
       core.setOutput("patch_size_exceeded", "true");
       core.setFailed(
-        `Patch additions size (${patchSizeKb} KB, ${patchSizeBytes} bytes) exceeds maximum allowed size (${effectiveMaxPatchSizeKb} KB, ${effectiveMaxPatchSize} bytes, configured limit: ${maxPatchSizeKb} KB with 20% overhead allowance). Reduce the number or size of changes, or increase max-patch-size.`
+        `Patch diff size (${patchSizeKb} KB, ${patchSizeBytes} bytes) exceeds maximum allowed size (${effectiveMaxPatchSizeKb} KB, ${effectiveMaxPatchSize} bytes, configured limit: ${maxPatchSizeKb} KB with 20% overhead allowance). Reduce the number or size of changes, or increase max-patch-size.`
       );
       return;
     } else if (patchSizeBytes > maxPatchSize) {
@@ -575,7 +592,7 @@ async function main() {
       core.info(patchSizeMessage);
     }
   } catch (error) {
-    core.setFailed(`Failed to compute patch additions size: ${getErrorMessage(error)}`);
+    core.setFailed(`Failed to compute patch diff size: ${getErrorMessage(error)}`);
     return;
   }
 

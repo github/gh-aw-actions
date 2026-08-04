@@ -37,6 +37,7 @@ set +o histexpand
 #   HOME               - agent user home directory
 #   RUNNER_TEMP        - runner temporary directory
 #   GITHUB_OUTPUT      - path to the GitHub Actions output file
+#   GITHUB_STEP_SUMMARY- path to the GitHub Actions step summary file (optional)
 #
 # GitHub Actions outputs written:
 #   pre-agent-audit-file        - path to the audit file
@@ -99,7 +100,36 @@ list_dir() {
   list_dir "gh-aw temp directory"    "${RUNNER_TEMP}/gh-aw"
 } > "${AUDIT_FILE}"
 
+# Render the audit listing as a collapsed, compact tree in the step summary.
+render_summary_tree() {
+  local line
+  local label
+  echo "<details>"
+  echo "<summary>Pre-agent workspace audit</summary>"
+  echo
+  echo '```text'
+  while IFS= read -r line; do
+    case "${line}" in
+      "=== "*) continue ;;
+      "--- "*": "*" ---")
+        label="${line#--- }"
+        echo "│   ├── ${label% ---}"
+        ;;
+      "--- "*" ---")
+        label="${line#--- }"
+        echo "├── ${label% ---}"
+        ;;
+      "(not found)") echo "│   │   └── ${line}" ;;
+      "") continue ;;
+      *) echo "│   │   └── ${line}" ;;
+    esac
+  done < "${AUDIT_FILE}"
+  echo '```'
+  echo "</details>"
+}
+
 LINE_COUNT="$(wc -l < "${AUDIT_FILE}" | tr -d ' ')"
+render_summary_tree >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 echo "pre-agent-audit-file=${AUDIT_FILE}" >> "${GITHUB_OUTPUT}"
 echo "pre-agent-audit-line-count=${LINE_COUNT}" >> "${GITHUB_OUTPUT}"
 echo "Pre-agent audit written to ${AUDIT_FILE} (${LINE_COUNT} lines)"
