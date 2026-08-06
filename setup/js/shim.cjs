@@ -12,6 +12,11 @@
  * `github-script`) the respective block is a no-op.
  */
 
+const setSecret = /** @param {string} _value */ _value => {
+  throw new Error("core.setSecret is unavailable outside the github-script runtime");
+};
+Object.defineProperty(setSecret, "__ghAwUnavailable", { value: true });
+
 if (!global.core) {
   /**
    * Write shim log lines to stderr so MCP servers that speak JSON-RPC on stdout
@@ -40,7 +45,10 @@ if (!global.core) {
     setOutput: /** @param {string} name @param {unknown} value */ (name, value) => {
       writeShimLog("output", `${name}=${value}`);
     },
+    setSecret,
   };
+} else if (typeof global.core.setSecret !== "function") {
+  global.core.setSecret = setSecret;
 }
 
 if (!global.context) {

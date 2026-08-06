@@ -4,9 +4,28 @@
 // All callers must ensure these globals are set before invoking any helper.
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { buildGitAuthEnv } = require("./git_auth_env.cjs");
+const { maskSecret } = require("./actions_secret_masking.cjs");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+
+/**
+ * Build git authentication environment variables and mask both credential
+ * representations in the surrounding GitHub Actions step.
+ *
+ * @param {string} [token]
+ * @returns {Object}
+ */
+function getGitAuthEnv(token) {
+  const authToken = token || process.env.GITHUB_TOKEN;
+  if (!authToken) {
+    core.debug("getGitAuthEnv: no token available, git network operations may fail if credentials were cleaned");
+    return {};
+  }
+  maskSecret(authToken);
+  return buildGitAuthEnv(authToken, maskSecret);
+}
 
 /**
  * Normalize a server URL by stripping any trailing slash so the git config key
@@ -167,6 +186,29 @@ async function checkoutHasPersistedExtraheader(serverUrl) {
 }
 
 /**
+ * Run `git config` with `silent: true` (to prevent credential-bearing command
+ * lines from reaching stdout / uploaded safe-output artifacts) while still
+ * capturing stderr so that real git diagnostics surface on failure.
+ *
+ * @param {string[]} gitArgs - Arguments passed to `git` (e.g. `["config", "--local", ...]`)
+ * @param {string} [cwd] - Optional working directory
+ * @returns {Promise<void>}
+ */
+async function gitExecSilent(gitArgs, cwd) {
+  let stderrBuf = "";
+  const listeners = {
+    stderr: (/** @type {Buffer} */ data) => {
+      stderrBuf += data.toString();
+    },
+  };
+  try {
+    await exec.exec("git", gitArgs, { silent: true, listeners, ...(cwd ? { cwd } : {}) });
+  } catch (err) {
+    throw new Error(`git-config-credential failed: ${stderrBuf.trim() || getErrorMessage(err)}`);
+  }
+}
+
+/**
  * Replace any existing extraheader values with a single token-based Authorization
  * header and return the previous values for restoration.
  *
@@ -186,7 +228,9 @@ async function overridePersistedExtraheader(serverUrl, token, cwd) {
     previousValues = [];
   }
   core.info(`git_auth_helpers: overriding http.${normalizedUrl}/.extraheader with CI trigger token`);
+  maskSecret(token);
   const tokenBase64 = Buffer.from(`x-access-token:${token.trim()}`).toString("base64");
+  maskSecret(tokenBase64);
   const authHeader = `Authorization: basic ${tokenBase64}`;
 
   // Clear from ALL writable scopes before writing our token to prevent duplicate
@@ -195,11 +239,7 @@ async function overridePersistedExtraheader(serverUrl, token, cwd) {
   // global value in place and causing duplicate-header HTTP 400 errors.
   await unsetExtraheaderAllScopes(`http.${normalizedUrl}/.extraheader`, cwd);
 
-  if (cwd) {
-    await exec.exec("git", ["config", "--local", "--replace-all", `http.${normalizedUrl}/.extraheader`, authHeader], { cwd });
-  } else {
-    await exec.exec("git", ["config", "--local", "--replace-all", `http.${normalizedUrl}/.extraheader`, authHeader]);
-  }
+  await gitExecSilent(["config", "--local", "--replace-all", `http.${normalizedUrl}/.extraheader`, authHeader], cwd);
   core.info(`git_auth_helpers: extraheader override applied`);
   return previousValues;
 }
@@ -236,16 +276,9 @@ async function restorePersistedExtraheader(serverUrl, previousValues, cwd) {
   // best-effort cleanup, then re-throw so the caller is aware that restoration
   // failed.
   try {
-    if (cwd) {
-      await exec.exec("git", ["config", "--local", "--replace-all", key, previousValues[0]], { cwd });
-      for (const value of previousValues.slice(1)) {
-        await exec.exec("git", ["config", "--local", "--add", key, value], { cwd });
-      }
-    } else {
-      await exec.exec("git", ["config", "--local", "--replace-all", key, previousValues[0]]);
-      for (const value of previousValues.slice(1)) {
-        await exec.exec("git", ["config", "--local", "--add", key, value]);
-      }
+    await gitExecSilent(["config", "--local", "--replace-all", key, previousValues[0]], cwd);
+    for (const value of previousValues.slice(1)) {
+      await gitExecSilent(["config", "--local", "--add", key, value], cwd);
     }
   } catch (err) {
     core.warning(`git_auth_helpers: partial extraheader restore for ${key} — attempting cleanup: ${getErrorMessage(err)}`);
@@ -294,6 +327,8 @@ async function withGitHubHostToken(token, callback, cwd) {
 module.exports = {
   checkoutHasPersistedExtraheader,
   findIncludedExtraheaderConfigFiles,
+  getGitAuthEnv,
+  gitExecSilent,
   overridePersistedExtraheader,
   restorePersistedExtraheader,
   unsetExtraheaderAllScopes,
