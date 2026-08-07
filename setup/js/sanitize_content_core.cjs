@@ -210,11 +210,148 @@ function sanitizeDomainName(domain) {
 }
 
 /**
+ * Character class (as a source fragment) for the delimiters that may introduce a
+ * protocol-relative URL. A "//" is only treated as the start of a URL when it
+ * sits at the start of the string or immediately after one of these, so that
+ * "//" segments inside the path of an absolute URL (e.g.
+ * "https://github.com//issues") are not misread as a new URL.
+ *
+ * Beyond whitespace/bracket/quote, this includes the delimiters that actually
+ * precede a URL in rendered contexts: "<" and "=" for HTML attributes and
+ * CommonMark angle-bracket link destinations (`<img src=//host/x>`,
+ * `[a](<//host/x>)`), and ",", ">", "|" and "`" which separate URLs in prose,
+ * tables and markup. Omitting these left renderable URLs unfiltered.
+ *
+ * Shared by the userinfo-stripping pre-pass and the protocol-relative filtering
+ * pass so the two cannot disagree about what counts as a URL start: if the
+ * strip pass recognized a URL the filter pass did not (or vice versa), a
+ * spoofed host could be normalized into a form that is then trusted.
+ */
+const URL_START_DELIMITERS = "[\\s([{\"'<=,>|`]";
+
+/**
+ * Character class (as a source fragment) matching one character of a URL
+ * authority (the "userinfo@host:port" component).
+ *
+ * The authority ends at the path/query/fragment ("/", "?", "#") and at
+ * whitespace, but it must ALSO end at the delimiters that terminate a URL in
+ * prose and markup. Consuming those was a bypass rather than a cosmetic issue:
+ * with a class of merely [^\s/?#], the authority of the first URL in
+ * "https://x.com,https://github.com@evil.com/" swallowed ",https:", so the
+ * global scan resumed past the second URL's scheme and never stripped its
+ * userinfo — leaving the spoofed host to be read as the allowlisted github.com.
+ * The same applied to adjacent markdown images "![a](//x.com)![b](//host@evil)".
+ */
+const URL_AUTHORITY_CHAR = "[^\\s/?#,()<>[\\]{}\"'`|\\\\]";
+
+/**
+ * Remove the ASCII tab, CR and LF characters that URL parsers discard.
+ *
+ * WHATWG URL parsing strips these from anywhere in a URL before parsing, so
+ * "//github.com\tA@evil.com/x" is fetched as host "evil.com" with the userinfo
+ * "github.comA" — while a regex that treats them as terminators sees only the
+ * allowlisted "github.com". Callers must therefore compare hosts on the
+ * stripped form to match what a browser will actually request.
+ *
+ * @param {string} authority - The raw authority text
+ * @returns {string} The authority with tab/CR/LF removed
+ */
+function stripUrlIgnorableWhitespace(authority) {
+  return authority.replace(/[\t\r\n]/g, "");
+}
+
+/**
+ * Strip URL userinfo (user:password@) from all scheme://... URLs in a string.
+ * This must run before any domain filtering so that credentials embedded in
+ * a URL authority are never passed to the allowlist check or returned to the
+ * caller.
+ *
+ * Examples:
+ *   https://user:REDACTED@example.com/repo.git  →  https://example.com/repo.git
+ *   git://user@example.com/repo.git          →  git://example.com/repo.git
+ *
+ * @param {string} s - The string to process
+ * @returns {string} The string with userinfo removed from all URLs
+ */
+function stripUrlUserinfo(s) {
+  // Capture the authority-like component right after scheme:// - everything
+  // up to the start of the path (/), query (?), fragment (#), or whitespace.
+  //
+  // The scheme quantifier is bounded ({0,30}) rather than unbounded (*). With
+  // an unbounded quantifier, a long run of characters that never resolves to
+  // "://" (e.g. hundreds of thousands of plain letters) forces the scheme
+  // group to greedily consume the whole remainder and then backtrack one
+  // character at a time before the match attempt fails at that start
+  // position - and this repeats at every subsequent start position, giving
+  // O(n^2) behavior on pathological input even though there is no nested
+  // quantifier. Real URL schemes are always short (RFC 3986 examples and IANA
+  // registrations top out well under 30 characters), so bounding the
+  // quantifier keeps this linear without affecting legitimate matches.
+  //
+  // Once captured, look for the LAST "@" within that authority component (in
+  // plain JS, not regex) and drop everything up to and including it. Using
+  // the last "@" ensures chained userinfo values (e.g. "a@b@c@host") are
+  // fully stripped, while stopping the authority match at "?"/"#" ensures an
+  // ordinary URL whose query string happens to contain "@" is left untouched.
+  //
+  // Tab/CR/LF are allowed *inside* the authority and then discarded, because
+  // URL parsers discard them too: without this, "https://github.com\tA@evil.com/"
+  // would present an authority of just the allowlisted "github.com" to the
+  // filter while a browser fetches evil.com. Tolerating them is safe because a
+  // rewrite only happens when the cleaned authority contains "@" — so an
+  // ordinary host that merely happens to be followed by a newline and more
+  // prose is left untouched.
+  const schemeUserinfoRegex = new RegExp(`([a-z][a-z0-9+.-]{0,30}://)((?:${URL_AUTHORITY_CHAR}|[\\t\\r\\n])*)`, "gi");
+  return s.replace(schemeUserinfoRegex, (match, scheme, authority) => {
+    const cleaned = stripUrlIgnorableWhitespace(authority);
+    const at = cleaned.lastIndexOf("@");
+    if (at === -1) return match;
+    return scheme + cleaned.slice(at + 1);
+  });
+}
+
+/**
+ * Strip URL userinfo (user:password@) from protocol-relative URLs (//host/path).
+ *
+ * Browsers on an HTTPS page resolve "//host/path" to "https://host/path", so a
+ * protocol-relative URL carries the same userinfo-spoofing risk as an explicit
+ * https:// URL: in "//github.com@evil.com/x" the real host is evil.com, but a
+ * host pattern that stops at "@" would read it as the allowlisted github.com.
+ * stripUrlUserinfo() cannot cover this form because it requires a scheme.
+ *
+ * The "//" is only treated as a protocol-relative URL when it appears at the
+ * start of the string or immediately after a URL-introducing delimiter (see
+ * URL_START_DELIMITERS) — the same anchoring used by the protocol-relative pass
+ * in sanitizeUrlDomains() — so "//" segments inside the path of an absolute URL
+ * (e.g. "https://github.com//issues") are left untouched.
+ *
+ * Backslashes are accepted in the separator position because URL parsers treat
+ * "\" as "/" for special schemes, so "\\github.com@evil.com/x" and
+ * "/\github.com@evil.com/x" both resolve to host evil.com in a browser.
+ *
+ * @param {string} s - The string to process
+ * @returns {string} The string with userinfo removed from protocol-relative URLs
+ */
+function stripProtocolRelativeUserinfo(s) {
+  const protoRelativeUserinfoRegex = new RegExp(`(^|${URL_START_DELIMITERS})([/\\\\]{2})((?:${URL_AUTHORITY_CHAR}|[\\t\\r\\n])*)`, "g");
+  return s.replace(protoRelativeUserinfoRegex, (match, prefix, _slashes, authority) => {
+    const cleaned = stripUrlIgnorableWhitespace(authority);
+    const at = cleaned.lastIndexOf("@");
+    if (at === -1) return match;
+    return prefix + "//" + cleaned.slice(at + 1);
+  });
+}
+
+/**
  * Sanitize URL protocols - replace non-https with <sanitized-domain>/redacted
  * @param {string} s - The string to process
  * @returns {string} The string with non-https protocols redacted
  */
 function sanitizeUrlProtocols(s) {
+  // Strip userinfo (user:password@) from all scheme:// URLs before any other
+  // processing so that credentials never appear in redaction summaries or logs.
+  s = stripUrlUserinfo(s);
+
   // Normalize percent-encoded colons before applying the protocol filter.
   // This prevents bypasses via javascript%3Aalert(1) (single-encoded),
   // javascript%253Aalert(1) (double-encoded), or deeper nesting.
@@ -255,7 +392,6 @@ function sanitizeUrlProtocols(s) {
       // remains useful without recording an empty-string entry.
       const truncated = fullMatch.length > 12 ? fullMatch.substring(0, 12) + "..." : fullMatch;
       core.info(`Redacted URL: ${truncated}`);
-      core.debug(`Redacted URL (full): ${fullMatch}`);
       addRedactedDomain(scheme.toLowerCase() + "://");
       return "(redacted)";
     }
@@ -263,7 +399,6 @@ function sanitizeUrlProtocols(s) {
     const sanitized = sanitizeDomainName(domainLower);
     const truncated = domainLower.length > 12 ? domainLower.substring(0, 12) + "..." : domainLower;
     core.info(`Redacted URL: ${truncated}`);
-    core.debug(`Redacted URL (full): ${fullMatch}`);
     addRedactedDomain(domainLower);
     return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
   });
@@ -278,7 +413,6 @@ function sanitizeUrlProtocols(s) {
       const protocol = protocolMatch[1] + ":";
       const truncated = match.length > 12 ? match.substring(0, 12) + "..." : match;
       core.info(`Redacted URL: ${truncated}`);
-      core.debug(`Redacted URL (full): ${match}`);
       addRedactedDomain(protocol);
     }
     return "(redacted)";
@@ -292,6 +426,14 @@ function sanitizeUrlProtocols(s) {
  * @returns {string} The string with unknown domains redacted
  */
 function sanitizeUrlDomains(s, allowed) {
+  // Strip userinfo (user:password@) from HTTPS URLs before any domain filtering
+  // so that credentials are never passed to the allowlist check or preserved
+  // in the output for an allowed domain. Protocol-relative URLs (//host/path)
+  // are stripped too, since browsers resolve them to https:// and they are
+  // subject to the same allowlist check below.
+  s = stripUrlUserinfo(s);
+  s = stripProtocolRelativeUserinfo(s);
+
   // Match HTTPS URLs with optional port and path
   // This regex is designed to:
   // 1. Match https:// URIs with explicit protocol
@@ -337,7 +479,6 @@ function sanitizeUrlDomains(s, allowed) {
       const sanitized = sanitizeDomainName(hostname);
       const truncated = hostname.length > 12 ? hostname.substring(0, 12) + "..." : hostname;
       core.info(`Redacted URL: ${truncated}`);
-      core.debug(`Redacted URL (full): ${match}`);
       addRedactedDomain(hostname);
       // Return sanitized domain format
       return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
@@ -376,13 +517,32 @@ function sanitizeUrlDomains(s, allowed) {
   // The path stop-condition (?!\/\/) stops before the next protocol-relative URL
   // (analogous to how the httpsUrlRegex stops before the next https:// URL).
   // Capture groups:
+  // Second pass: handle protocol-relative URLs (//hostname/path).
+  // Browsers on HTTPS pages resolve these to https://, so they must be subject
+  // to the same domain allowlist check as explicit https:// URLs.
+  // We only treat // as a protocol-relative URL when it appears at the start of
+  // the string or immediately after a URL-introducing delimiter. The delimiter
+  // set is shared with the userinfo-stripping pre-pass (URL_START_DELIMITERS)
+  // so the two passes cannot disagree about where a URL begins. This avoids
+  // matching // segments inside the path of an allowed https:// URL, such as
+  // "https://github.com//issues".
+  // The separator accepts backslashes ("\\host", "/\host") because URL parsers
+  // treat "\" as "/" for special schemes, so those forms reach the same host.
+  // The path stop-condition (?!\/\/) stops before the next protocol-relative URL
+  // (analogous to how the httpsUrlRegex stops before the next https:// URL).
+  // Capture groups:
   //   1: prefix (start-of-string or delimiter)
-  //   2: full protocol-relative URL (starting with //)
+  //   2: separator (// or a backslash variant)
   //   3: hostname (and optional port)
   //   4: optional path
-  const protoRelativeUrlRegex = /(^|[\s([{"'])(\/\/([\w.-]+(?::\d+)?)(\/(?:(?!\/\/)[^\s,])*)?)/gi;
+  const protoRelativeUrlRegex = new RegExp(`(^|${URL_START_DELIMITERS})([/\\\\]{2})([\\w.-]+(?::\\d+)?)((?:/(?:(?![/\\\\]{2})[^\\s,])*)?)`, "gi");
 
-  s = s.replace(protoRelativeUrlRegex, (match, prefix, url, hostnameWithPort) => prefix + applyDomainFilter(url, hostnameWithPort));
+  s = s.replace(protoRelativeUrlRegex, (match, prefix, _separator, hostnameWithPort, path = "") => {
+    // Normalize the separator to "//" so a backslash form can never survive as
+    // an allowed URL in a shape the regex would not re-examine.
+    const url = `//${hostnameWithPort}${path}`;
+    return prefix + applyDomainFilter(url, hostnameWithPort);
+  });
 
   return s;
 }
@@ -1333,6 +1493,11 @@ function sanitizeContentCore(content, maxLength, maxBotMentions) {
   if (!content || typeof content !== "string") {
     return "";
   }
+
+  // Apply truncation early to avoid running expensive operations on oversized inputs.
+  // This is a pre-pass truncation on raw content; a second truncation pass is applied
+  // later after normalization (which may reduce length via stripping invisible chars).
+  content = applyTruncation(content, maxLength);
 
   // Build list of allowed domains from environment and GitHub context
   const allowedDomains = buildAllowedDomains();

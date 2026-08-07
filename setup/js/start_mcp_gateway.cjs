@@ -27,6 +27,7 @@ require("./shim.cjs");
  * Optional:
  * - GH_AW_ENGINE: Engine type (copilot, codex, claude, gemini)
  * - GH_AW_MCP_CLI_SERVERS: JSON array of server names to exclude from agent config
+ * - GH_AW_MCP_GATEWAY_CUSTOM_ENV_NAMES: JSON array of custom gateway environment variable names
  */
 
 const { spawn, execSync } = require("child_process");
@@ -39,6 +40,8 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 
 /** @type {number | null} */
 let activeGatewayPid = null;
+const customGatewayEnvMarker = "__GH_AW_MCP_GATEWAY_CUSTOM_ENV__";
+const customGatewayEnvNamePattern = /^[A-Z_][A-Z0-9_]*$/;
 
 // ---------------------------------------------------------------------------
 // Timing helpers
@@ -67,6 +70,37 @@ function printTiming(startMs, label) {
  */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Replaces the compiler marker with atomic Docker -e arguments. Runtime values
+ * never enter MCP_GATEWAY_DOCKER_COMMAND, preventing Docker argument injection.
+ *
+ * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string[]}
+ */
+function injectCustomGatewayEnvArgs(args, env = process.env) {
+  const markerIndex = args.indexOf(customGatewayEnvMarker);
+  if (markerIndex === -1) {
+    return args;
+  }
+
+  let names;
+  try {
+    names = JSON.parse(env.GH_AW_MCP_GATEWAY_CUSTOM_ENV_NAMES || "[]");
+  } catch (err) {
+    throw new Error(`GH_AW_MCP_GATEWAY_CUSTOM_ENV_NAMES must be valid JSON: ${getErrorMessage(err)}`, { cause: err });
+  }
+  if (!Array.isArray(names) || !names.every(name => typeof name === "string" && customGatewayEnvNamePattern.test(name))) {
+    throw new Error("GH_AW_MCP_GATEWAY_CUSTOM_ENV_NAMES must be an array of valid environment variable names");
+  }
+
+  // Missing indexed transport values intentionally become empty container env vars.
+  // This preserves deterministic NAME→slot mapping and keeps Docker argument injection
+  // impossible even if the compiler/runtime metadata ever diverges.
+  const customArgs = names.flatMap((name, index) => ["-e", `${name}=${env[`GH_AW_MCP_GATEWAY_ENV_${index}`] || ""}`]);
+  return [...args.slice(0, markerIndex), ...customArgs, ...args.slice(markerIndex + 1)];
 }
 
 /**
@@ -513,7 +547,6 @@ async function main() {
   // -----------------------------------------------------------------------
   const logDir = "/tmp/gh-aw/mcp-logs/";
   const outputPath = path.join(configDir, "gateway-output.json");
-  const stderrLogPath = "/tmp/gh-aw/mcp-logs/stderr.log";
 
   // Clean up any stale gateway container from a previous run on this runner.
   // On persistent self-hosted runners a prior job's gateway container may still
@@ -537,18 +570,18 @@ async function main() {
   const gatewayStartTime = nowMs();
 
   // Split docker command into args, respecting simple quoting
-  const args = dockerCommand.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+  let args = Array.from(dockerCommand.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || []);
   const cmd = args.shift();
   if (!cmd) {
     core.setFailed("ERROR: MCP_GATEWAY_DOCKER_COMMAND did not contain an executable command");
     return;
   }
+  args = injectCustomGatewayEnvArgs(args);
 
   const outputFd = fs.openSync(outputPath, "w", 0o600);
-  const stderrFd = fs.openSync(stderrLogPath, "w", 0o600);
 
   const child = spawn(cmd, args, {
-    stdio: ["pipe", outputFd, stderrFd],
+    stdio: ["pipe", outputFd, "ignore"],
     env: { ...process.env, MCP_GATEWAY_LOG_DIR: logDir },
     detached: true,
   });
@@ -587,13 +620,6 @@ async function main() {
     } catch {
       core.error("No stdout output available");
     }
-    core.error("");
-    core.error("Gateway stderr logs:");
-    try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
-    }
     core.setFailed("ERROR: Gateway process exited immediately after start");
     return;
   }
@@ -614,13 +640,6 @@ async function main() {
       core.error(fs.readFileSync(outputPath, "utf8"));
     } catch {
       core.error("No stdout output available");
-    }
-    core.error("");
-    core.error("Gateway stderr logs (debug output):");
-    try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
     }
     core.setFailed(`ERROR: Gateway process (PID: ${gatewayPid}) exited during initialization`);
     return;
@@ -727,13 +746,6 @@ async function main() {
       core.error("No stdout output available");
     }
     core.error("");
-    core.error("Gateway stderr logs (debug output):");
-    try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
-    }
-    core.error("");
     core.error("Checking network connectivity to gateway port...");
     try {
       // Validate gatewayPort is numeric to prevent shell injection
@@ -791,13 +803,6 @@ async function main() {
     } catch {
       core.error("No stdout output available");
     }
-    core.error("");
-    core.error("Gateway stderr logs:");
-    try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
-    }
     try {
       process.kill(gatewayPid);
     } catch {
@@ -826,13 +831,6 @@ async function main() {
     core.error("");
     core.error("Gateway error details:");
     core.error(JSON.stringify(gatewayOutput, null, 2));
-    core.error("");
-    core.error("Gateway stderr logs:");
-    try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
-    }
     try {
       process.kill(gatewayPid);
     } catch {
@@ -945,12 +943,11 @@ async function main() {
 
   if (fs.existsSync(checkScript)) {
     core.info("Running MCP server checks...");
-    // Store diagnostics in /tmp/gh-aw/mcp-logs/start-gateway.log
     // Pass apiKey via MCP_GATEWAY_API_KEY env var (already set) rather than
     // as a shell argument to avoid shell metacharacter injection risks.
     const safePort = String(gatewayPort).replace(/[^0-9]/g, "");
     try {
-      execSync(`bash "${checkScript}" "${outputPath}" "http://localhost:${safePort}" "$MCP_GATEWAY_API_KEY" 2>&1 | tee /tmp/gh-aw/mcp-logs/start-gateway.log`, { stdio: "inherit", env: process.env });
+      execSync(`bash "${checkScript}" "${outputPath}" "http://localhost:${safePort}" "$MCP_GATEWAY_API_KEY"`, { stdio: "inherit", env: process.env });
     } catch {
       core.error("ERROR: MCP server checks failed - no servers could be connected");
       core.error("Gateway process will be terminated");
@@ -1064,6 +1061,7 @@ module.exports = {
   hasNonEmptyOTLPHeaders,
   isOTLPIfMissingIgnore,
   getJSONParseErrorContext,
+  injectCustomGatewayEnvArgs,
   normalizeSinkVisibilityEncoding,
   resolveCopilotConfigPaths,
 };
