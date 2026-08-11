@@ -35,6 +35,7 @@ const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 const { normalizeIssueIntentLabelInputs, buildIssueIntentLabelUpdates } = require("./issue_intents.cjs");
 const { fetchAllRepoLabels } = require("./github_api_helpers.cjs");
+const { SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
 
 /**
  * @param {{ rationale?: string, confidence?: string, suggest?: boolean } | null | undefined} spec
@@ -231,14 +232,31 @@ const main = createCountGatedHandler({
         });
         if (requiredLabels.length > 0) {
           const itemLabels = (item.labels || []).map(/** @param {any} l */ l => (typeof l === "string" ? l : l.name || ""));
-          if (!requiredLabels.every(r => itemLabels.includes(r))) {
+          const missingLabels = requiredLabels.filter(r => !itemLabels.includes(r));
+          if (missingLabels.length > 0) {
             core.info(`Skipping add_labels for ${contextType} #${itemNumber}: does not match required-labels filter (${requiredLabels.join(", ")})`);
-            return { success: false, skipped: true, error: `Item does not match required-labels filter` };
+            return {
+              success: false,
+              skipped: true,
+              reasonCode: "REQUIRED_LABELS_MISMATCH",
+              reason: "Required labels missing",
+              error: "Item does not match required-labels filter",
+              target: { repo: itemRepo, number: itemNumber },
+              safeDetails: { requiredLabels, missingLabels },
+            };
           }
         }
         if (requiredTitlePrefix && !item.title?.startsWith(requiredTitlePrefix)) {
           core.info(`Skipping add_labels for ${contextType} #${itemNumber}: title does not start with required prefix "${requiredTitlePrefix}"`);
-          return { success: false, skipped: true, error: `Item title does not start with required prefix` };
+          return {
+            success: false,
+            skipped: true,
+            reasonCode: "REQUIRED_TITLE_PREFIX_MISMATCH",
+            reason: "Required title prefix missing",
+            error: "Item title does not start with required prefix",
+            target: { repo: itemRepo, number: itemNumber },
+            safeDetails: { requiredTitlePrefix },
+          };
         }
       }
 
@@ -344,7 +362,7 @@ const main = createCountGatedHandler({
 
           const issueNodeId = issueData?.node_id;
           if (!issueNodeId) {
-            throw new Error(`Failed to resolve GraphQL node ID for ${contextType} #${itemNumber}`);
+            throw new Error(`${SAFE_OUTPUT_E099}: Failed to resolve GraphQL node ID for ${contextType} #${itemNumber}`);
           }
 
           // The GraphQL updateIssue mutation only accepts Issue node IDs, and
