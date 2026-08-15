@@ -19,7 +19,7 @@ const {
   parseUnknownModelAICreditsFromAuditLog,
   parseMaxCacheMissesExceededFromEventLog,
 } = require("./ai_credits_context.cjs");
-const { MAX_CACHE_MISSES_EXCEEDED_PATTERN } = require("./detect_agent_errors.cjs");
+const { MAX_CACHE_MISSES_EXCEEDED_PATTERN, SHELL_EXPANSION_GUARD_REJECTED_PATTERN } = require("./detect_agent_errors.cjs");
 const { formatAICCredits } = require("./daily_aic_workflow_helpers.cjs");
 const { formatAIC } = require("./model_costs.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
@@ -32,6 +32,10 @@ const os = require("os");
 const path = require("path");
 
 const DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS = 24 * 7;
+/** Claude Code error emitted when a `--continue` resume finds no deferred tool marker. */
+const NO_DEFERRED_MARKER_LINE_RE = /No deferred tool marker found/i;
+/** Claude harness line reporting that the no-deferred-marker error was recovered by a fresh retry. */
+const CLAUDE_HARNESS_NO_DEFERRED_MARKER_RECOVERY_RE = /^\[claude-harness\].*no deferred tool marker on --continue.*retrying as fresh run.*--continue disabled permanently/i;
 const FAILURE_ISSUE_DEDUP_WINDOW_HOURS = 24;
 const FAILURE_ISSUE_CATEGORY_DAILY_CAP = 50;
 const FAILURE_ISSUE_WINDOW_MS = FAILURE_ISSUE_DEDUP_WINDOW_HOURS * 60 * 60 * 1000;
@@ -268,6 +272,7 @@ function buildFailureMatchCategories(options) {
   if (options.hasEngineRateLimit429) categories.push("engine_rate_limit_429");
   if (options.unknownModelAICredits) categories.push("unknown_model_ai_credits");
   if (options.missingModelPricingError) categories.push("missing_model_pricing");
+  if (options.shellExpansionGuardRejected) categories.push("shell_expansion_guard_rejected");
   if (options.maxAICreditsExceeded) categories.push("max_ai_credits_exceeded");
   if (options.hasAppTokenMintingFailed) categories.push("app_token_minting_failed");
   if (options.hasLockdownCheckFailed) categories.push("lockdown_check_failed");
@@ -312,6 +317,7 @@ function buildFailureMatchCategories(options) {
  * @param {boolean} [options.hasDockerSbxSecretsFailed]
  * @param {boolean} [options.missingModelPricingError]
  * @param {string} [options.missingModelPricingModelName]
+ * @param {boolean} [options.shellExpansionGuardRejected]
  * @returns {string}
  */
 function buildFailureIssueTitle(options) {
@@ -336,6 +342,7 @@ function buildFailureIssueTitle(options) {
   if (options.hasLockdownCheckFailed) return `[aw] ${workflowName} failed lockdown check`;
   if (options.hasOAuthTokenCheckFailed) return `[aw] ${workflowName} has OAuth token misconfiguration`;
   if (options.hasStaleLockFileFailed) return `[aw] ${workflowName} has stale lock file`;
+  if (options.shellExpansionGuardRejected) return `[aw] ${workflowName} hit shell expansion guard rejection`;
   if (options.hasDockerSbxSecretsFailed) return `[aw] ${workflowName} is missing docker-sbx Docker Hub secrets`;
   if (options.isTimedOut) return `[aw] ${workflowName} timed out`;
   if (options.hasToolDenialsExceeded) return `[aw] ${workflowName} exceeded tool denial limit`;
@@ -1683,10 +1690,11 @@ function buildTimeoutContext(isTimedOut, timeoutMinutes) {
  * @param {boolean} hasToolDenialsExceeded
  * @param {boolean} isTimedOut
  * @param {boolean} hasMissingModelPricingError
+ * @param {boolean} hasShellExpansionGuardRejected
  * @returns {boolean}
  */
-function shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, hasMissingModelPricingError = false) {
-  return agentConclusion === "failure" && !hasToolDenialsExceeded && !isTimedOut && !hasMissingModelPricingError;
+function shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, hasMissingModelPricingError = false, hasShellExpansionGuardRejected = false) {
+  return agentConclusion === "failure" && !hasToolDenialsExceeded && !isTimedOut && !hasMissingModelPricingError && !hasShellExpansionGuardRejected;
 }
 
 /**
@@ -2051,6 +2059,30 @@ function hasEngineMaxCacheMissesExceededSignal(content) {
     return false;
   }
   return MAX_CACHE_MISSES_EXCEEDED_PATTERN.test(content);
+}
+
+/**
+ * Detect sandbox shell-expansion guard rejections in text payloads.
+ * @param {string|null|undefined} content
+ * @returns {boolean}
+ */
+function hasShellExpansionGuardRejectedSignal(content) {
+  if (!content) {
+    return false;
+  }
+  return SHELL_EXPANSION_GUARD_REJECTED_PATTERN.test(content);
+}
+
+/**
+ * Build dedicated context for sandbox shell-expansion guard rejections.
+ * @param {boolean} hasShellExpansionGuardRejected
+ * @returns {string}
+ */
+function buildShellExpansionGuardRejectedContext(hasShellExpansionGuardRejected) {
+  if (!hasShellExpansionGuardRejected) {
+    return "";
+  }
+  return "\n" + renderPromptTemplate("shell_expansion_guard_rejected.md");
 }
 
 /**
@@ -2712,6 +2744,7 @@ function detectEngineRateLimit429Failure() {
 function buildEngineFailureContext(options = {}) {
   const suppressEngineRateLimit429 = options.suppressEngineRateLimit429 === true;
   const maxCacheMissesExceededFromDetection = options.maxCacheMissesExceeded === true;
+  const shellExpansionGuardRejectedFromDetection = options.shellExpansionGuardRejected === true;
   // Derive agent-stdio.log path from the agent output file path (same directory)
   const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
   const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
@@ -2723,6 +2756,10 @@ function buildEngineFailureContext(options = {}) {
 
   try {
     if (!fs.existsSync(stdioLogPath)) {
+      if (shellExpansionGuardRejectedFromDetection) {
+        core.info("agent-stdio.log not found, but shell expansion guard rejection was detected — using dedicated context message");
+        return buildShellExpansionGuardRejectedContext(true);
+      }
       if (hasStructuredMaxCacheMissesSignal) {
         core.info("agent-stdio.log not found, but structured max cache misses signal was detected — using dedicated context message");
         return buildEngineMaxCacheMissesExceededContext(engineLabel);
@@ -2733,6 +2770,10 @@ function buildEngineFailureContext(options = {}) {
 
     const logContent = fs.readFileSync(stdioLogPath, "utf8");
     if (!logContent.trim()) {
+      if (shellExpansionGuardRejectedFromDetection) {
+        core.info("agent-stdio.log is empty, but shell expansion guard rejection was detected — using dedicated context message");
+        return buildShellExpansionGuardRejectedContext(true);
+      }
       if (hasStructuredMaxCacheMissesSignal) {
         core.info("agent-stdio.log is empty, but structured max cache misses signal was detected — using dedicated context message");
         return buildEngineMaxCacheMissesExceededContext(engineLabel);
@@ -2756,6 +2797,11 @@ function buildEngineFailureContext(options = {}) {
       return buildEngineRateLimit429Context(engineLabel);
     }
 
+    if (hasShellExpansionGuardRejectedSignal(logContent) || shellExpansionGuardRejectedFromDetection) {
+      core.info("Detected shell expansion guard rejection — using dedicated context message");
+      return buildShellExpansionGuardRejectedContext(true);
+    }
+
     if (hasEngineMaxRunsExceededSignal(logContent)) {
       core.info("Detected engine max-runs guardrail signal — using dedicated context message");
       return buildEngineMaxRunsExceededContext(engineLabel);
@@ -2767,8 +2813,30 @@ function buildEngineFailureContext(options = {}) {
     }
 
     const errorMessages = new Set();
+    // "No deferred tool marker found" is only noise when the Claude harness reports that it
+    // recovered from it by retrying fresh with --continue permanently disabled. Correlate each
+    // marker line with a later harness-prefixed recovery line so that markers that were never
+    // recovered (including a terminal marker after an earlier recovered one) stay visible.
+    const recoveredNoDeferredMarkerLines = new Set();
+    {
+      const pendingMarkerLines = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (NO_DEFERRED_MARKER_LINE_RE.test(line)) {
+          pendingMarkerLines.push(i);
+          continue;
+        }
+        if (pendingMarkerLines.length > 0 && CLAUDE_HARNESS_NO_DEFERRED_MARKER_RECOVERY_RE.test(line)) {
+          for (const markerLine of pendingMarkerLines) {
+            recoveredNoDeferredMarkerLines.add(markerLine);
+          }
+          pendingMarkerLines.length = 0;
+        }
+      }
+    }
+    const isRecoveredNoDeferredMarkerLine = index => recoveredNoDeferredMarkerLines.has(index);
 
-    for (const line of lines) {
+    for (const [lineIndex, line] of lines.entries()) {
       // Codex / generic CLI: "ERROR: <message>" at the start of a line
       const errorPrefixMatch = line.match(/^ERROR:\s*(.+)$/);
       if (errorPrefixMatch) {
@@ -2779,7 +2847,11 @@ function buildEngineFailureContext(options = {}) {
       // Node.js / generic: "Error: <message>" at the start of a line
       const errorCapMatch = line.match(/^Error:\s*(.+)$/);
       if (errorCapMatch) {
-        errorMessages.add(errorCapMatch[1].trim());
+        const message = errorCapMatch[1].trim();
+        if (isRecoveredNoDeferredMarkerLine(lineIndex)) {
+          continue;
+        }
+        errorMessages.add(message);
         continue;
       }
 
@@ -2875,13 +2947,13 @@ function buildEngineFailureContext(options = {}) {
     // Fallback: no known error patterns found — include the last non-empty lines so that
     // failures caused by timeouts or unexpected terminations still surface useful context.
     const TAIL_LINES = 10;
-    const nonEmptyLines = lines.filter(l => l.trim());
+    const nonEmptyLines = lines.map((line, index) => ({ line, index })).filter(entry => entry.line.trim());
     if (nonEmptyLines.length === 0) {
       return "";
     }
 
     // Exclude AWF infrastructure lines so the fallback displays only actual engine output.
-    const agentLines = nonEmptyLines.filter(l => !INFRA_LINE_RE.test(l));
+    const agentLines = nonEmptyLines.filter(entry => !INFRA_LINE_RE.test(entry.line) && !isRecoveredNoDeferredMarkerLine(entry.index)).map(entry => entry.line);
 
     if (agentLines.length === 0) {
       // The log contains only AWF infrastructure lines — the engine exited before producing
@@ -3219,6 +3291,7 @@ async function main() {
     const unknownModelAICredits = unknownModelAICreditsFromAudit || (unknownModelAICreditsFromOutput && agentConclusion === "failure");
     const missingModelPricingError = process.env.GH_AW_MISSING_MODEL_PRICING_ERROR === "true" && agentConclusion === "failure";
     const missingModelPricingModelName = process.env.GH_AW_MISSING_MODEL_PRICING_MODEL_NAME || "";
+    const shellExpansionGuardRejected = process.env.GH_AW_SHELL_EXPANSION_GUARD_REJECTED === "true" && agentConclusion === "failure";
     const pushRepoMemoryResult = process.env.GH_AW_PUSH_REPO_MEMORY_RESULT || "";
     const reportFailureAsIssue = parseBoolTemplatable(process.env.GH_AW_FAILURE_REPORT_AS_ISSUE, true);
     // Parse included categories filter for report-failure-as-issue (optional JSON array of category strings)
@@ -3332,6 +3405,7 @@ async function main() {
     core.info(`Unknown model AI credits error: ${unknownModelAICredits}`);
     core.info(`Unknown model AI credits sources (audit/output): ${unknownModelAICreditsFromAudit}/${unknownModelAICreditsFromOutput}`);
     core.info(`Missing model pricing error: ${missingModelPricingError} (model: ${missingModelPricingModelName || "(unknown)"})`);
+    core.info(`Shell expansion guard rejected: ${shellExpansionGuardRejected}`);
     core.info(`Push repo-memory result: ${pushRepoMemoryResult}`);
     core.info(`App token minting failed (safe_outputs/conclusion/activation): ${safeOutputsAppTokenMintingFailed}/${conclusionAppTokenMintingFailed}/${activationAppTokenMintingFailed}`);
     core.info(`Lockdown check failed: ${hasLockdownCheckFailed}`);
@@ -3347,7 +3421,7 @@ async function main() {
     // A step-level timeout (timeout-minutes on the engine execution step) is detected by
     // the detect-copilot-errors step which checks for SIGTERM/SIGKILL/SIGINT signals
     // in the engine output and sets the agentic_engine_timeout output.
-    const isTimedOut = agentConclusion === "timed_out" || agenticEngineTimeout;
+    const isTimedOut = (agentConclusion === "timed_out" || agenticEngineTimeout) && !shellExpansionGuardRejected;
 
     // Check if there are assignment errors (regardless of agent job status).
     // Use assignment_errors as the single source of truth because it includes
@@ -3631,6 +3705,7 @@ async function main() {
       aiCreditsRateLimitError,
       hasEngineRateLimit429,
       maxAICreditsExceeded,
+      shellExpansionGuardRejected,
       hasAssignmentErrors,
       http400ResponseError,
       unknownModelAICredits,
@@ -3817,7 +3892,7 @@ async function main() {
         // context is the more actionable signal.
         // Also suppress when missing-model-pricing is detected: the pricing error is the
         // root cause and the engine error block would be redundant noise.
-        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError)
+        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected)
           ? buildEngineFailureContext({
               suppressEngineRateLimit429: maxAICreditsExceeded,
               maxCacheMissesExceeded,
@@ -3894,6 +3969,7 @@ async function main() {
           ai_credits_rate_limit_error_context: aiCreditsRateLimitErrorContext,
           unknown_model_ai_credits_context: unknownModelAICreditsContext,
           missing_model_pricing_context: missingModelPricingContext,
+          shell_expansion_guard_rejected_context: buildShellExpansionGuardRejectedContext(shellExpansionGuardRejected),
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
           oauth_token_check_failed_context: oauthTokenCheckFailedContext,
@@ -4044,7 +4120,9 @@ async function main() {
         // context is the more actionable signal.
         // Also suppress when missing-model-pricing is detected: the pricing error is the
         // root cause and the engine error block would be redundant noise.
-        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError) ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded }) : "";
+        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected)
+          ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded })
+          : "";
 
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
@@ -4121,6 +4199,7 @@ async function main() {
           ai_credits_rate_limit_error_context: aiCreditsRateLimitErrorContext,
           unknown_model_ai_credits_context: unknownModelAICreditsContext,
           missing_model_pricing_context: missingModelPricingContext,
+          shell_expansion_guard_rejected_context: buildShellExpansionGuardRejectedContext(shellExpansionGuardRejected),
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
           oauth_token_check_failed_context: oauthTokenCheckFailedContext,
@@ -4244,6 +4323,8 @@ module.exports = {
   buildEngineRateLimit429Context,
   hasEngineMaxCacheMissesExceededSignal,
   buildEngineMaxCacheMissesExceededContext,
+  hasShellExpansionGuardRejectedSignal,
+  buildShellExpansionGuardRejectedContext,
   readTokenUsageMarkdown,
   parseFirewallAuthErrors,
   parseMaxAICreditsFromAuditLog,

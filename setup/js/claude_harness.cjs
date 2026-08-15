@@ -18,8 +18,9 @@
  *     observed immediately after a `permission_denied` tool-result on a compound Bash command.
  *     It is retried as a fresh run (not `--continue`, which is permanently disabled for the rest
  *     of the driver invocation) since resuming would resend the same corrupted session state.
- *   - If the process produced no output (failed to start / auth error before any work), the
- *     driver does not retry because there is nothing to resume.
+ *   - Connection-refused failures before the first assistant response are retried as fresh
+ *     runs because there is no session state to resume.
+ *   - Other failures that produce no output use a separate bounded startup retry budget.
  *   - On a `--continue` retry the initial prompt is omitted: Claude Code resumes the session
  *     from its on-disk state rather than re-processing the original instructions.
  *   - Retries use exponential backoff: 5s → 10s → 20s (capped at 60s) by default.
@@ -39,6 +40,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const fs = require("fs");
 const { runProcess, formatDuration, sleep } = require("./process_runner.cjs");
+const { runHarnessRetryLoop, shouldSkipForNoopSafeOutputs, shouldStopForNoopSafeOutputs } = require("./harness_retry_runner.cjs");
 const { resolveRetryConfig: resolveSharedRetryConfig } = require("./harness_retry_config.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
@@ -56,6 +58,7 @@ const {
 const { emitMissingToolPermissionIssue, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
 const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal, isAuthenticationFailedError } = require("./harness_retry_guard.cjs");
+const { isCrashSignalExitCode, crashSignalNameForExitCode } = require("./harness_crash_signals.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
 const { applyModelFallback } = require("./model_fallback.cjs");
 const { parseMaxAICreditsExceededFromAuditLog } = require("./ai_credits_context.cjs");
@@ -81,6 +84,7 @@ const RATE_LIMIT_ERROR_PATTERN = /rate_limit_error|429 Too Many Requests|"api_er
 // run rather than --continue, since resuming would resend the same corrupted
 // session state and reproduce the identical error.
 const INVALID_JSON_BODY_ERROR_PATTERN = /request body is not valid JSON/i;
+const CONNECTION_REFUSED_ERROR_PATTERN = /connection refused|ECONNREFUSED/i;
 
 // Pattern to detect a clean max-turns exit from Claude Code.
 // Claude Code emits a JSON result object with "subtype":"error_max_turns" when the
@@ -191,6 +195,25 @@ function isInvalidJsonBodyError(output) {
 }
 
 /**
+ * Determines if the collected output contains a refused network connection.
+ * @param {string} output - Collected stdout+stderr from the process
+ * @returns {boolean}
+ */
+function isConnectionRefusedError(output) {
+  return CONNECTION_REFUSED_ERROR_PATTERN.test(output);
+}
+
+/**
+ * Determines whether Claude produced an assistant response before failing.
+ * System initialization and transport-error events do not represent resumable work.
+ * @param {string} output - Collected stdout+stderr from the process
+ * @returns {boolean}
+ */
+function hasClaudeSessionProgress(output) {
+  return output.split(/\r?\n/).some(line => /"type"\s*:\s*"assistant"/.test(line));
+}
+
+/**
  * Determines if the collected output contains a "no deferred tool marker" error.
  * This occurs when Claude Code is invoked with --continue but the session was never
  * deferred, the deferred marker is stale (tool already ran), or it falls outside the
@@ -238,7 +261,7 @@ function shouldRetryWithContinue({ attempt, maxRetries, exitCode, hasOutput, isN
   if (attempt >= maxRetries || !hasOutput || continueDisabledPermanently) {
     return false;
   }
-  if (isSignalTerminationExitCode(exitCode)) {
+  if (isSignalTerminationExitCode(exitCode) || isCrashSignalExitCode(exitCode)) {
     return false;
   }
   if (isNoDeferredMarker) {
@@ -415,16 +438,20 @@ async function main() {
   // A noop indicates the work is complete or there is nothing to do — starting the agent
   // would be wasteful and potentially harmful.
   const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS || "";
-  if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
-    log("pre-flight: noop message found in safe-outputs — skipping agent (work is already complete or no work needed)");
+  if (shouldSkipForNoopSafeOutputs({ safeOutputsPath, hasNoopInSafeOutputs, log })) {
     process.exit(0);
   }
 
-  let delay = initialDelayMs;
   let lastExitCode = 1;
   let useContinueOnRetry = false;
   let continueDisabledPermanently = false;
   let startupRetriesUsed = 0;
+  // Tracks whether the *active session* (the run currently being resumed via --continue)
+  // has ever produced an assistant response. This must persist across attempts — a later
+  // --continue attempt can fail during its own startup (e.g. connection refused before it
+  // emits anything) even though earlier attempts in the same session already made progress.
+  // Reset only when a genuinely fresh run begins (see below), never on a --continue attempt.
+  let sessionHasProgress = false;
   const driverStartTime = Date.now();
   // Soft-timeout guard: polled at the top of the retry loop and after each backoff sleep.
   // It does not preempt a running attempt — if a single invocation runs past the soft
@@ -432,220 +459,203 @@ async function main() {
   // complete within the SOFT_TIMEOUT_BUFFER_MS window.
   const softTimeoutGuard = buildSoftTimeoutGuard(driverStartTime);
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (softTimeoutGuard && Date.now() >= softTimeoutGuard.softDeadlineMs) {
-      emitSoftTimeoutSignal(softTimeoutGuard, `before attempt ${attempt + 1}`, "Claude harness", log);
-      lastExitCode = 1;
-      break;
-    }
-
-    // For --continue retries: omit the original prompt and add --continue.
-    // Claude Code resumes the session from on-disk state; re-sending the original
-    // instructions would re-execute the full task from scratch.
-    let currentArgs;
-    if (attempt > 0 && useContinueOnRetry) {
-      currentArgs = [...continueBaseArgs, "--continue"];
-    } else {
-      currentArgs = attempt === 0 ? initialArgs : freshRetryArgs;
-    }
-
-    // Use redacted args for logging when the run carries the prompt text.
-    const logArgs = attempt === 0 ? safeInitialArgs : useContinueOnRetry ? currentArgs : safeFreshRetryArgs;
-
-    if (attempt > 0) {
-      const retryMode = useContinueOnRetry ? "--continue" : "fresh run";
-      log(`retry ${attempt}/${maxRetries}: sleeping ${delay}ms before next attempt (${retryMode})`);
-      await sleep(delay);
-      delay = Math.min(delay * backoffMultiplier, maxDelayMs);
-      log(`retry ${attempt}/${maxRetries}: woke up, next delay cap will be ${Math.min(delay * backoffMultiplier, maxDelayMs)}ms`);
-      if (softTimeoutGuard && Date.now() >= softTimeoutGuard.softDeadlineMs) {
-        emitSoftTimeoutSignal(softTimeoutGuard, "after backoff sleep", "Claude harness", log);
-        lastExitCode = 1;
-        break;
+  const retryRun = await runHarnessRetryLoop({
+    maxRetries,
+    initialDelayMs,
+    backoffMultiplier,
+    maxDelayMs,
+    driverStartTime,
+    harnessName: "Claude harness",
+    log,
+    softTimeoutGuard,
+    getRetryMode: () => (useContinueOnRetry ? "--continue" : "fresh run"),
+    runAttempt: async attempt => {
+      // For --continue retries: omit the original prompt and add --continue.
+      // Claude Code resumes the session from on-disk state; re-sending the original
+      // instructions would re-execute the full task from scratch.
+      let currentArgs;
+      if (attempt > 0 && useContinueOnRetry) {
+        currentArgs = [...continueBaseArgs, "--continue"];
+      } else {
+        currentArgs = attempt === 0 ? initialArgs : freshRetryArgs;
+        // This attempt starts a brand-new session (either attempt 0, or a fresh
+        // retry that discards prior on-disk state) — no assistant progress can carry
+        // forward from any earlier attempt, so reset the tracker.
+        sessionHasProgress = false;
       }
-    }
 
-    const result = await runProcess({ command, args: currentArgs, attempt, log, logArgs, env: childEnv });
-    lastExitCode = result.exitCode;
-
-    // Success — stop retrying
-    if (result.exitCode === 0) {
-      log(`success on attempt ${attempt + 1}: totalDuration=${formatDuration(Date.now() - driverStartTime)}`);
-      lastExitCode = 0;
-      break;
-    }
-
-    const isOverloaded = isOverloadedError(result.output);
-    const isRateLimit = isRateLimitError(result.output);
-    const isAuthenticationFailed = isAuthenticationFailedError(result.output);
-    const isMaxTurns = isMaxTurnsExit(result.output);
-    const isNoDeferredMarker = isNoDeferredMarkerError(result.output);
-    const isInvalidModel = isInvalidModelError(result.output);
-    const isInvalidJsonBody = isInvalidJsonBodyError(result.output);
-    const permissionDeniedCount = countPermissionDeniedIssues(result.output);
-    const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
-    log(
-      `attempt ${attempt + 1} failed:` +
-        ` exitCode=${result.exitCode}` +
-        ` isOverloadedError=${isOverloaded}` +
-        ` isRateLimitError=${isRateLimit}` +
-        ` isAuthenticationFailedError=${isAuthenticationFailed}` +
-        ` isMaxTurnsExit=${isMaxTurns}` +
-        ` isNoDeferredMarkerError=${isNoDeferredMarker}` +
-        ` isInvalidModelError=${isInvalidModel}` +
-        ` isInvalidJsonBodyError=${isInvalidJsonBody}` +
-        ` permissionDeniedCount=${permissionDeniedCount}` +
-        ` hasNumerousPermissionDenied=${hasNumerousPermissionDenied}` +
-        ` hasOutput=${result.hasOutput}` +
-        ` retriesRemaining=${maxRetries - attempt}`
-    );
-
-    // If a noop was written to safe-outputs during the failed run, the agent determined
-    // there was nothing to do (or the user indicated so before the agent ran).  Retrying
-    // would not produce different results and could waste resources.
-    if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
-      log(`attempt ${attempt + 1}: noop message found in safe-outputs — not retrying (work is already complete or no work needed)`);
-      lastExitCode = 0;
-      break;
-    }
-
-    const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
-    const trustedAICreditsExceeded = nonRetryableGuard.aiCreditsExceeded && parseMaxAICreditsExceededFromAuditLog();
-    if (nonRetryableGuard.aiCreditsExceeded && !trustedAICreditsExceeded) {
-      log(`attempt ${attempt + 1}: AI credits marker found in CLI output without trusted firewall audit confirmation — preserving normal failure handling`);
-    }
-    const shouldTreatAICreditsExceededAsSuccess = trustedAICreditsExceeded && !isAuthenticationFailed;
-    if (shouldTreatAICreditsExceededAsSuccess || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.maxRunsExceeded) {
-      const reasons = [];
-      if (shouldTreatAICreditsExceededAsSuccess) reasons.push("AI credits budget exceeded");
-      if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
-      if (nonRetryableGuard.maxRunsExceeded) reasons.push("maximum LLM invocations exceeded");
-      log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
-      // When the per-run AI credits budget is exceeded the AWF firewall intentionally
-      // stopped the agent — this is controlled budget enforcement, not an unexpected
-      // error.  Exit 0 so the agent step and job succeed; the ai_credits_rate_limit_error
-      // output surfaced by parse-mcp-gateway will inform downstream handlers (e.g.
-      // handle_agent_failure) of the budget exceedance.
-      if (shouldTreatAICreditsExceededAsSuccess) {
-        log(`attempt ${attempt + 1}: AI credits budget enforced — exiting 0 (budget control, not an error)`);
-        lastExitCode = 0;
-      }
-      break;
-    }
-
-    if (attempt === 0 && isAuthenticationFailed) {
-      log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
-      break;
-    }
-
-    if (isInvalidModel) {
-      log(`attempt ${attempt + 1}: invalid/unsupported model configuration — not retrying (specify a valid engine model name in workflow frontmatter)`);
-      break;
-    }
-
-    if (hasNumerousPermissionDenied) {
-      // If the agent already produced expected safe-outputs, the permission-denied
-      // signals are from optional/exploratory commands — not from the core task work.
-      // Suppress the terminal verdict and exit 0 to avoid a false-red run.
-      if (safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
-        log(`attempt ${attempt + 1}: detected numerous permission-denied issues but safe-outputs already contain expected output — suppressing terminal verdict (false-red: core work succeeded)`);
-        lastExitCode = 0;
-        break;
-      }
-      const deniedCommands = extractDeniedCommands(result.output);
-      emitMissingToolPermissionIssue({ deniedCommands, logger: log });
-      log(`attempt ${attempt + 1}: detected numerous permission-denied issues — not retrying (classified as missing tool/permission issue)`);
-      break;
-    }
-
-    // max_turns is a deterministic terminal condition: the session ended cleanly after
-    // exhausting the allowed number of turns.  --continue cannot resume it because no
-    // deferred tool marker was written.  Retrying would immediately fail with "No deferred
-    // tool marker found", wasting time and masking the real exit reason.
-    if (isMaxTurns) {
-      log(`attempt ${attempt + 1}: max_turns exit — not retriable via --continue`);
-      break;
-    }
-
-    // "No deferred tool marker found" is a deterministic terminal condition: the session
-    // was never deferred, the marker is stale (tool already ran), or it falls outside the
-    // tail-scan window. If this happens on a --continue attempt, restart fresh and disable
-    // --continue permanently so we do not re-enter the same invalid retry path.
-    if (isNoDeferredMarker) {
-      if (attempt < maxRetries && result.hasOutput) {
-        useContinueOnRetry = false;
-        continueDisabledPermanently = true;
-        log(`attempt ${attempt + 1}: no deferred tool marker on --continue — retrying as fresh run (failure_reason=harness_retry_path_invalid, --continue disabled permanently, attempt ${attempt + 2}/${maxRetries + 1})`);
-        continue;
-      }
-      log(`attempt ${attempt + 1}: no deferred tool marker — not retriable via --continue (failure_reason=harness_retry_path_invalid)`);
-      break;
-    }
-
-    // "The request body is not valid JSON" is a transport-level serialization bug,
-    // observed immediately after a permission_denied tool-result on a compound Bash
-    // command. Retrying with --continue would resend the same corrupted on-disk
-    // session state and reproduce the identical error, so force a fresh run and
-    // permanently disable --continue for the remainder of this driver invocation.
-    if (isInvalidJsonBody) {
-      if (attempt < maxRetries && result.hasOutput) {
-        useContinueOnRetry = false;
-        continueDisabledPermanently = true;
-        log(`attempt ${attempt + 1}: invalid JSON request body (transport-level serialization bug, likely following a permission_denied) — retrying as fresh run (--continue disabled permanently, attempt ${attempt + 2}/${maxRetries + 1})`);
-        continue;
-      }
-      log(`attempt ${attempt + 1}: invalid JSON request body — not retriable via --continue (failure_reason=harness_retry_path_invalid)`);
-      break;
-    }
-
-    // Retry when the session was partially executed (has output).
-    // Use --continue so Claude Code can resume from its saved session state.
-    if (attempt < maxRetries && result.hasOutput) {
-      const isSignalTermination = isSignalTerminationExitCode(result.exitCode);
-      const retryWithContinue = shouldRetryWithContinue({
-        attempt,
-        maxRetries,
-        exitCode: result.exitCode,
-        hasOutput: result.hasOutput,
-        isNoDeferredMarker,
-        continueDisabledPermanently,
-      });
-      if (isSignalTermination) {
-        continueDisabledPermanently = true;
-      }
-      const reason = isSignalTermination
-        ? `signal-style termination exitCode=${result.exitCode} (failure_reason=cancelled_or_timed_out)`
-        : isOverloaded
-          ? "overloaded_error (transient)"
-          : isRateLimit
-            ? "rate_limit_error (transient)"
-            : "partial execution";
-      useContinueOnRetry = retryWithContinue;
-      const retryMode = retryWithContinue ? "--continue" : "fresh run (--continue disabled permanently)";
-      log(`attempt ${attempt + 1}: ${reason} — will retry with ${retryMode} (attempt ${attempt + 2}/${maxRetries + 1})`);
-      continue;
-    }
-
-    if (attempt >= maxRetries) {
-      log(`all ${maxRetries} retries exhausted — giving up (exitCode=${lastExitCode})`);
-    } else {
-      if (startupRetriesUsed < startupRetryLimit) {
-        startupRetriesUsed++;
-        useContinueOnRetry = false;
-        delay = initialDelayMs;
-        // attempt is 0-based; logs are 1-based, so "next attempt" is +2.
-        const nextAttemptNumber = attempt + 2;
-        const totalAttempts = maxRetries + 1;
-        log(`attempt ${attempt + 1}: no output produced — retrying startup as fresh run ` + `(startup retry ${startupRetriesUsed}/${startupRetryLimit}, next attempt ${nextAttemptNumber} of ${totalAttempts} total attempts)`);
-        continue;
-      }
+      // Use redacted args for logging when the run carries the prompt text.
+      const logArgs = attempt === 0 ? safeInitialArgs : useContinueOnRetry ? currentArgs : safeFreshRetryArgs;
+      return runProcess({ command, args: currentArgs, attempt, log, logArgs, env: childEnv });
+    },
+    handleFailure: ({ attempt, result }) => {
+      const isOverloaded = isOverloadedError(result.output);
+      const isRateLimit = isRateLimitError(result.output);
+      const isAuthenticationFailed = isAuthenticationFailedError(result.output);
+      const isMaxTurns = isMaxTurnsExit(result.output);
+      const isNoDeferredMarker = isNoDeferredMarkerError(result.output);
+      const isInvalidModel = isInvalidModelError(result.output);
+      const isInvalidJsonBody = isInvalidJsonBodyError(result.output);
+      const isConnectionRefused = isConnectionRefusedError(result.output);
+      // Accumulate across attempts of the same session: once an assistant response has been
+      // observed, it stays true for the remainder of this session's --continue attempts, even
+      // if a later attempt's own output contains nothing but startup/transport errors.
+      sessionHasProgress = sessionHasProgress || hasClaudeSessionProgress(result.output);
+      const permissionDeniedCount = countPermissionDeniedIssues(result.output);
+      const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
+      const crashSignalName = crashSignalNameForExitCode(result.exitCode);
       log(
-        `attempt ${attempt + 1}: no output produced — not retrying (startup retry budget exhausted: ${startupRetriesUsed}/${startupRetryLimit}; possible causes: binary not found, permission denied, auth failure, or silent startup crash)`
+        `attempt ${attempt + 1} failed:` +
+          ` exitCode=${result.exitCode}` +
+          (crashSignalName ? ` crashSignal=${crashSignalName}` : "") +
+          ` isOverloadedError=${isOverloaded}` +
+          ` isRateLimitError=${isRateLimit}` +
+          ` isAuthenticationFailedError=${isAuthenticationFailed}` +
+          ` isMaxTurnsExit=${isMaxTurns}` +
+          ` isNoDeferredMarkerError=${isNoDeferredMarker}` +
+          ` isInvalidModelError=${isInvalidModel}` +
+          ` isInvalidJsonBodyError=${isInvalidJsonBody}` +
+          ` isConnectionRefusedError=${isConnectionRefused}` +
+          ` sessionHasProgress=${sessionHasProgress}` +
+          ` permissionDeniedCount=${permissionDeniedCount}` +
+          ` hasNumerousPermissionDenied=${hasNumerousPermissionDenied}` +
+          ` hasOutput=${result.hasOutput}` +
+          ` retriesRemaining=${maxRetries - attempt}`
       );
-    }
 
-    break;
-  }
+      if (shouldStopForNoopSafeOutputs({ attempt, safeOutputsPath, hasNoopInSafeOutputs, log })) {
+        return { action: "stop", exitCode: 0 };
+      }
+
+      const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
+      const trustedAICreditsExceeded = nonRetryableGuard.aiCreditsExceeded && parseMaxAICreditsExceededFromAuditLog();
+      if (nonRetryableGuard.aiCreditsExceeded && !trustedAICreditsExceeded) {
+        log(`attempt ${attempt + 1}: AI credits marker found in CLI output without trusted firewall audit confirmation — preserving normal failure handling`);
+      }
+      const shouldTreatAICreditsExceededAsSuccess = trustedAICreditsExceeded && !isAuthenticationFailed;
+      if (shouldTreatAICreditsExceededAsSuccess || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.maxRunsExceeded) {
+        const reasons = [];
+        if (shouldTreatAICreditsExceededAsSuccess) reasons.push("AI credits budget exceeded");
+        if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
+        if (nonRetryableGuard.maxRunsExceeded) reasons.push("maximum LLM invocations exceeded");
+        log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
+        if (shouldTreatAICreditsExceededAsSuccess) {
+          log(`attempt ${attempt + 1}: AI credits budget enforced — exiting 0 (budget control, not an error)`);
+          return { action: "stop", exitCode: 0 };
+        }
+        if (nonRetryableGuard.maxRunsExceeded && safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
+          log(`attempt ${attempt + 1}: invocation cap saturated but safe-outputs already contain expected output — suppressing terminal verdict (false-red: core work succeeded)`);
+          return { action: "stop", exitCode: 0 };
+        }
+        return { action: "stop" };
+      }
+
+      if (attempt === 0 && isAuthenticationFailed) {
+        log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
+        return { action: "stop" };
+      }
+
+      if (isInvalidModel) {
+        log(`attempt ${attempt + 1}: invalid/unsupported model configuration — not retrying (specify a valid engine model name in workflow frontmatter)`);
+        return { action: "stop" };
+      }
+
+      if (hasNumerousPermissionDenied) {
+        if (safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
+          log(`attempt ${attempt + 1}: detected numerous permission-denied issues but safe-outputs already contain expected output — suppressing terminal verdict (false-red: core work succeeded)`);
+          return { action: "stop", exitCode: 0 };
+        }
+        const deniedCommands = extractDeniedCommands(result.output);
+        emitMissingToolPermissionIssue({ deniedCommands, logger: log });
+        log(`attempt ${attempt + 1}: detected numerous permission-denied issues — not retrying (classified as missing tool/permission issue)`);
+        return { action: "stop" };
+      }
+
+      if (isMaxTurns) {
+        log(`attempt ${attempt + 1}: max_turns exit — not retriable via --continue`);
+        return { action: "stop" };
+      }
+
+      if (isNoDeferredMarker) {
+        if (attempt < maxRetries && result.hasOutput) {
+          useContinueOnRetry = false;
+          continueDisabledPermanently = true;
+          log(`attempt ${attempt + 1}: no deferred tool marker on --continue — retrying as fresh run (failure_reason=harness_retry_path_invalid, --continue disabled permanently, attempt ${attempt + 2}/${maxRetries + 1})`);
+          return { action: "retry" };
+        }
+        log(`attempt ${attempt + 1}: no deferred tool marker — not retriable via --continue (failure_reason=harness_retry_path_invalid)`);
+        return { action: "stop" };
+      }
+
+      if (isInvalidJsonBody) {
+        if (attempt < maxRetries && result.hasOutput) {
+          useContinueOnRetry = false;
+          continueDisabledPermanently = true;
+          log(
+            `attempt ${attempt + 1}: invalid JSON request body (transport-level serialization bug, likely following a permission_denied) — retrying as fresh run (--continue disabled permanently, attempt ${attempt + 2}/${maxRetries + 1})`
+          );
+          return { action: "retry" };
+        }
+        log(`attempt ${attempt + 1}: invalid JSON request body — not retriable via --continue (failure_reason=harness_retry_path_invalid)`);
+        return { action: "stop" };
+      }
+
+      if (isConnectionRefused && !sessionHasProgress && attempt < maxRetries) {
+        useContinueOnRetry = false;
+        log(`attempt ${attempt + 1}: connection refused before first assistant response — retrying as fresh run with backoff (attempt ${attempt + 2}/${maxRetries + 1})`);
+        return { action: "retry" };
+      }
+
+      if (attempt < maxRetries && result.hasOutput) {
+        const isSignalTermination = isSignalTerminationExitCode(result.exitCode);
+        const isCrashSignal = isCrashSignalExitCode(result.exitCode);
+        const crashSignalName = crashSignalNameForExitCode(result.exitCode);
+        const retryWithContinue = shouldRetryWithContinue({
+          attempt,
+          maxRetries,
+          exitCode: result.exitCode,
+          hasOutput: result.hasOutput,
+          isNoDeferredMarker,
+          continueDisabledPermanently,
+        });
+        if (isSignalTermination || isCrashSignal) {
+          continueDisabledPermanently = true;
+        }
+        const reason = isCrashSignal
+          ? `fatal-signal crash exitCode=${result.exitCode} (signal=${crashSignalName}, failure_reason=sandbox_runtime_crash)`
+          : isSignalTermination
+            ? `signal-style termination exitCode=${result.exitCode} (failure_reason=cancelled_or_timed_out)`
+            : isOverloaded
+              ? "overloaded_error (transient)"
+              : isRateLimit
+                ? "rate_limit_error (transient)"
+                : "partial execution";
+        useContinueOnRetry = retryWithContinue;
+        const retryMode = retryWithContinue ? "--continue" : "fresh run (--continue disabled permanently)";
+        log(`attempt ${attempt + 1}: ${reason} — will retry with ${retryMode} (attempt ${attempt + 2}/${maxRetries + 1})`);
+        return { action: "retry" };
+      }
+
+      if (attempt >= maxRetries) {
+        log(`all ${maxRetries} retries exhausted — giving up (exitCode=${result.exitCode})`);
+      } else {
+        if (startupRetriesUsed < startupRetryLimit) {
+          startupRetriesUsed++;
+          useContinueOnRetry = false;
+          const nextAttemptNumber = attempt + 2;
+          const totalAttempts = maxRetries + 1;
+          log(`attempt ${attempt + 1}: no output produced — retrying startup as fresh run ` + `(startup retry ${startupRetriesUsed}/${startupRetryLimit}, next attempt ${nextAttemptNumber} of ${totalAttempts} total attempts)`);
+          return { action: "retry", nextDelayMs: initialDelayMs };
+        }
+        log(
+          `attempt ${attempt + 1}: no output produced — not retrying (startup retry budget exhausted: ${startupRetriesUsed}/${startupRetryLimit}; possible causes: binary not found, permission denied, auth failure, or silent startup crash)`
+        );
+      }
+
+      return { action: "stop" };
+    },
+  });
+  lastExitCode = retryRun.exitCode;
 
   // Fetch AWF API proxy reflection data and persist to disk for post-run step summary.
   await fetchAWFReflect({ logger: log });
@@ -664,7 +674,11 @@ if (typeof module !== "undefined" && module.exports) {
     isNoDeferredMarkerError,
     isInvalidModelError,
     isInvalidJsonBodyError,
+    isConnectionRefusedError,
+    hasClaudeSessionProgress,
     isSignalTerminationExitCode,
+    isCrashSignalExitCode,
+    crashSignalNameForExitCode,
     shouldRetryWithContinue,
     countPermissionDeniedIssues,
     hasNumerousPermissionDeniedIssues,
