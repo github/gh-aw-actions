@@ -11,6 +11,7 @@ const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
 const { formatMissingData, formatMissingTools } = require("./missing_info_formatter.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { AWF_INFRA_LINE_RE } = require("./log_parser_shared.cjs");
+const { applyAddMaskRedaction, collectAddMaskedValues, isAddMaskCommandLine } = require("./add_mask_redaction.cjs");
 const {
   resolveFirewallAuditLogPath,
   resolveAICreditsFailureState,
@@ -36,6 +37,13 @@ const DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS = 24 * 7;
 const NO_DEFERRED_MARKER_LINE_RE = /No deferred tool marker found/i;
 /** Claude harness line reporting that the no-deferred-marker error was recovered by a fresh retry. */
 const CLAUDE_HARNESS_NO_DEFERRED_MARKER_RECOVERY_RE = /^\[claude-harness\].*no deferred tool marker on --continue.*retrying as fresh run.*--continue disabled permanently/i;
+/**
+ * Terminal failure reported by an engine harness wrapper, e.g.
+ * `[copilot-harness] unexpected error: copilot-sdk headless server did not become ready ...`.
+ * These lines carry the actionable root cause even though the harness prefix marks them as
+ * infrastructure output, so they are extracted as engine error details.
+ */
+const HARNESS_UNEXPECTED_ERROR_RE = /^\[(?:copilot|claude|codex)-harness\]\s*unexpected error:\s*(.+)$/;
 const FAILURE_ISSUE_DEDUP_WINDOW_HOURS = 24;
 const FAILURE_ISSUE_CATEGORY_DAILY_CAP = 50;
 const FAILURE_ISSUE_WINDOW_MS = FAILURE_ISSUE_DEDUP_WINDOW_HOURS * 60 * 60 * 1000;
@@ -2783,6 +2791,14 @@ function buildEngineFailureContext(options = {}) {
 
     const lines = logContent.split("\n");
 
+    // Values registered through `::add-mask::` are masked in the live job log but appear
+    // verbatim in the captured log file. Collect them so every excerpt rendered into the
+    // failure issue is redacted.
+    const maskedValues = collectAddMaskedValues(logContent);
+    if (maskedValues.length > 0) {
+      core.info(`Detected ${maskedValues.length} add-mask value(s) in agent-stdio.log; redacting them from rendered output`);
+    }
+
     // Guard: if the agent completed successfully (terminal_reason: "completed"), the job
     // failure was caused by something other than the agent itself (e.g., post-processing
     // or infrastructure). Suppress the engine failure context to avoid false positive labels.
@@ -2855,6 +2871,15 @@ function buildEngineFailureContext(options = {}) {
         continue;
       }
 
+      // Engine harness wrappers report their terminal failure as
+      // "[<engine>-harness] unexpected error: <message>" (e.g. the copilot-sdk headless server
+      // never becoming ready). Surface it as the root cause instead of falling back to the tail.
+      const harnessUnexpectedErrorMatch = line.match(HARNESS_UNEXPECTED_ERROR_RE);
+      if (harnessUnexpectedErrorMatch) {
+        errorMessages.add(harnessUnexpectedErrorMatch[1].trim());
+        continue;
+      }
+
       // AWF startup failures can appear as "[ERROR] Failed to start ...".
       // Exclude generic wrapper [ERROR] lines (e.g., command completion/exit noise)
       // because they are infrastructure output and don't provide actionable startup context.
@@ -2922,7 +2947,7 @@ function buildEngineFailureContext(options = {}) {
         }
         context += "\n<details>\n<summary>Error details</summary>\n\n";
         for (const message of errorMessages) {
-          context += `- ${message}\n`;
+          context += `- ${applyAddMaskRedaction(message, maskedValues)}\n`;
         }
         context += `\n</details>\n\nSee [Diagnosing AWF Failures](https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md) for troubleshooting guidance.\n\n`;
         return context;
@@ -2930,7 +2955,7 @@ function buildEngineFailureContext(options = {}) {
 
       let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n**Error details:**\n";
       for (const message of errorMessages) {
-        context += `- ${message}\n`;
+        context += `- ${applyAddMaskRedaction(message, maskedValues)}\n`;
       }
       context += "\n";
       return context;
@@ -2944,6 +2969,31 @@ function buildEngineFailureContext(options = {}) {
     // pattern in sync with parse_copilot_log.cjs.
     const INFRA_LINE_RE = AWF_INFRA_LINE_RE;
 
+    // AWF infrastructure messages can wrap onto indented continuation lines, e.g.
+    //   [WARN] --pids-limit/container.pidsLimit is not supported by this microVM runtime …
+    //      The Docker agent cgroup cannot be passed through, so pids.max/pids.current are unavailable.
+    // Those continuations belong to the infrastructure line above them, so they must be
+    // filtered out as well — otherwise they can be reported as the "last agent output".
+    const infraContinuationLines = new Set();
+    {
+      let previousWasInfra = false;
+      for (const [index, line] of lines.entries()) {
+        if (!line.trim()) {
+          previousWasInfra = false;
+          continue;
+        }
+        if (INFRA_LINE_RE.test(line)) {
+          previousWasInfra = true;
+          continue;
+        }
+        if (previousWasInfra && /^\s/.test(line)) {
+          infraContinuationLines.add(index);
+          continue;
+        }
+        previousWasInfra = false;
+      }
+    }
+
     // Fallback: no known error patterns found — include the last non-empty lines so that
     // failures caused by timeouts or unexpected terminations still surface useful context.
     const TAIL_LINES = 10;
@@ -2953,7 +3003,11 @@ function buildEngineFailureContext(options = {}) {
     }
 
     // Exclude AWF infrastructure lines so the fallback displays only actual engine output.
-    const agentLines = nonEmptyLines.filter(entry => !INFRA_LINE_RE.test(entry.line) && !isRecoveredNoDeferredMarkerLine(entry.index)).map(entry => entry.line);
+    // `::add-mask::` command lines are runner directives, not agent output: drop them so the
+    // rendered tail neither leaks the masked value nor wastes a tail slot.
+    const agentLines = nonEmptyLines
+      .filter(entry => !INFRA_LINE_RE.test(entry.line) && !infraContinuationLines.has(entry.index) && !isAddMaskCommandLine(entry.line) && !isRecoveredNoDeferredMarkerLine(entry.index))
+      .map(entry => entry.line);
 
     if (agentLines.length === 0) {
       // The log contains only AWF infrastructure lines — the engine exited before producing
@@ -2988,7 +3042,7 @@ function buildEngineFailureContext(options = {}) {
     core.info(`No specific error patterns found; including last ${tailLines.length} line(s) of agent-stdio.log as fallback`);
 
     let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated unexpectedly.`) + "\n**Last agent output:**\n\`\`\`\n";
-    context += tailLines.join("\n");
+    context += applyAddMaskRedaction(tailLines.join("\n"), maskedValues);
     context += "\n```\n\n";
     return context;
   } catch (error) {

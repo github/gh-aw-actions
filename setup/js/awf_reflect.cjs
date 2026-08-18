@@ -19,6 +19,8 @@ require("./shim.cjs");
 
 const fs = require("fs");
 const path = require("path");
+const net = require("net");
+const tls = require("tls");
 const { withRetry, sleep } = require("./error_recovery.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 
@@ -33,8 +35,19 @@ const AWF_REFLECT_OUTPUT_PATH = "/tmp/gh-aw/sandbox/firewall/awf-reflect.json";
 const AWF_REFLECT_TIMEOUT_MS = 60000;
 // Milliseconds to wait for each models_url fallback fetch (shorter than the main reflect timeout).
 const AWF_MODELS_URL_TIMEOUT_MS = 3000;
+// Milliseconds to wait for an api-proxy provider listener to accept a real TCP connection.
+const AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS = 15000;
+// Delay between provider-listener readiness probes.
+const AWF_PROVIDER_LISTENER_READY_RETRY_MS = 250;
+// Per-attempt connect timeout while probing provider listener readiness.
+const AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS = 2000;
 // Maximum attempts for models_url fallback fetches when the proxy is not yet ready.
 const AWF_MODELS_URL_MAX_ATTEMPTS = 5;
+// HTTP statuses treated as transient and worth retrying for models_url fallback fetches.
+// 503 covers the api-proxy not yet being ready; 429 covers transient model-catalog throttling
+// (see https://github.com/github/gh-aw/issues/52782 — an unresolved 429 previously caused
+// alias resolution to be skipped and an unresolved alias to reach the API proxy).
+const AWF_MODELS_URL_RETRYABLE_STATUSES = new Set([503, 429]);
 // Base delay between models_url fallback retries. Uses exponential backoff.
 const AWF_MODELS_URL_RETRY_BASE_MS = 250;
 // Cap for exponential backoff delay between retries.
@@ -168,6 +181,24 @@ function extractModelIds(json) {
 }
 
 /**
+ * Extract a `retry-after` header (if present) from a fetch Response so it can be attached
+ * to a retryable error for `withRetry`'s Retry-After handling (see `getRetryAfterMs` in
+ * error_recovery.cjs). Only the `retry-after` header is needed: `withRetry` only consults
+ * it for HTTP 429 responses, which is the only retryable status here that carries one.
+ *
+ * @param {{ headers?: { get?: (name: string) => string|null } }} res - fetch Response-like object
+ * @returns {Record<string, string>|undefined}
+ */
+function extractRetryAfterHeader(res) {
+  try {
+    const retryAfter = res?.headers?.get?.("retry-after");
+    return retryAfter != null ? { "retry-after": retryAfter } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Fetch model IDs from a single models_url endpoint via HTTP GET.
  * Used as a fallback when the api-proxy's startup model-fetch returned null.
  * The api-proxy injects the correct auth headers when forwarding the request.
@@ -207,9 +238,9 @@ async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
     shouldRetry: error => {
       const original = error?.originalError || error;
       const status = original?.status ?? original?.response?.status ?? null;
-      const shouldRetry = status === 503;
+      const shouldRetry = AWF_MODELS_URL_RETRYABLE_STATUSES.has(status);
       if (shouldRetry && attemptCounter < AWF_MODELS_URL_MAX_ATTEMPTS) {
-        logger(`awf-reflect: models fetch returned 503 for ${modelsUrl}; retrying (attempt ${attemptCounter + 1}/${AWF_MODELS_URL_MAX_ATTEMPTS})`);
+        logger(`awf-reflect: models fetch returned ${status} for ${modelsUrl}; retrying (attempt ${attemptCounter + 1}/${AWF_MODELS_URL_MAX_ATTEMPTS})`);
       }
       return shouldRetry;
     },
@@ -227,10 +258,15 @@ async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
         try {
           const res = await fetch(requestUrl, { signal: ac.signal });
           if (!res.ok) {
-            if (res.status === 503) {
-              const err = Object.assign(new Error(`models fetch returned 503 for ${modelsUrl}`), { status: 503 });
+            if (AWF_MODELS_URL_RETRYABLE_STATUSES.has(res.status)) {
+              const err = Object.assign(new Error(`models fetch returned ${res.status} for ${modelsUrl}`), {
+                status: res.status,
+                headers: extractRetryAfterHeader(res),
+              });
               throw err;
             }
+            // Permanent 4xx/5xx responses (e.g. 400, 401, 403) are not retried — the
+            // caller falls back to treating this endpoint as having no models.
             logger(`awf-reflect: models fetch returned ${res.status} for ${modelsUrl}`);
             return null;
           }
@@ -247,7 +283,7 @@ async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
           /** @type {any} */
           const e = err;
           const status = e?.status ?? e?.response?.status ?? null;
-          if (status === 503) {
+          if (AWF_MODELS_URL_RETRYABLE_STATUSES.has(status)) {
             throw e;
           }
           logger(`awf-reflect: models fetch error for ${modelsUrl}: ${getErrorMessage(err)}`);
@@ -264,8 +300,8 @@ async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
     const e = err;
     const original = e?.originalError || e;
     const status = original?.status ?? original?.response?.status ?? null;
-    if (status === 503) {
-      logger(`awf-reflect: models fetch returned 503 for ${modelsUrl}`);
+    if (AWF_MODELS_URL_RETRYABLE_STATUSES.has(status)) {
+      logger(`awf-reflect: models fetch returned ${status} for ${modelsUrl}`);
       return null;
     }
     logger(`awf-reflect: models fetch error for ${modelsUrl}: ${getErrorMessage(err)}`);
@@ -366,6 +402,7 @@ async function fetchAWFReflect(options) {
         status: res.status,
       };
     }
+
     /** @type {any} */
     const reflectData = await res.json();
     // Attempt to fill in null models for configured providers by fetching directly
@@ -405,6 +442,113 @@ async function fetchAWFReflect(options) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Wait until a provider listener (e.g. http://api-proxy:10002) accepts a real TCP
+ * connection, or time out.
+ *
+ * This guards against startup races where /reflect is available but a per-provider
+ * listener has not yet bound/started accepting connections.
+ *
+ * For "https:" baseUrls, the probe performs a full TLS handshake (via `tls.connect`) rather
+ * than a bare TCP connect, since a raw TCP accept can succeed well before the TLS listener
+ * is actually able to negotiate a secure session and serve requests.
+ *
+ * @param {{
+ *   baseUrl: string,
+ *   timeoutMs?: number,
+ *   retryDelayMs?: number,
+ *   perAttemptTimeoutMs?: number,
+ *   logger?: (msg: string) => void,
+ *   connectImpl?: (opts: { host: string, port: number }) => import("net").Socket,
+ * }} options - `connectImpl`, when provided, overrides the default connect implementation for
+ *   both http:// and https:// baseUrls (test-only hook). The readiness event awaited is still
+ *   derived from the baseUrl's protocol: for `https:` baseUrls the returned socket must emit
+ *   `"secureConnect"` (not `"connect"`) to be treated as ready, matching the real `tls.connect`
+ *   behavior; for `http:` baseUrls it must emit `"connect"`.
+ * @returns {Promise<{ ok: true } | { ok: false, reason: "invalid_base_url" | "timeout", error: string }>}
+ */
+async function waitForProviderListenerReady(options) {
+  const logger = options?.logger ?? DEFAULT_REFLECT_LOGGER;
+  const timeoutMs = options?.timeoutMs ?? AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS;
+  const retryDelayMs = options?.retryDelayMs ?? AWF_PROVIDER_LISTENER_READY_RETRY_MS;
+  const perAttemptTimeoutMsRaw = options?.perAttemptTimeoutMs ?? AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS;
+  const perAttemptTimeoutMs = Number.isFinite(perAttemptTimeoutMsRaw) && perAttemptTimeoutMsRaw > 0 ? perAttemptTimeoutMsRaw : AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS;
+  const baseUrl = String(options?.baseUrl ?? "").trim();
+  if (!baseUrl) {
+    return { ok: false, reason: "invalid_base_url", error: "baseUrl is empty" };
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return { ok: false, reason: "invalid_base_url", error: `invalid baseUrl: ${baseUrl}` };
+  }
+  const host = parsed.hostname;
+  const port = parsed.port ? Number.parseInt(parsed.port, 10) : parsed.protocol === "https:" ? 443 : 80;
+  if (!host || !Number.isFinite(port) || port <= 0) {
+    return { ok: false, reason: "invalid_base_url", error: `baseUrl missing host/port: ${baseUrl}` };
+  }
+  // For https:// providers, a bare TCP accept does not prove the listener can complete a TLS
+  // handshake. Probe with tls.connect and wait for "secureConnect" so the readiness gate lines
+  // up with the actual failure mode (handshake/startup errors), not just an open port.
+  const isHttps = parsed.protocol === "https:";
+  const readyEvent = isHttps ? "secureConnect" : "connect";
+  const connectImpl = options?.connectImpl ?? (isHttps ? opts => tls.connect({ ...opts, servername: opts.host }) : opts => net.connect(opts));
+
+  logger(`awf-reflect: waiting for provider listener readiness at ${host}:${port} (timeout=${timeoutMs}ms)`);
+  const startedAt = Date.now();
+  let lastError = "connection not ready";
+  while (Date.now() - startedAt < timeoutMs) {
+    const remainingBudgetMs = timeoutMs - (Date.now() - startedAt);
+    const attemptTimeoutMs = Math.max(1, Math.min(perAttemptTimeoutMs, remainingBudgetMs));
+    const ready = await new Promise(resolve => {
+      const socket = connectImpl({ host, port });
+      let settled = false;
+      const settle = value => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      let timer;
+      const clear = () => clearTimeout(timer);
+      timer = setTimeout(() => {
+        clear();
+        lastError = `connect attempt timed out after ${attemptTimeoutMs}ms`;
+        settle(false);
+        socket.destroy();
+      }, attemptTimeoutMs);
+      socket.once(readyEvent, () => {
+        clear();
+        // Settle as ready before tearing down the socket, and keep the "error" listener
+        // installed: destroy() can surface a late/trailing error (e.g. an abrupt RST), and an
+        // EventEmitter with no "error" listener would throw and terminate the process. The
+        // handler below ignores errors once the probe is settled.
+        settle(true);
+        socket.destroy();
+      });
+      socket.once("error", err => {
+        if (settled) return;
+        clear();
+        lastError = getErrorMessage(err);
+        socket.destroy();
+        settle(false);
+      });
+    });
+    if (ready) {
+      logger(`awf-reflect: provider listener is accepting connections at ${host}:${port}`);
+      return { ok: true };
+    }
+    const remainingAfterAttemptMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingAfterAttemptMs <= 0) {
+      break;
+    }
+    await sleep(Math.min(retryDelayMs, remainingAfterAttemptMs));
+  }
+  logger(`awf-reflect: provider listener readiness timed out for ${host}:${port} (${lastError})`);
+  return { ok: false, reason: "timeout", error: lastError };
 }
 
 /**
@@ -858,14 +1002,19 @@ if (typeof module !== "undefined" && module.exports) {
     AWF_REFLECT_TIMEOUT_MS,
     AWF_MODELS_URL_TIMEOUT_MS,
     AWF_MODELS_URL_MAX_ATTEMPTS,
+    AWF_MODELS_URL_RETRYABLE_STATUSES,
     AWF_MODELS_URL_RETRY_BASE_MS,
     AWF_MODELS_URL_RETRY_MAX_MS,
+    AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS,
+    AWF_PROVIDER_LISTENER_READY_RETRY_MS,
+    AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS,
     DEFAULT_API_PROXY_HOST_BRIDGE,
     GEMINI_MODEL_NAME_PREFIX,
     enrichReflectModels,
     extractModelIds,
     fetchAWFReflect,
     fetchModelsFromUrl,
+    waitForProviderListenerReady,
     getCatalogModelEntry,
     hasAPIProxyLocalhostAlias,
     inferProviderTypeForModel,

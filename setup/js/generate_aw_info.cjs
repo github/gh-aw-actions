@@ -9,7 +9,7 @@ const { validateContextVariables } = require("./validate_context_variables.cjs")
 const validateLockdownRequirements = require("./validate_lockdown_requirements.cjs");
 const { writeMergedModelsJSON } = require("./merge_frontmatter_models.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { ERR_CONFIG } = require("./error_codes.cjs");
+const { ERR_CONFIG, ERR_SYSTEM } = require("./error_codes.cjs");
 
 /**
  * Generate aw_info.json with workflow run metadata.
@@ -75,6 +75,7 @@ async function main(core, ctx) {
     workflow_name: process.env.GH_AW_INFO_WORKFLOW_NAME || "",
     experimental: process.env.GH_AW_INFO_EXPERIMENTAL === "true",
     supports_tools_allowlist: process.env.GH_AW_INFO_SUPPORTS_TOOLS_ALLOWLIST === "true",
+    cache_memory: process.env.GH_AW_INFO_CACHE_MEMORY === "true",
     run_id: ctx.runId,
     run_number: ctx.runNumber,
     run_attempt: process.env.GITHUB_RUN_ATTEMPT,
@@ -182,14 +183,14 @@ async function main(core, ctx) {
   try {
     fs.mkdirSync(TMP_GH_AW_PATH, { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create directory ${TMP_GH_AW_PATH}: ${getErrorMessage(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to create directory ${TMP_GH_AW_PATH}: ${getErrorMessage(err)}`, { cause: err });
   }
   writeMergedModelsJSON(core);
   const tmpPath = TMP_GH_AW_PATH + "/aw_info.json";
   try {
     fs.writeFileSync(tmpPath, JSON.stringify(awInfo, null, 2));
   } catch (err) {
-    throw new Error(`Failed to write file ${tmpPath}: ${getErrorMessage(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to write file ${tmpPath}: ${getErrorMessage(err)}`, { cause: err });
   }
 
   if (awInfo.staged) {

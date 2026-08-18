@@ -16,6 +16,9 @@ set +o histexpand
 #                $GITHUB_PATH so subsequent steps find the binary.  Use this on
 #                ARC/DinD runners that enforce allowPrivilegeEscalation: false.
 #
+# Environment overrides (testing):
+#   COPILOT_INSTALL_DIR - Override the install directory (default: /usr/local/bin).
+#
 # Security features:
 #   - Downloads binary directly from GitHub releases (no installer script execution)
 #   - Verifies SHA256 checksum against official SHA256SUMS.txt
@@ -26,7 +29,7 @@ set -euo pipefail
 # Configuration
 SECONDS_PER_DAY=86400
 COPILOT_REPO="github/copilot-cli"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${COPILOT_INSTALL_DIR:-/usr/local/bin}"
 COPILOT_DIR="${HOME}/.copilot"
 COPILOT_TOOLCACHE_MAX_DEPTH=4
 # DEFAULT_COPILOT_VERSION is the baked-in fallback used when neither an explicit version
@@ -206,7 +209,7 @@ download_compat_json() {
   local source_file="$2"
 
   echo "Attempting to download compatibility matrix from ${COMPAT_URL}..." >&2
-  if curl -fsSL --retry 3 --retry-delay 5 -o "$compat_file" "$COMPAT_URL"; then
+  if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o "$compat_file" "$COMPAT_URL"; then
     echo "$COMPAT_URL" > "$source_file"
     echo "Successfully downloaded compatibility matrix from ${COMPAT_URL}" >&2
     return 0
@@ -232,7 +235,7 @@ resolve_compat_with_jq() {
   local compiled_version="$2"
   local compiled_no_v="${compiled_version#v}"
   
-  jq -r --arg compiled "$compiled_no_v" '
+  jq -r --arg compiled "$compiled_no_v" --arg compiled_version "$compiled_version" '
     # Semver comparison: returns -1 if a<b, 0 if equal, 1 if a>b
     def semver_cmp(a; b):
       (a | split(".") | map(tonumber)) as $a_parts |
@@ -258,9 +261,11 @@ resolve_compat_with_jq() {
       $row["min-agent"] as $min_agent |
       $row["max-agent"] as $max_agent |
       
-      # Check if gh-aw version is in range
-      if (semver_cmp($compiled; $min_aw) >= 0) and
-         (($max_aw == "*") or (semver_cmp($compiled; $max_aw) <= 0)) then
+      # Use the open row for development builds, which do not have a semver release tag.
+      if (($compiled_version == "dev") and ($row.open == true)) or
+         (($compiled_version != "dev") and
+          (semver_cmp($compiled; $min_aw) >= 0) and
+          (($max_aw == "*") or (semver_cmp($compiled; $max_aw) <= 0))) then
         "\($max_agent)|\($idx)|\($min_aw)|\($max_aw)|\($min_agent)|\($max_agent)|\($cache_ttl)"
       else empty end
     ) | first // ""
@@ -279,7 +284,7 @@ resolve_version_from_compat() {
     return 1
   fi
 
-  if [[ ! "$compiled_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  if [[ ! "$compiled_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$compiled_version" != "dev" ]]; then
     echo "GH_AW_COMPILED_VERSION '${compiled_version}' is not in vMAJOR.MINOR.PATCH format; skipping compatibility matrix resolution." >&2
     return 1
   fi
@@ -491,12 +496,19 @@ activate_cached_copilot_bin() {
   if [ -n "${GITHUB_PATH:-}" ]; then
     echo "  Exporting ${cached_copilot_dir} to GITHUB_PATH (${GITHUB_PATH})"
     echo "$cached_copilot_dir" >> "${GITHUB_PATH}"
+  else
+    echo "  GITHUB_PATH not set — relying on ${INSTALL_DIR}/copilot"
+  fi
+
+  # The agent is launched with the hardcoded absolute path ${INSTALL_DIR}/copilot, which
+  # PATH additions cannot satisfy, so always materialize that path. A small wrapper is used
+  # instead of symlinking or copying the cached script to avoid broken relative paths.
+  if [ "$cached_copilot_bin" = "${INSTALL_DIR}/copilot" ]; then
+    echo "  Cached binary already lives at ${INSTALL_DIR}/copilot — no wrapper needed"
     return 0
   fi
 
-  # Outside GitHub Actions there is no GITHUB_PATH file, so install a small wrapper
-  # instead of symlinking or copying the cached script and risking broken relative paths.
-  echo "  GITHUB_PATH not set — installing wrapper at ${INSTALL_DIR}/copilot"
+  echo "  Installing wrapper at ${INSTALL_DIR}/copilot"
   wrapper_path="${TEMP_DIR}/copilot"
   cat > "$wrapper_path" <<EOF
 #!/usr/bin/env bash
@@ -537,9 +549,17 @@ if CACHED_COPILOT_BIN="$(find_cached_copilot_bin "$REQUESTED_VERSION" "${COMPAT_
   activate_cached_copilot_bin "$CACHED_COPILOT_BIN"
 
   echo "Verifying cached Copilot CLI installation..."
+  # The agent is spawned with the absolute path ${INSTALL_DIR}/copilot, so that path must
+  # exist even when the CLI itself came from the toolcache.
+  if [ ! -x "${INSTALL_DIR}/copilot" ]; then
+    echo "ERROR: Cached Copilot CLI activation failed - ${INSTALL_DIR}/copilot is missing or not executable"
+    exit 1
+  fi
+
   RESOLVED_COPILOT="$(command -v copilot 2>/dev/null || true)"
   if [ -n "$RESOLVED_COPILOT" ]; then
     echo "  Resolved copilot binary: ${RESOLVED_COPILOT}"
+    echo "  Canonical install path: ${INSTALL_DIR}/copilot"
     "$RESOLVED_COPILOT" --version
     echo "✓ Copilot CLI installation complete (cached)"
     exit 0
@@ -566,11 +586,11 @@ CHECKSUMS_URL="${BASE_URL}/SHA256SUMS.txt"
 
 # Download checksums
 echo "Downloading checksums from ${CHECKSUMS_URL}..."
-curl -fsSL --retry 3 --retry-delay 5 -o "${TEMP_DIR}/SHA256SUMS.txt" "${CHECKSUMS_URL}"
+curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "${TEMP_DIR}/SHA256SUMS.txt" "${CHECKSUMS_URL}"
 
 # Download binary tarball
 echo "Downloading binary from ${TARBALL_URL}..."
-curl -fsSL --retry 3 --retry-delay 5 -o "${TEMP_DIR}/${TARBALL_NAME}" "${TARBALL_URL}"
+curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "${TEMP_DIR}/${TARBALL_NAME}" "${TARBALL_URL}"
 
 # Verify checksum
 echo "Verifying SHA256 checksum for ${TARBALL_NAME}..."

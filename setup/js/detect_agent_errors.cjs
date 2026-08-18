@@ -14,7 +14,10 @@
  *   - agentic_engine_timeout: A timeout signature was detected in engine logs.
  *     This includes process termination by signal (SIGTERM/SIGKILL/SIGINT),
  *     typically due to step timeout-minutes, and SDK idle-timeout messages
- *     ("Timeout after <n>ms waiting for session.idle").
+ *     ("Timeout after <n>ms waiting for session.idle"). It is also set when the
+ *     engine execution step failed after running for its full `timeout-minutes`
+ *     budget, which is how GitHub Actions step-level timeouts surface for engines
+ *     that leave no timeout signature in the agent log.
  *   - model_not_supported_error: The configured model is invalid or unsupported
  *     for the selected engine/account (for example unknown model name, model not
  *     found, or model unavailable for the plan).
@@ -22,9 +25,12 @@
  *     response (for example "Response status code does not indicate success: 400 (Bad Request)").
  *   - capi_quota_exceeded_error: The Copilot CAPI quota has been exhausted
  *     or rate-limited (e.g., "CAPIError: 429 429 quota exceeded",
- *     "CAPIError: Too Many Requests"). All matched forms are treated as
- *     non-retryable because the Copilot SDK has already retried internally
- *     before surfacing the error.
+ *     "CAPIError: Too Many Requests", or the Copilot CLI's own
+ *     retry-exhaustion message "Failed to get response from the AI model;
+ *     retried N times ... Last error: 429/5xx" which carries no "CAPIError:"
+ *     prefix). All matched forms are treated as non-retryable because the
+ *     Copilot CLI/SDK has already retried internally before surfacing the
+ *     error.
  *   - invocation_cap_exceeded: The per-run pooled LLM invocation cap is
  *     fully exhausted (e.g., "CAPIError: 429 Maximum LLM invocations exceeded (N/N)"
  *     or `"type":"max_runs_exceeded"`). This is more specific than generic
@@ -56,6 +62,16 @@ const { MAX_RUNS_EXCEEDED_PATTERNS, isMaxRunsExceededError } = require("./harnes
 const { parseUnknownModelAICreditsAndModelFromAuditLog, parseMaxCacheMissesExceededFromEventLog } = require("./ai_credits_context.cjs");
 
 const LOG_FILE = "/tmp/gh-aw/agent-stdio.log";
+
+// File written by the engine execution step with the epoch milliseconds at which the
+// engine CLI was started. Used to measure how long the engine ran before it was killed.
+const AGENT_CLI_START_MS_FILE = "/tmp/gh-aw/agent_cli_start_ms.txt";
+
+// Tolerance applied when comparing the engine run duration against the step timeout budget.
+// The start timestamp is written a moment after the step begins, so a step killed by
+// GitHub Actions ("The action '...' has timed out after N minutes.") reports slightly less
+// than the full budget here.
+const STEP_TIMEOUT_TOLERANCE_MS = 30_000;
 
 // Pattern: Copilot CLI inference access denied
 const INFERENCE_ACCESS_ERROR_PATTERN = /Access denied by policy settings|invalid access to inference/;
@@ -152,9 +168,12 @@ const MISSING_MODEL_PRICING_PATTERN = /Model\s+"([^"]+)"\s+has no AI credits pri
 //   "CAPIError: 429 429 quota exceeded"  (original observed form)
 //   "CAPIError: 429 Too Many Requests"   (HTTP 429 form)
 //   "CAPIError: Too Many Requests"       (no status code in message)
-// All forms are treated as non-retryable; the Copilot SDK has already retried
-// internally before surfacing this error (evidenced by "retried 5 times" context).
-const CAPI_QUOTA_EXCEEDED_PATTERN = /CAPIError:\s*(?:429\s+)?(?:429\s+quota exceeded|Too Many Requests)/i;
+//   "Failed to get response from the AI model; retried 5 times ... Last error: 429 Too Many Requests"
+//     (Copilot CLI's own retry-exhaustion message, no "CAPIError:" prefix — seen with both
+//     429 and 5xx terminal statuses, e.g. "Last error: 503 Service Unavailable")
+// All forms are treated as non-retryable; the Copilot CLI/SDK has already retried
+// internally before surfacing this error (evidenced by "retried N times" context).
+const CAPI_QUOTA_EXCEEDED_PATTERN = /CAPIError:\s*(?:429\s+)?(?:429\s+quota exceeded|Too Many Requests)|Failed to get response from the AI model;\s*retried\s+\d+\s+times[^\n]{0,300}?Last error:\s*(?:429|5\d{2})\b/i;
 
 /**
  * Build a case-insensitive merged RegExp from literal/regex patterns.
@@ -237,6 +256,65 @@ function isMaxCacheMissesExceededError(output) {
  */
 function isShellExpansionGuardRejectedError(output) {
   return SHELL_EXPANSION_GUARD_REJECTED_PATTERN.test(output);
+}
+
+/**
+ * Determines whether the engine execution step was killed by the GitHub Actions
+ * step-level `timeout-minutes` limit.
+ *
+ * A step timeout terminates the engine externally, so it can leave no timeout
+ * signature in the agent stdio log (only GitHub's own annotation "The action '...'
+ * has timed out after N minutes." in the runner log, which is not available here).
+ * Without this check such runs are misreported as "engine terminated unexpectedly".
+ *
+ * Detection requires both:
+ *   1. The engine execution step did not succeed (outcome is not "success"), and
+ *   2. The engine ran for at least its configured timeout budget (minus a small
+ *      tolerance for the delay between step start and the start timestamp write).
+ *
+ * @param {{ outcome?: string, timeoutMinutes?: string, startMs?: number, nowMs?: number }} options
+ * @returns {boolean}
+ */
+function isStepTimeout({ outcome, timeoutMinutes, startMs, nowMs }) {
+  if (!outcome || outcome === "success" || outcome === "skipped") return false;
+
+  const minutes = parseInt(String(timeoutMinutes || "").trim(), 10);
+  if (!Number.isFinite(minutes) || minutes <= 0) return false;
+
+  const start = Number(startMs);
+  const now = Number(nowMs);
+  if (!Number.isFinite(start) || start <= 0 || !Number.isFinite(now)) return false;
+
+  const elapsedMs = now - start;
+  if (elapsedMs <= 0) return false;
+
+  return elapsedMs >= minutes * 60_000 - STEP_TIMEOUT_TOLERANCE_MS;
+}
+
+/**
+ * Read the engine CLI start timestamp (epoch milliseconds) written by the execution step.
+ * @returns {number} Epoch milliseconds, or NaN when unavailable/unparsable
+ */
+function readAgentCLIStartMs() {
+  try {
+    if (!fs.existsSync(AGENT_CLI_START_MS_FILE)) return NaN;
+    return parseInt(fs.readFileSync(AGENT_CLI_START_MS_FILE, "utf8").trim(), 10);
+  } catch {
+    return NaN;
+  }
+}
+
+/**
+ * Detect a step-level timeout from the current environment and on-disk start timestamp.
+ * @returns {boolean}
+ */
+function detectStepTimeoutFromEnvironment() {
+  return isStepTimeout({
+    outcome: process.env.GH_AW_AGENTIC_EXECUTION_OUTCOME,
+    timeoutMinutes: process.env.GH_AW_ENGINE_STEP_TIMEOUT_MINUTES,
+    startMs: readAgentCLIStartMs(),
+    nowMs: Date.now(),
+  });
 }
 
 /**
@@ -353,8 +431,17 @@ function main() {
     process.stderr.write("[detect-agent-errors] Detected max cache misses exceeded from AWF API proxy event log\n");
   }
 
+  // A GitHub Actions step-level timeout kills the engine externally and can leave no
+  // timeout signature in the agent log, so it is detected from the step outcome and the
+  // engine run duration instead.
+  const stepTimeout = detectStepTimeoutFromEnvironment();
+  if (stepTimeout && !stdioResults.agenticEngineTimeout) {
+    process.stderr.write(`[detect-agent-errors] Detected step timeout: the engine execution step reached its ${process.env.GH_AW_ENGINE_STEP_TIMEOUT_MINUTES}-minute timeout-minutes budget and was terminated\n`);
+  }
+
   const results = {
     ...stdioResults,
+    agenticEngineTimeout: stdioResults.agenticEngineTimeout || stepTimeout,
     maxCacheMissesExceeded: stdioResults.maxCacheMissesExceeded || eventLogCacheMissesExceeded,
     missingModelPricingError: stdioResults.missingModelPricingError || auditMissingPricing,
     missingModelPricingModelName: stdioResults.missingModelPricingModelName || sanitizeModelName(auditModelName),
@@ -366,7 +453,7 @@ function main() {
   if (results.mcpPolicyError) {
     process.stderr.write("[detect-agent-errors] Detected MCP policy error in agent log\n");
   }
-  if (results.agenticEngineTimeout) {
+  if (stdioResults.agenticEngineTimeout) {
     process.stderr.write("[detect-agent-errors] Detected agentic engine timeout signature in agent log\n");
   }
   if (results.modelNotSupportedError) {
@@ -407,6 +494,8 @@ module.exports = {
   isInvocationCapExceededError,
   isMaxCacheMissesExceededError,
   isAgenticEngineTimeout,
+  isStepTimeout,
+  detectStepTimeoutFromEnvironment,
   INFERENCE_ACCESS_ERROR_PATTERN,
   MCP_POLICY_BLOCKED_PATTERN,
   AGENTIC_ENGINE_TIMEOUT_PATTERN,

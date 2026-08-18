@@ -38,10 +38,12 @@ const os = require("os");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_VALIDATION, ERR_PARSE, ERR_SYSTEM, ERR_API, ERR_CONFIG } = require("./error_codes.cjs");
 const { findRepoCheckout } = require("./find_repo_checkout.cjs");
+const { getSetupTimeoutMs } = require("./child_process_timeouts.cjs");
 
 const DEFAULT_BASE_BRANCH = process.env.GH_AW_CUSTOM_BASE_BRANCH || process.env.GITHUB_BASE_REF || process.env.GITHUB_REF_NAME || "main";
 const PATCH_SIDECAR_TOOLS = new Set(["create_pull_request", "push_to_pull_request_branch"]);
-const FETCH_TIMEOUT_MS = 120_000;
+const FETCH_TIMEOUT_MS = getSetupTimeoutMs("applySamplesFetch");
+const GIT_COMMAND_TIMEOUT_MS = getSetupTimeoutMs("applySamplesGit");
 
 /**
  * @typedef {Object} SampleEntry
@@ -95,7 +97,7 @@ function loadSamples() {
  */
 function runGit(args, cwd) {
   const { spawnSync } = require("child_process");
-  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", timeout: GIT_COMMAND_TIMEOUT_MS });
   if (result.error) {
     throw result.error;
   }
@@ -424,7 +426,7 @@ async function preStagePatch(entry, index, workspace) {
     branch = await derivePrHeadRef(entry);
     if (!branch) {
       throw new Error(
-        `apply_samples: cannot derive pull-request head branch for sample[${index}] (tool=${entry.tool}). ` +
+        `${ERR_VALIDATION}: apply_samples: cannot derive pull-request head branch for sample[${index}] (tool=${entry.tool}). ` +
           `Trigger the workflow from a pull_request event, or set arguments.pull_request_number on the sample entry, ` +
           `or provide GITHUB_TOKEN so the PR can be fetched.`
       );
@@ -459,7 +461,7 @@ async function preStagePatch(entry, index, workspace) {
   try {
     fs.writeFileSync(tmpPatch, patch.endsWith("\n") ? patch : patch + "\n");
   } catch (err) {
-    throw new Error(`Failed to write file ${tmpPatch}: ${getErrorMessage(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to write file ${tmpPatch}: ${getErrorMessage(err)}`, { cause: err });
   }
   try {
     runGit(["apply", "--whitespace=nowarn", tmpPatch], repoCwd);
@@ -627,6 +629,9 @@ async function main() {
   const child = spawn(process.execPath, [serverPath], {
     stdio: ["pipe", "pipe", "inherit"],
     env: process.env,
+  });
+  child.on("error", err => {
+    core.error(`apply_samples: failed to launch MCP server: ${getErrorMessage(err)}`);
   });
 
   const stdoutIter = lineIterator(child.stdout);

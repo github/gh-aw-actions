@@ -53,6 +53,14 @@
           "type": ["number", "string"],
           "description": "Parent issue number for creating sub-issues. This is the numeric ID from the GitHub URL (e.g., 42 in github.com/owner/repo/issues/42). Can also be a temporary_id from a previously created issue in the same workflow run \u2014 use the '#aw_abc123' form (e.g., '#aw_Test123'); the bare 'aw_abc123' form is also accepted and normalised to '#aw_abc123'."
         },
+        "blocked_by": {
+          "type": ["number", "string", "array"],
+          "items": {
+            "type": ["number", "string"]
+          },
+          "description": "Issue dependencies that block this issue. Provide one issue number, temporary_id, owner/repo#number reference, GitHub issue URL, or an array of these references. Temporary IDs are resolved before the dependency is created.",
+          "x-synonyms": ["blockedBy", "blocked-by"]
+        },
         "temporary_id": {
           "type": "string",
           "pattern": "^#?aw_[A-Za-z0-9_]{3,12}$",
@@ -377,7 +385,24 @@
         },
         "base": {
           "type": "string",
-          "description": "Target base branch for the pull request. This override is only allowed when workflow configuration sets safe-outputs.create-pull-request.allowed-base-branches and the value matches one of those patterns."
+          "description": "Target base branch for the pull request. This override is only allowed when workflow configuration sets safe-outputs.create-pull-request.allowed-base-branches and the value matches one of those patterns, or when it names the branch of a pull request created earlier in the same run (a stacked pull request). Stacked pull requests are rejected when safe-outputs.create-pull-request.stacked is false."
+        },
+        "stack_position": {
+          "type": ["number", "string"],
+          "description": "Optional 1-based position of this pull request within a stack of dependent pull requests. Recorded in the pull request body as stack metadata.",
+          "x-synonyms": ["stackPosition"]
+        },
+        "stack_root": {
+          "type": "string",
+          "description": "Optional branch name of the root of the pull request stack (the branch the first pull request in the stack targets). Recorded in the pull request body as stack metadata.",
+          "x-synonyms": ["stackRoot"]
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional list of branch names this pull request depends on (branches of earlier pull requests in the same stack). Used to detect circular stack dependencies and to record stack metadata."
         },
         "labels": {
           "type": "array",
@@ -1899,7 +1924,7 @@
   },
   {
     "name": "approve_workflow_run",
-    "description": "Approve a GitHub Actions workflow run awaiting fork pull request approval. Supply the positive run ID from the workflow run URL only when the run belongs to the triggering pull request or an explicitly allowed pull request. The handler approves only pull request runs with status waiting; it rejects other runs.",
+    "description": "Approve a GitHub Actions workflow run awaiting required approval. Supply the positive run ID from the workflow run URL only when the run belongs to the triggering pull request or an explicitly allowed pull request. The handler approves only pull request runs with status waiting; it rejects other runs.",
     "inputSchema": {
       "type": "object",
       "required": ["run_id"],
