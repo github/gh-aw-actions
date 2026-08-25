@@ -47,15 +47,17 @@ const {
   fetchAWFReflect,
   fetchModelsFromUrl,
   normalizeReflectProviderName,
+  REFLECT_PROVIDER_ALIASES,
   resolveProviderEndpointFromReflect,
 } = require("./awf_reflect.cjs");
-const { emitMissingToolPermissionIssue, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
+const { emitInfrastructureIncomplete, emitMissingToolPermissionIssue, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
-const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal, isAuthenticationFailedError } = require("./harness_retry_guard.cjs");
+const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal, isAuthenticationFailedError, parseAICreditsExceededProxyRejection } = require("./harness_retry_guard.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
 const { resolveRetryConfig } = require("./harness_retry_config.cjs");
 const { applyModelFallback, injectModelFlagAfterExec } = require("./model_fallback.cjs");
 const { parseMaxAICreditsExceededFromAuditLog } = require("./ai_credits_context.cjs");
+const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
 
 // Pattern to detect OpenAI rate-limit errors.
 // Matches the JSON error type field ("rate_limit_exceeded"), the HTTP status code
@@ -101,6 +103,16 @@ const POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS = resolvePostResultWatchdogIdleTimeou
 // Types that are NOT terminal safe-outputs (infrastructure/diagnostic signals).
 // A terminal safe-output is any entry whose type is NOT in this set, plus "noop".
 const SAFE_OUTPUT_NON_TERMINAL_TYPES = new Set(["missing_tool", "report_incomplete"]);
+
+const TOKEN_USAGE_AUDIT_PATH = "/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl";
+const TOKEN_USAGE_AWF_AUDIT_PATH = "/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl";
+const TOKEN_USAGE_PATH = "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl";
+const TOKEN_USAGE_PATHS = [TOKEN_USAGE_AUDIT_PATH, TOKEN_USAGE_AWF_AUDIT_PATH, TOKEN_USAGE_PATH];
+
+const DEFAULT_CONTEXT_REBUILD_FACTOR_LIMIT = 25;
+const DEFAULT_CONTEXT_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS = 1000000;
+const DEFAULT_CONTEXT_REBUILD_POLL_INTERVAL_MS = 15000;
+const DEFAULT_CONTEXT_REBUILD_TERM_GRACE_MS = 5000;
 
 /**
  * Return the current byte size of the safe-outputs file, or 0 if the file does not
@@ -392,26 +404,43 @@ function extractOpenAIProxyBaseURLFromToml(tomlContent) {
 }
 
 /**
- * Determine configured OpenAI endpoint port from AWF /reflect payload.
+ * Determine a configured provider endpoint port from AWF /reflect payload.
  * @param {any} reflectData
+ * @param {string} [provider]
  * @returns {number|null}
  */
-function getConfiguredOpenAIPortFromReflect(reflectData) {
-  const endpoints = reflectData && Array.isArray(reflectData.endpoints) ? reflectData.endpoints : [];
-  const openAIEndpoint = endpoints.find(ep => {
-    if (!ep || ep.configured !== true || typeof ep.provider !== "string") return false;
-    return ep.provider.toLowerCase() === "openai";
-  });
-  if (!openAIEndpoint || openAIEndpoint.port == null) return null;
-  const parsedPort = Number(openAIEndpoint.port);
-  return Number.isNaN(parsedPort) ? null : parsedPort;
+function getConfiguredProviderPortFromReflect(reflectData, provider = "openai") {
+  const resolved = resolveProviderEndpointFromReflect({ provider, reflectData, logger: () => {} });
+  const normalizedProvider = normalizeReflectProviderName(provider, "openai");
+  const normalizedEndpointProvider = normalizeReflectProviderName(resolved?.endpointProvider);
+  const matchingProviders = REFLECT_PROVIDER_ALIASES[normalizedProvider] || new Set([normalizedProvider]);
+  if (!matchingProviders.has(normalizedEndpointProvider)) return null;
+  return resolved && resolved.port != null ? resolved.port : null;
 }
 
 /**
- * Validate that Codex openai-proxy base_url matches the configured OpenAI endpoint from /reflect.
+ * Determine whether AWF /reflect advertises at least one configured endpoint for the
+ * selected provider. Used to distinguish "no endpoints configured at all" (best-effort,
+ * cannot validate) from "endpoints configured but none for the selected provider"
+ * (validation should fail strictly rather than silently pass).
+ * @param {any} reflectData
+ * @param {string} provider
+ * @returns {boolean}
+ */
+function reflectHasMatchingProviderEndpoint(reflectData, provider) {
+  const endpoints = Array.isArray(reflectData?.endpoints) ? reflectData.endpoints.filter(ep => ep && ep.configured === true) : [];
+  if (endpoints.length === 0) return true;
+  const normalizedProvider = normalizeReflectProviderName(provider, "openai");
+  const matchingProviders = REFLECT_PROVIDER_ALIASES[normalizedProvider] || new Set([normalizedProvider]);
+  return endpoints.some(ep => matchingProviders.has(normalizeReflectProviderName(ep.provider)));
+}
+
+/**
+ * Validate that Codex openai-proxy base_url matches the configured provider endpoint from /reflect.
  * @param {{
  *   codexConfigPath: string,
  *   reflectPath: string,
+ *   provider?: string,
  *   readFileSync?: (path: import("node:fs").PathOrFileDescriptor, options?: import("node:fs").ObjectEncodingOptions & { flag?: string } | BufferEncoding | null) => string
  * }} options
  * @returns {{ ok: boolean, reason?: string }}
@@ -420,6 +449,7 @@ function validateCodexOpenAIBaseURLFromReflect(options) {
   const readFileSync = (options && options.readFileSync) || fs.readFileSync;
   const codexConfigPath = options && options.codexConfigPath;
   const reflectPath = options && options.reflectPath;
+  const provider = normalizeReflectProviderName(options?.provider || "openai", "openai");
   if (!codexConfigPath || !reflectPath) return { ok: true };
 
   let tomlContent;
@@ -442,12 +472,18 @@ function validateCodexOpenAIBaseURLFromReflect(options) {
   } catch {
     return { ok: true };
   }
-  const openAIPort = getConfiguredOpenAIPortFromReflect(reflectData);
-  if (openAIPort == null) return { ok: true };
-  if (openAIPort !== baseURLPort) {
+  if (!reflectHasMatchingProviderEndpoint(reflectData, provider)) {
     return {
       ok: false,
-      reason: `Codex openai-proxy base_url port mismatch: config.toml uses ${baseURLPort}, but /reflect reports OpenAI on port ${openAIPort}`,
+      reason: `Codex openai-proxy provider mismatch: /reflect has no configured endpoint for provider "${provider}"`,
+    };
+  }
+  const providerPort = getConfiguredProviderPortFromReflect(reflectData, provider);
+  if (providerPort == null) return { ok: true };
+  if (providerPort !== baseURLPort) {
+    return {
+      ok: false,
+      reason: `Codex openai-proxy base_url port mismatch: config.toml uses ${baseURLPort}, but /reflect reports ${provider} on port ${providerPort}`,
     };
   }
   return { ok: true };
@@ -492,6 +528,89 @@ function configureCodexProviderFromReflect(options) {
     log(`warning: unable to configure provider endpoint from /reflect: ${err.message}`);
     return { env, configured: false };
   }
+}
+
+/**
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ enabled: boolean, maxRebuildFactor: number, minCumulativeInputTokens: number, pollIntervalMs: number, termGraceMs: number }}
+ */
+function resolveContextRebuildCircuitBreakerConfig(env = process.env) {
+  const enabledValue = env.GH_AW_CODEX_CONTEXT_REBUILD_CIRCUIT_BREAKER;
+  const enabled = enabledValue == null || !/^(0|false|off|no)$/i.test(String(enabledValue).trim());
+  const maxRebuildFactorRaw = Number(env.GH_AW_CODEX_MAX_REBUILD_FACTOR);
+  const minCumulativeInputTokensRaw = Number(env.GH_AW_CODEX_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS);
+  const pollIntervalRaw = Number(env.GH_AW_CODEX_REBUILD_GUARD_POLL_MS);
+  const termGraceRaw = Number(env.GH_AW_CODEX_REBUILD_GUARD_TERM_GRACE_MS);
+  return {
+    enabled,
+    // A rebuild factor of exactly 1 means "no rebuild at all", so it is accepted as the
+    // most aggressive valid threshold; anything below 1 is not a reachable factor.
+    maxRebuildFactor: Number.isFinite(maxRebuildFactorRaw) && maxRebuildFactorRaw >= 1 ? maxRebuildFactorRaw : DEFAULT_CONTEXT_REBUILD_FACTOR_LIMIT,
+    minCumulativeInputTokens: Number.isFinite(minCumulativeInputTokensRaw) && Math.floor(minCumulativeInputTokensRaw) >= 1 ? Math.floor(minCumulativeInputTokensRaw) : DEFAULT_CONTEXT_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS,
+    pollIntervalMs: Number.isFinite(pollIntervalRaw) && pollIntervalRaw > 0 ? Math.max(1000, Math.floor(pollIntervalRaw)) : DEFAULT_CONTEXT_REBUILD_POLL_INTERVAL_MS,
+    termGraceMs: Number.isFinite(termGraceRaw) && termGraceRaw > 0 ? Math.max(250, Math.floor(termGraceRaw)) : DEFAULT_CONTEXT_REBUILD_TERM_GRACE_MS,
+  };
+}
+
+/**
+ * Returns the working set from the most recently written candidate that yields usable
+ * measurements. Candidates are ordered by modification time (newest first) so the breaker
+ * tracks the active run rather than whichever path happens to be listed first, and
+ * candidates that are missing, empty, or unparseable (`measurement_state` of
+ * `"unavailable"`) are skipped so a stale or malformed file cannot silently disable it.
+ * File access is asynchronous to avoid blocking the driver's event loop while polling.
+ * @param {string[]} paths
+ * @returns {Promise<ReturnType<typeof calculateWorkingSetFromJSONL>["workingSet"] | null>}
+ */
+async function readWorkingSetFromTokenUsage(paths = TOKEN_USAGE_PATHS) {
+  /** @type {{ path: string, mtimeMs: number }[]} */
+  const candidates = [];
+  for (const candidate of paths) {
+    if (!candidate) continue;
+    try {
+      const stat = await fs.promises.stat(candidate);
+      if (!stat.isFile() || stat.size <= 0) continue;
+      candidates.push({ path: candidate, mtimeMs: stat.mtimeMs });
+    } catch {
+      continue;
+    }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const candidate of candidates) {
+    try {
+      const content = await fs.promises.readFile(candidate.path, "utf8");
+      if (!content.trim()) continue;
+      const workingSet = calculateWorkingSetFromJSONL(content).workingSet;
+      if (!workingSet || workingSet.measurement_state === "unavailable") continue;
+      return workingSet;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * @param {ReturnType<typeof calculateWorkingSetFromJSONL>["workingSet"] | null} workingSet
+ * @param {{ maxRebuildFactor: number, minCumulativeInputTokens: number }} config
+ * @returns {{ terminate: boolean, reason: string }}
+ */
+function evaluateContextRebuildCircuitBreaker(workingSet, config) {
+  if (!workingSet || typeof workingSet !== "object") {
+    return { terminate: false, reason: "" };
+  }
+  const rebuildFactor = typeof workingSet.rebuild_factor === "number" && Number.isFinite(workingSet.rebuild_factor) ? workingSet.rebuild_factor : null;
+  const cumulativeInputTokens = Number.isFinite(workingSet.cumulative_input_tokens) ? Number(workingSet.cumulative_input_tokens) : 0;
+  if (rebuildFactor == null || rebuildFactor < config.maxRebuildFactor) {
+    return { terminate: false, reason: "" };
+  }
+  if (!Number.isFinite(cumulativeInputTokens) || cumulativeInputTokens < config.minCumulativeInputTokens) {
+    return { terminate: false, reason: "" };
+  }
+  return {
+    terminate: true,
+    reason: `context-rebuild circuit breaker tripped: rebuild_factor=${rebuildFactor.toFixed(2)} cumulative_input_tokens=${Math.round(cumulativeInputTokens)} thresholds=${config.maxRebuildFactor}/${config.minCumulativeInputTokens}`,
+  };
 }
 
 /**
@@ -578,6 +697,7 @@ async function main() {
     const validation = validateCodexOpenAIBaseURLFromReflect({
       codexConfigPath: `${codexHome}/config.toml`,
       reflectPath: AWF_REFLECT_OUTPUT_PATH,
+      provider: process.env.GH_AW_LLM_PROVIDER || "openai",
     });
     if (!validation.ok) {
       log(`fatal: ${validation.reason}`);
@@ -592,6 +712,13 @@ async function main() {
   // deadline the guard fires on the next iteration. Individual attempts are expected to
   // complete within the SOFT_TIMEOUT_BUFFER_MS window.
   const softTimeoutGuard = buildSoftTimeoutGuard(driverStartTime);
+  const contextRebuildCircuitBreaker = resolveContextRebuildCircuitBreakerConfig(process.env);
+  log(
+    `context-rebuild circuit breaker: enabled=${contextRebuildCircuitBreaker.enabled}` +
+      ` maxRebuildFactor=${contextRebuildCircuitBreaker.maxRebuildFactor}` +
+      ` minCumulativeInputTokens=${contextRebuildCircuitBreaker.minCumulativeInputTokens}` +
+      ` pollIntervalMs=${contextRebuildCircuitBreaker.pollIntervalMs}`
+  );
   const retryRun = await runHarnessRetryLoop({
     maxRetries: MAX_RETRIES,
     initialDelayMs: INITIAL_DELAY_MS,
@@ -614,6 +741,17 @@ async function main() {
         log,
         logArgs: safeArgs,
         env: codexEnv,
+        runtimeGuard: contextRebuildCircuitBreaker.enabled
+          ? {
+              pollIntervalMs: contextRebuildCircuitBreaker.pollIntervalMs,
+              termGraceMs: contextRebuildCircuitBreaker.termGraceMs,
+              shouldTerminate: async () =>
+                evaluateContextRebuildCircuitBreaker(await readWorkingSetFromTokenUsage(TOKEN_USAGE_PATHS), {
+                  maxRebuildFactor: contextRebuildCircuitBreaker.maxRebuildFactor,
+                  minCumulativeInputTokens: contextRebuildCircuitBreaker.minCumulativeInputTokens,
+                }),
+            }
+          : undefined,
         postResultWatchdog: safeOutputsPath
           ? {
               shouldArm: () => hasTerminalSafeOutput(safeOutputsPath, safeOutputsByteOffset, { logger: log }),
@@ -621,9 +759,23 @@ async function main() {
             }
           : undefined,
       });
+      // A guard-terminated run must never be reported as a success: Codex may handle SIGTERM
+      // and exit cleanly, and `runHarnessRetryLoop` short-circuits on exitCode 0 before
+      // `handleFailure` runs. Normalize the exit code so the failure handler always sees it.
+      if (result.runtimeGuardFired && result.exitCode === 0) {
+        log(`attempt ${attempt + 1}: runtime guard fired but process exited 0 — normalizing exit code to 1`);
+        return { ...result, exitCode: 1, safeOutputsByteOffset };
+      }
       return { ...result, safeOutputsByteOffset };
     },
     handleFailure: ({ attempt, result }) => {
+      if (result.runtimeGuardFired) {
+        const details = result.runtimeGuardReason || "Codex runtime guard terminated the run after context rebuild thresholds were exceeded.";
+        emitInfrastructureIncomplete(details, { logger: log });
+        log(`attempt ${attempt + 1}: ${details} — not retrying (circuit breaker)`);
+        return { action: "stop" };
+      }
+
       // When the post-result watchdog fired (SIGTERM sent to a hanging Codex process) and the
       // safe-outputs file contains a terminal result written during this attempt, treat the run
       // as a success.  The agent completed its work and wrote its output — the hang on exit is
@@ -647,6 +799,7 @@ async function main() {
         `attempt ${attempt + 1} failed:` +
           ` exitCode=${result.exitCode}` +
           ` watchdogFired=${result.watchdogFired}` +
+          ` runtimeGuardFired=${result.runtimeGuardFired}` +
           ` isRateLimitError=${isRateLimit}` +
           ` isTokenPerMinuteRateLimitError=${isTokenPerMinuteRateLimit}` +
           ` isAuthenticationFailedError=${isAuthenticationFailed}` +
@@ -665,11 +818,18 @@ async function main() {
       }
 
       const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
-      const trustedAICreditsExceeded = nonRetryableGuard.aiCreditsExceeded && parseMaxAICreditsExceededFromAuditLog();
+      const proxyAICreditsRejection = parseAICreditsExceededProxyRejection(result.output);
+      if (proxyAICreditsRejection) {
+        log(`attempt ${attempt + 1}: AWF API proxy rejected the request with HTTP 403 max-AI-credits (${proxyAICreditsRejection.aiCredits}/${proxyAICreditsRejection.maxAICredits}) — trusted budget-abort evidence`);
+      }
+      const trustedAICreditsExceeded = nonRetryableGuard.aiCreditsExceeded && (!!proxyAICreditsRejection || parseMaxAICreditsExceededFromAuditLog());
       if (nonRetryableGuard.aiCreditsExceeded && !trustedAICreditsExceeded) {
         log(`attempt ${attempt + 1}: AI credits marker found in CLI output without trusted firewall audit confirmation — preserving normal failure handling`);
       }
-      const shouldTreatAICreditsExceededAsSuccess = trustedAICreditsExceeded && !isAuthenticationFailed && !isMissingApiKey;
+      // Some CLIs surface the proxy's budget rejection as an authentication failure (e.g. Claude Code
+      // reports `error: authentication_failed` for "403 Maximum AI credits exceeded"). When the trusted
+      // proxy signature is present that veto must not mask intentional budget enforcement.
+      const shouldTreatAICreditsExceededAsSuccess = trustedAICreditsExceeded && (!isAuthenticationFailed || !!proxyAICreditsRejection) && !isMissingApiKey;
       if (shouldTreatAICreditsExceededAsSuccess || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.goalAlreadyActive || nonRetryableGuard.maxRunsExceeded) {
         const reasons = [];
         if (shouldTreatAICreditsExceededAsSuccess) reasons.push("AI credits budget exceeded");
@@ -777,9 +937,17 @@ if (typeof module !== "undefined" && module.exports) {
     buildCodexChildEnv,
     extractPortFromURL,
     extractOpenAIProxyBaseURLFromToml,
-    getConfiguredOpenAIPortFromReflect,
+    getConfiguredProviderPortFromReflect,
     validateCodexOpenAIBaseURLFromReflect,
     configureCodexProviderFromReflect,
+    resolveContextRebuildCircuitBreakerConfig,
+    readWorkingSetFromTokenUsage,
+    evaluateContextRebuildCircuitBreaker,
+    TOKEN_USAGE_PATHS,
+    DEFAULT_CONTEXT_REBUILD_FACTOR_LIMIT,
+    DEFAULT_CONTEXT_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS,
+    DEFAULT_CONTEXT_REBUILD_POLL_INTERVAL_MS,
+    DEFAULT_CONTEXT_REBUILD_TERM_GRACE_MS,
     hasNoopInSafeOutputs,
     hasExpectedSafeOutputs,
     resolveRetryConfig,
