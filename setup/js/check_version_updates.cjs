@@ -18,9 +18,12 @@
 
 const { withRetry, isTransientError } = require("./error_recovery.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
 
 const CONFIG_URL = "https://raw.githubusercontent.com/github/gh-aw-actions/main/.github/aw/compat.json";
 const FETCH_TIMEOUT_MS = 120_000;
+const BLOCKED_VERSION_ISSUE_TITLE_PREFIX = "[aw] Workflows blocked by compile-agentic";
+const GITHUB_API_VERSION = "2022-11-28";
 
 /**
  * Parse an official version string (must be in vMAJOR.MINOR.PATCH format).
@@ -56,6 +59,149 @@ function compareVersions(a, b) {
     if (pa[i] !== pb[i]) return pa[i] - pb[i];
   }
   return 0;
+}
+
+/**
+ * Build the stable issue title used to deduplicate blocked compiler notifications.
+ *
+ * @param {string} compiledVersion
+ * @returns {string}
+ */
+function buildBlockedVersionIssueTitle(compiledVersion) {
+  return `${BLOCKED_VERSION_ISSUE_TITLE_PREFIX} ${compiledVersion}`;
+}
+
+/**
+ * Return a Markdown-safe inline-code representation.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function markdownCode(value) {
+  return `\`${String(value).replace(/`/g, "\\`")}\``;
+}
+
+/**
+ * Build a link to the current workflow run when the GitHub Actions context is available.
+ *
+ * @returns {string}
+ */
+function getRunUrl() {
+  const repoFullName = process.env.GITHUB_REPOSITORY || (typeof context !== "undefined" && context.repo ? `${context.repo.owner}/${context.repo.repo}` : "");
+  const runId = process.env.GITHUB_RUN_ID || String(typeof context !== "undefined" && context.runId ? context.runId : "");
+  if (!repoFullName || !runId) {
+    return "";
+  }
+  const serverUrl = process.env.GITHUB_SERVER_URL || (typeof context !== "undefined" ? context.serverUrl : "") || "https://github.com";
+  return `${serverUrl}/${repoFullName}/actions/runs/${runId}`;
+}
+
+/**
+ * Build the body for the blocked compiler notification issue.
+ *
+ * @param {string} compiledVersion
+ * @returns {string}
+ */
+function buildBlockedVersionIssueBody(compiledVersion) {
+  const workflowName = process.env.GH_AW_WORKFLOW_NAME || (typeof context !== "undefined" ? context.workflow : "") || "unknown";
+  const runUrl = getRunUrl();
+  return renderTemplateFromFile(getPromptPath("blocked_compiler_version_issue.md"), {
+    compiled_version: compiledVersion,
+    compiled_version_code: markdownCode(compiledVersion),
+    workflow_name_code: markdownCode(workflowName),
+    run_url_line: runUrl ? `- Run: ${runUrl}` : "",
+  });
+}
+
+/**
+ * Find an existing open blocked-version issue for this compiler version.
+ *
+ * NOTE: This relies on the GitHub search index, which is eventually consistent.
+ * During a repo-wide blocked-version outage, many activation runs can fire close
+ * together; two runs can both observe `items: []` before the index catches up and
+ * both proceed to create an issue, producing duplicates. This is accepted as a
+ * best-effort tradeoff (consistent with other dedup lookups in this codebase, e.g.
+ * handle_agent_failure.cjs) rather than a correctness guarantee. The call is wrapped
+ * in withRetry so transient failures and secondary rate limits (more likely during a
+ * fan-out of many concurrent activation failures) don't silently drop the lookup.
+ *
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} compiledVersion
+ * @returns {Promise<{number: number, html_url: string} | null>}
+ */
+async function findExistingBlockedVersionIssue(owner, repo, compiledVersion) {
+  const title = buildBlockedVersionIssueTitle(compiledVersion);
+  const result = await withRetry(
+    () =>
+      github.rest.search.issuesAndPullRequests({
+        q: `repo:${owner}/${repo} is:issue is:open in:title "${title}"`,
+        per_page: 10,
+      }),
+    {},
+    "search for existing blocked compiler version issue"
+  );
+  const existing = result.data.items.find(item => item.title === title && !item.pull_request);
+  return existing ? { number: existing.number, html_url: existing.html_url } : null;
+}
+
+/**
+ * Best-effort issue notification for blocked compiler versions. Failures here must not
+ * mask the primary blocked-version error.
+ *
+ * @param {string} compiledVersion
+ * @returns {Promise<void>}
+ */
+async function reportBlockedVersionIssue(compiledVersion) {
+  if (process.env.GH_AW_BLOCKED_VERSION_REPORT_AS_ISSUE === "false") {
+    core.info("Blocked compiler version issue reporting is disabled");
+    return;
+  }
+  if (typeof github === "undefined" || typeof context === "undefined" || !github.rest?.issues || !github.rest?.search || !context.repo) {
+    core.info("GitHub issue APIs are unavailable; skipping blocked compiler version issue notification");
+    return;
+  }
+
+  const { owner, repo } = context.repo;
+  const title = buildBlockedVersionIssueTitle(compiledVersion);
+  const body = buildBlockedVersionIssueBody(compiledVersion);
+
+  try {
+    const existing = await findExistingBlockedVersionIssue(owner, repo, compiledVersion);
+    if (existing) {
+      const updatedIssue = await withRetry(
+        () =>
+          github.rest.issues.update({
+            owner,
+            repo,
+            issue_number: existing.number,
+            title,
+            body,
+            headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
+          }),
+        {},
+        "update blocked compiler version issue"
+      );
+      core.info(`Updated blocked compiler version issue #${updatedIssue.data.number}: ${updatedIssue.data.html_url}`);
+      return;
+    }
+
+    const newIssue = await withRetry(
+      () =>
+        github.rest.issues.create({
+          owner,
+          repo,
+          title,
+          body,
+          headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
+        }),
+      {},
+      "create blocked compiler version issue"
+    );
+    core.info(`Created blocked compiler version issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
+  } catch (err) {
+    core.warning(`Could not create or update blocked compiler version issue: ${getErrorMessage(err)}`);
+  }
 }
 
 /**
@@ -128,6 +274,7 @@ async function main() {
       .addRaw("This version has been revoked, typically due to a security issue.\n\n")
       .addRaw("**Action required:** Update `gh-aw` to the latest version and recompile your workflow with `gh aw compile`.\n");
     await core.summary.write();
+    await reportBlockedVersionIssue(compiledVersion);
     core.setFailed(`Blocked compile-agentic version: ${compiledVersion} is in the blocked versions list. Update gh-aw to the latest version and recompile your workflow.`);
     return;
   }
@@ -157,4 +304,12 @@ async function main() {
   core.info(`✅ Version check passed: ${compiledVersion}`);
 }
 
-module.exports = { main };
+module.exports = {
+  buildBlockedVersionIssueBody,
+  buildBlockedVersionIssueTitle,
+  compareVersions,
+  findExistingBlockedVersionIssue,
+  main,
+  parseVersion,
+  reportBlockedVersionIssue,
+};
