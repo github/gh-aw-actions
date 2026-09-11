@@ -3,6 +3,7 @@
 const { createCountGatedHandler } = require("./handler_scaffold.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { createJiraClient, textToADF } = require("./jira_client.cjs");
+const { appendConfiguredBodyFooter } = require("./body_footer.cjs");
 
 function requiredString(value, field, maxLength = 255) {
   if (typeof value !== "string" || value.trim() === "") {
@@ -25,13 +26,13 @@ function optionalString(value, field, maxLength = 32767) {
 function jiraHandler(handlerType, handle) {
   return createCountGatedHandler({
     handlerType,
-    setup: async (_config, _maxCount, isStaged) => {
+    setup: async (config, _maxCount, isStaged) => {
       core.debug(`${handlerType}: initializing handler (staged=${isStaged})`);
       const client = isStaged ? null : createJiraClient();
       return async message => {
         core.debug(`${handlerType}: processing request`);
         try {
-          const result = await handle(message || {}, client, isStaged);
+          const result = await handle(message || {}, client, isStaged, config);
           core.debug(`${handlerType}: request completed successfully`);
           return result;
         } catch (error) {
@@ -45,11 +46,12 @@ function jiraHandler(handlerType, handle) {
   });
 }
 
-const createIssue = jiraHandler("jira_create_issue", async (message, client, isStaged) => {
+const createIssue = jiraHandler("jira_create_issue", async (message, client, isStaged, config) => {
   const projectKey = requiredString(message.project_key, "project_key");
   const issueType = requiredString(message.issue_type, "issue_type");
   const summary = requiredString(message.summary, "summary");
-  const description = optionalString(message.description, "description");
+  const rawDescription = optionalString(message.description, "description");
+  const description = rawDescription === undefined ? undefined : requiredString(appendConfiguredBodyFooter(rawDescription, config.body_footer, { maxLength: 32767 }), "description", 32767);
 
   if (isStaged) {
     logStagedPreviewInfo(`Jira create issue — Project: ${projectKey}; Type: ${issueType}; Summary: ${summary}${description ? `; Description: ${description}` : ""}`);
@@ -75,10 +77,11 @@ const createIssue = jiraHandler("jira_create_issue", async (message, client, isS
   };
 });
 
-const updateIssue = jiraHandler("jira_update_issue", async (message, client, isStaged) => {
+const updateIssue = jiraHandler("jira_update_issue", async (message, client, isStaged, config) => {
   const issueKey = requiredString(message.issue_key, "issue_key");
   const summary = optionalString(message.summary, "summary", 255);
-  const description = optionalString(message.description, "description");
+  const rawDescription = optionalString(message.description, "description");
+  const description = rawDescription === undefined ? undefined : requiredString(appendConfiguredBodyFooter(rawDescription, config.body_footer, { maxLength: 32767 }), "description", 32767);
   if (summary === undefined && description === undefined) {
     throw new Error("jira_update_issue requires summary or description");
   }
@@ -100,9 +103,9 @@ const updateIssue = jiraHandler("jira_update_issue", async (message, client, isS
   return { success: true, issue_key: issueKey, metadata: { issue_key: issueKey } };
 });
 
-const addComment = jiraHandler("jira_add_comment", async (message, client, isStaged) => {
+const addComment = jiraHandler("jira_add_comment", async (message, client, isStaged, config) => {
   const issueKey = requiredString(message.issue_key, "issue_key");
-  const body = requiredString(message.body, "body", 32767);
+  const body = requiredString(appendConfiguredBodyFooter(requiredString(message.body, "body", 32767), config.body_footer, { maxLength: 32767 }), "body", 32767);
 
   if (isStaged) {
     logStagedPreviewInfo(`Jira add comment — Issue: ${issueKey}; Body: ${body}`);
