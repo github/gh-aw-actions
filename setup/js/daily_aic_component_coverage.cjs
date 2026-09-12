@@ -65,10 +65,38 @@ function provesExecutionNotStarted(directory, name, runId, runAttempt) {
   }
 }
 
+function inspectAccountingFile(directory, file) {
+  const relativeFile = path.relative(directory, file);
+  if (!fs.existsSync(file)) return { file: relativeFile, state: "missing" };
+  try {
+    return { file: relativeFile, state: fs.readFileSync(file, "utf8").trim() ? "non-empty" : "empty" };
+  } catch (error) {
+    return { file: relativeFile, state: `unreadable (${error instanceof Error ? error.message : String(error)})` };
+  }
+}
+
+function logComponentAIC(runId, name, job, aic, reason, details = {}) {
+  core.info(
+    `[daily-workflow-aic] Computed component AIC: ${JSON.stringify({
+      runId,
+      component: name,
+      jobId: job.id,
+      runAttempt: job.run_attempt,
+      conclusion: job.conclusion,
+      aic,
+      reason,
+      ...details,
+    })}`
+  );
+}
+
 function sumCoveredComponents(directory, components, artifactCreatedAt, artifacts, usageArtifactName, attempt, runId) {
   let total = 0;
   for (const [name, job] of components) {
-    if (job.conclusion === "skipped") continue;
+    if (job.conclusion === "skipped") {
+      logComponentAIC(runId, name, job, 0, "job_skipped");
+      continue;
+    }
     // Failed-only reruns can retain successful jobs from earlier attempts. Such
     // usage remains valid, but an artifact predating any executed job does not.
     const started = Date.parse(job.started_at);
@@ -87,14 +115,52 @@ function sumCoveredComponents(directory, components, artifactCreatedAt, artifact
       }
     }
     const candidates = COMPONENT_FILES[name].map(parts => path.join(directory, ...parts));
-    const selected = candidates.find(file => fs.existsSync(file) && fs.readFileSync(file, "utf8").trim());
-    if (!selected) {
-      if (provesExecutionNotStarted(directory, name, runId, job.run_attempt)) continue;
-      throw new Error(`Missing accounting for executed ${name} component`);
+    const candidateStates = candidates.map(file => inspectAccountingFile(directory, file));
+    core.info(
+      `[daily-workflow-aic] Inspected component accounting: ${JSON.stringify({
+        runId,
+        component: name,
+        jobId: job.id,
+        runAttempt: job.run_attempt,
+        conclusion: job.conclusion,
+        candidates: candidateStates,
+      })}`
+    );
+    // An empty raw detection/token_usage.jsonl is authoritative proof that
+    // detection ran but produced no firewall-observed usage (e.g. threat
+    // detection was skipped internally). Unlike every other component, this
+    // deliberately overrides the "first non-empty candidate wins" fallback
+    // below: the legacy detection_usage.jsonl summary is not consulted, so a
+    // stale or unrelated fallback value cannot resurrect nonzero AIC for a
+    // component whose primary source proves zero usage.
+    if (name === "detection" && candidateStates[0].state === "empty") {
+      logComponentAIC(runId, name, job, 0, "empty_detection_accounting", {
+        source: candidateStates[0].file,
+      });
+      continue;
     }
-    total += sumAICFromUsageJSONLFiles([selected], { strict: true });
+    const selectedIndex = candidateStates.findIndex(candidate => candidate.state === "non-empty");
+    const unreadableIndex = candidateStates.findIndex(candidate => candidate.state.startsWith("unreadable"));
+    const selected = selectedIndex >= 0 ? candidates[selectedIndex] : "";
+    const candidateSummary = candidateStates.map(candidate => `${candidate.file} is ${candidate.state}`).join("; ");
+    if (unreadableIndex >= 0 && (selectedIndex < 0 || unreadableIndex < selectedIndex)) {
+      throw new Error(`Missing accounting for executed ${name} component in run ${runId} (attempt ${job.run_attempt}, job ${job.id}, conclusion ${job.conclusion}): ${candidateSummary}`);
+    }
+    if (!selected) {
+      if (provesExecutionNotStarted(directory, name, runId, job.run_attempt)) {
+        logComponentAIC(runId, name, job, 0, "execution_not_started");
+        continue;
+      }
+      throw new Error(`Missing accounting for executed ${name} component in run ${runId} (attempt ${job.run_attempt}, job ${job.id}, conclusion ${job.conclusion}): ${candidateSummary}`);
+    }
+    const componentAIC = sumAICFromUsageJSONLFiles([selected], { strict: true });
+    logComponentAIC(runId, name, job, componentAIC, "accounting_file", {
+      source: candidateStates[selectedIndex].file,
+    });
+    total += componentAIC;
   }
   if (!Number.isFinite(total)) throw new Error("Daily AIC component total is not finite");
+  core.info(`[daily-workflow-aic] Computed covered component total: ${JSON.stringify({ runId, aic: total })}`);
   return total;
 }
 

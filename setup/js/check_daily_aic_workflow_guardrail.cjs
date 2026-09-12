@@ -232,7 +232,14 @@ function matchesGuardrailArtifactName(artifactName) {
  */
 async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspection) {
   const components = run ? await loadBillableJobs(inspection, owner, repo, run) : null;
-  if (components && allBillableJobsSkipped(components)) return 0;
+  if (components && allBillableJobsSkipped(components)) {
+    logDailyGuardrail("Computed run AIC", {
+      runId,
+      aic: 0,
+      reason: components.size === 0 ? "no_billable_jobs" : "all_billable_jobs_skipped",
+    });
+    return 0;
+  }
   const { artifacts } = await artifactClient.listArtifacts({
     latest: true,
     findBy: {
@@ -258,6 +265,7 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
       runId,
       availableArtifacts: artifactSummaries,
     });
+    logDailyGuardrail("Computed run AIC", { runId, aic: 0, reason: "no_usage_artifact" });
     return 0;
   }
   if (!artifact.id) {
@@ -266,6 +274,7 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
       runId,
       artifactName: artifact.name,
     });
+    logDailyGuardrail("Computed run AIC", { runId, aic: 0, reason: "usage_artifact_without_id" });
     return 0;
   }
   if (run && (artifact.expired || !artifact.createdAt || !Number.isFinite(artifact.createdAt.getTime()))) {
@@ -310,6 +319,7 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
       runId,
       artifactId: artifact.id,
       aic,
+      reason: components ? "covered_components" : "usage_files",
     });
     return aic;
   } finally {
@@ -557,6 +567,7 @@ async function main(options = {}) {
   core.setOutput("daily_ai_credits_total_effective_tokens", "");
   core.setOutput("daily_ai_credits_threshold", "");
   core.setOutput("daily_ai_credits_guardrail_status", "not_run");
+  core.setOutput("daily_ai_credits_guardrail_error", "");
   const threshold = parsePositiveCompactNumber(process.env.GH_AW_MAX_DAILY_AI_CREDITS);
   if (threshold <= 0) {
     core.setOutput("daily_ai_credits_guardrail_status", "disabled");
@@ -570,8 +581,10 @@ async function main(options = {}) {
 
   const token = process.env.GH_AW_GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
   if (!token) {
+    const message = "Daily workflow AI Credits are unknown: no artifact lookup token.";
     core.setOutput("daily_ai_credits_guardrail_status", "structural_error");
-    core.setFailed("Daily workflow AI Credits are unknown: no artifact lookup token.");
+    core.setOutput("daily_ai_credits_guardrail_error", message);
+    core.setFailed(message);
     return;
   }
 
@@ -638,10 +651,14 @@ async function main(options = {}) {
     // workflow to fail even though hitting the daily limit is an expected, graceful outcome.
     core.info(`Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold}.`);
   } catch (error) {
-    core.setOutput("daily_ai_credits_guardrail_status", isStructuralGuardrailError(error) ? "structural_error" : "transient_error");
+    const status = isStructuralGuardrailError(error) ? "structural_error" : "transient_error";
+    const message = `Daily workflow AI Credits are unknown: ${getErrorMessage(error)}`;
+    core.setOutput("daily_ai_credits_guardrail_status", status);
+    core.setOutput("daily_ai_credits_guardrail_error", message);
+    logDailyGuardrail("AIC inspection failed", { status, error: getErrorMessage(error) });
     const retryAt = retryNotBefore(error?.response?.headers);
     if (retryAt) core.info(`Daily AIC inspection must not retry before ${retryAt}`);
-    core.setFailed(`Daily workflow AI Credits are unknown: ${getErrorMessage(error)}`);
+    core.setFailed(message);
   }
 }
 
