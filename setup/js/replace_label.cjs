@@ -79,6 +79,7 @@ function validateSingleLabel(labelName, allowedPatterns, blockedPatterns, fieldN
 const main = createCountGatedHandler({
   handlerType: HANDLER_TYPE,
   setup: async (config, maxCount, isStaged) => {
+    const target = config.target || "triggering";
     const currentAllowedAdd = () => (Array.isArray(config.allowed_add) ? config.allowed_add : []);
     const currentAllowedRemove = () => (Array.isArray(config.allowed_remove) ? config.allowed_remove : []);
     const currentBlockedPatterns = () => (Array.isArray(config.blocked) ? config.blocked : []);
@@ -120,14 +121,23 @@ const main = createCountGatedHandler({
       const { repo: itemRepo, repoParts } = repoResult;
       core.info(`Target repository: ${itemRepo}`);
 
-      // Determine target issue/PR number
-      const targetResult = resolveSafeOutputIssueTarget({ message, resolvedTemporaryIds, repoParts, handlerType: HANDLER_TYPE });
-      if (!targetResult.success) return targetResult;
       const effectiveContext = resolveInvocationContext(context);
-      const itemNumber = targetResult.number ?? effectiveContext.eventPayload?.issue?.number ?? effectiveContext.eventPayload?.pull_request?.number;
+      const triggeringItemNumber = effectiveContext.eventPayload?.issue?.number ?? effectiveContext.eventPayload?.pull_request?.number;
+      let itemNumber;
 
-      if (!itemNumber || Number.isNaN(Number(itemNumber))) {
-        const error = "No issue/PR number available";
+      if (target === "*") {
+        const targetResult = resolveSafeOutputIssueTarget({ message, resolvedTemporaryIds, repoParts, handlerType: HANDLER_TYPE });
+        if (!targetResult.success) return targetResult;
+        itemNumber = targetResult.number ?? triggeringItemNumber;
+      } else if (target === "triggering") {
+        itemNumber = triggeringItemNumber;
+      } else {
+        itemNumber = Number(target);
+      }
+
+      itemNumber = Number(itemNumber);
+      if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
+        const error = target !== "*" && target !== "triggering" ? "Invalid issue/PR number" : "No issue/PR number available";
         core.warning(error);
         return { success: false, error };
       }

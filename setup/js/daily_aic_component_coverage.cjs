@@ -7,7 +7,7 @@ const { sumAICFromUsageJSONLFiles } = require("./daily_aic_workflow_helpers.cjs"
 // These are the compiler-owned jobs and collect_usage_artifact_files.sh paths.
 // Raw firewall accounting is preferred to the overlapping engine summary.
 const COMPONENT_FILES = {
-  agent: [["agent", "token_usage.jsonl"], ["agent_usage.jsonl"]],
+  agent: [["agent", "token_usage.jsonl"], ["agent_usage.jsonl"], ["agent_usage.json"]],
   detection: [["detection", "token_usage.jsonl"], ["detection_usage.jsonl"]],
   evals: [["evals", "token_usage.jsonl"]],
 };
@@ -45,7 +45,8 @@ async function loadBillableJobs({ github, budget }, owner, repo, run) {
       break;
     }
   }
-  if (!complete || !components.has("agent")) throw new Error("Cannot prove complete billable-component coverage");
+  // A complete empty job list proves the run ended before any billable job existed.
+  if (!complete || (components.size > 0 && !components.has("agent"))) throw new Error("Cannot prove complete billable-component coverage");
   return components;
 }
 
@@ -53,7 +54,18 @@ function allBillableJobsSkipped(components) {
   return [...components.values()].every(job => job.conclusion === "skipped");
 }
 
-function sumCoveredComponents(directory, components, artifactCreatedAt, artifacts, usageArtifactName, attempt) {
+function provesExecutionNotStarted(directory, name, runId, runAttempt) {
+  const evidenceFile = path.join(directory, name, "execution.json");
+  if (!fs.existsSync(evidenceFile)) return false;
+  try {
+    const evidence = JSON.parse(fs.readFileSync(evidenceFile, "utf8"));
+    return evidence?.version === 1 && evidence.component === name && evidence.run_id === runId && evidence.run_attempt === runAttempt && evidence.state === "not_started";
+  } catch {
+    return false;
+  }
+}
+
+function sumCoveredComponents(directory, components, artifactCreatedAt, artifacts, usageArtifactName, attempt, runId) {
   let total = 0;
   for (const [name, job] of components) {
     if (job.conclusion === "skipped") continue;
@@ -76,7 +88,10 @@ function sumCoveredComponents(directory, components, artifactCreatedAt, artifact
     }
     const candidates = COMPONENT_FILES[name].map(parts => path.join(directory, ...parts));
     const selected = candidates.find(file => fs.existsSync(file) && fs.readFileSync(file, "utf8").trim());
-    if (!selected) throw new Error(`Missing accounting for executed ${name} component`);
+    if (!selected) {
+      if (provesExecutionNotStarted(directory, name, runId, job.run_attempt)) continue;
+      throw new Error(`Missing accounting for executed ${name} component`);
+    }
     total += sumAICFromUsageJSONLFiles([selected], { strict: true });
   }
   if (!Number.isFinite(total)) throw new Error("Daily AIC component total is not finite");
