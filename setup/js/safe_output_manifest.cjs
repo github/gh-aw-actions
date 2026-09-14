@@ -80,6 +80,11 @@ const NOT_LOGGED_TYPES = new Set(["noop", "missing_tool", "missing_data", "repor
  * @property {string} [url] - URL of the affected item in GitHub (present for creation types; omitted for modification types that don't return a URL)
  * @property {number} [number] - Issue/PR/discussion number if applicable
  * @property {string} [repo] - Repository slug (owner/repo) if applicable
+ * @property {string} [provider] - Backing service (for example github, jira, or linear)
+ * @property {string|number} [id] - Provider-specific database or node ID
+ * @property {string} [identifier] - Provider-specific human-readable identifier
+ * @property {Object} [target] - Entity associated with this operation
+ * @property {Array<{name: string, database_id?: number, node_id?: string}>} [labels] - Labels added by this operation
  * @property {string} [temporaryId] - Temporary ID assigned to this item, if any
  * @property {Record<string, any>} [metadata] - Persisted outcome metadata captured at execution time
  * @property {Object} [before_state] - Execution-time state snapshot captured before mutation
@@ -90,13 +95,40 @@ const NOT_LOGGED_TYPES = new Set(["noop", "missing_tool", "missing_data", "repor
  */
 
 /**
+ * Recursively redacts secrets from every string leaf of a value.
+ *
+ * Redaction must happen before JSON.stringify: once a value containing a
+ * quote, backslash, or newline is serialized, its JSON-escaped form no
+ * longer matches the raw secret value that redactBuiltInPatterns/redactSecrets
+ * search for, and the secret would be persisted recoverably in the manifest.
+ *
+ * @param {unknown} value - Value to sanitize (object, array, string, or primitive)
+ * @param {string[]} secretValues - Secret values to redact
+ * @returns {unknown} Sanitized value safe to JSON.stringify
+ */
+function redactManifestValue(value, secretValues) {
+  if (typeof value === "string") {
+    let redacted = redactBuiltInPatterns(value).content;
+    redacted = redactSecrets(redacted, secretValues).content;
+    return redacted;
+  }
+  if (Array.isArray(value)) {
+    return value.map(entry => redactManifestValue(entry, secretValues));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, nestedValue]) => [key, redactManifestValue(nestedValue, secretValues)]));
+  }
+  return value;
+}
+
+/**
  * Create a manifest logger function for recording executed safe output items.
  *
  * The logger writes JSONL entries to the specified manifest file.
  * It is designed to be easily testable by accepting the file path as a parameter.
  *
  * @param {string} [manifestFile] - Path to the manifest file (defaults to MANIFEST_FILE_PATH)
- * @returns {(item: {type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}) => void} Logger function
+ * @returns {(item: {type: string, url?: string, number?: number, repo?: string, provider?: string, id?: string|number, identifier?: string, target?: Object, labels?: Array<{name: string, database_id?: number, node_id?: string}>, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}) => void} Logger function
  */
 function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
   // Touch the file immediately so it exists for artifact upload
@@ -106,7 +138,7 @@ function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
   /**
    * Log an executed safe output item to the manifest file.
    *
-   * @param {{type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}} item - Executed item details
+   * @param {{type: string, url?: string, number?: number, repo?: string, provider?: string, id?: string|number, identifier?: string, target?: Object, labels?: Array<{name: string, database_id?: number, node_id?: string}>, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}} item - Executed item details
    */
   return function logCreatedItem(item) {
     if (!item) return;
@@ -117,6 +149,11 @@ function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
       ...(item.url ? { url: item.url } : {}),
       ...(item.number != null ? { number: item.number } : {}),
       ...(item.repo ? { repo: item.repo } : {}),
+      ...(item.provider ? { provider: item.provider } : {}),
+      ...(item.id != null ? { id: item.id } : {}),
+      ...(item.identifier ? { identifier: item.identifier } : {}),
+      ...(item.target ? { target: item.target } : {}),
+      ...(Array.isArray(item.labels) ? { labels: item.labels } : {}),
       ...(item.temporaryId ? { temporaryId: item.temporaryId } : {}),
       ...(item.metadata && Object.keys(item.metadata).length > 0 ? { metadata: item.metadata } : {}),
       ...(item.before_state ? { before_state: item.before_state } : {}),
@@ -127,9 +164,24 @@ function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
       timestamp: new Date().toISOString(),
     };
 
-    const jsonLine = JSON.stringify(entry) + "\n";
+    let jsonLine;
     try {
-      fs.appendFileSync(manifestFile, jsonLine);
+      const secretValues = collectArtifactSecretValues();
+      const redactedEntry = /** @type {ManifestEntry} */ redactManifestValue(entry, secretValues);
+      jsonLine = JSON.stringify(redactedEntry);
+    } catch (error) {
+      if (typeof core !== "undefined" && typeof core.warning === "function") {
+        core.warning(`Failed to redact safe-output manifest entry (type=${entry.type}); recording minimal fields only to avoid persisting unredacted data: ${getErrorMessage(error)}`);
+      }
+      jsonLine = JSON.stringify({
+        type: entry.type,
+        ...(entry.provider ? { provider: entry.provider } : {}),
+        ...(entry.number != null ? { number: entry.number } : {}),
+        timestamp: entry.timestamp,
+      });
+    }
+    try {
+      fs.appendFileSync(manifestFile, jsonLine + "\n");
     } catch (error) {
       throw new Error(`${ERR_SYSTEM}: Failed to write to manifest file: ${getErrorMessage(error)}`, { cause: error });
     }
@@ -165,7 +217,7 @@ function ensureManifestExists(manifestFile = MANIFEST_FILE_PATH) {
  *
  * @param {string} type - The handler type (e.g., "create_issue")
  * @param {any} result - The handler result object
- * @returns {{type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}|null}
+ * @returns {{type: string, url?: string, number?: number, repo?: string, provider?: string, id?: string|number, identifier?: string, target?: Object, labels?: Array<{name: string, database_id?: number, node_id?: string}>, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}|null}
  */
 function extractCreatedItemFromResult(type, result) {
   if (!result || NOT_LOGGED_TYPES.has(type)) return null;
@@ -182,12 +234,37 @@ function extractCreatedItemFromResult(type, result) {
   // Normalize URL from different result shapes (present for creation types)
   const url = result.url || result.projectUrl || result.html_url || result.pull_request_url || result.review_url || result.issue_url;
   const number = result.number ?? result.pull_request_number ?? result.prNumber ?? result.issue_number ?? result.itemNumber;
+  const repo = result.repo || result._repo;
+  const provider = result.provider || result.metadata?.provider || (type.startsWith("jira_") ? "jira" : type.startsWith("linear_") ? "linear" : type.startsWith("ado_") ? "azure-devops" : "github");
+  const id = result.id ?? result.commentId ?? result.comment_id ?? result.review_id ?? result.issue_id;
+  const identifier = result.identifier ?? result.issue_key;
+  // result.target may be a scalar provider-specific identifier (e.g. Linear issue key "ENG-123")
+  // rather than a structured object. Normalize it to a provider-neutral object so downstream
+  // consumers (CreatedItemReport.Target, logs schema) always receive an object.
+  const rawTarget = result.target;
+  const target =
+    (rawTarget && typeof rawTarget === "object" ? rawTarget : undefined) ||
+    (typeof rawTarget === "string" && rawTarget ? { provider, identifier: rawTarget } : undefined) ||
+    (repo || number != null
+      ? {
+          provider,
+          ...(repo ? { repository: repo } : {}),
+          ...(number != null ? { number } : {}),
+          ...(result.contextType ? { kind: result.contextType } : {}),
+        }
+      : undefined);
+  const labels = Array.isArray(result.labels) ? result.labels : Array.isArray(result.labelsAdded) ? result.labelsAdded.map(name => ({ name })) : undefined;
 
   return {
     type,
     ...(url ? { url } : {}),
     ...(number != null ? { number } : {}),
-    ...(result.repo ? { repo: result.repo } : {}),
+    ...(repo ? { repo } : {}),
+    provider,
+    ...(id != null ? { id } : {}),
+    ...(identifier ? { identifier } : {}),
+    ...(target ? { target } : {}),
+    ...(labels ? { labels } : {}),
     ...(result.temporaryId ? { temporaryId: result.temporaryId } : {}),
     ...(result.metadata && Object.keys(result.metadata).length > 0 ? { metadata: result.metadata } : {}),
     ...(result.before_state ? { before_state: result.before_state } : {}),

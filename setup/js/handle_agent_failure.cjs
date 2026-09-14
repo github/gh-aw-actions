@@ -63,6 +63,14 @@ const ELLIPSIS_LENGTH = ELLIPSIS.length;
 const ENGINE_RATE_LIMIT_429_RE =
   /(?:\b429\b[\s\S]{0,120}(?:too many requests|rate[\s-]*limit)|\brate_limit_(?:error|exceeded)\b|capierror:\s*429|failed to get response from the ai model[\s\S]{0,120}\b429\b|exceeded your rate limit for utility models)/i;
 const ENGINE_MAX_RUNS_EXCEEDED_RE = /(?:\bmax_runs_exceeded\b|\bmaximum\s+llm\s+invocations\s+exceeded\b)/i;
+const COPILOT_ORG_BILLING_MODE_RE = /API proxy enabled:[^\n]*Copilot=true \(github-token\)/i;
+// Host allowlist kept aligned with isLikelyAWFAPIProxyURL in copilot_harness.cjs:
+// awf_reflect rewrites api-proxy to host-bridge addresses for host execution.
+const AWF_API_PROXY_HOST_RE_SOURCE = "(?:api-proxy|host\\.docker\\.internal|localhost|127(?:\\.\\d{1,3}){3}|10(?:\\.\\d{1,3}){3}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})";
+const COPILOT_ORG_BILLING_ERROR_RE = new RegExp(
+  `(?:awf-reflect: models fetch returned 403\\b|Copilot requests authentication failed through the gh-aw API proxy \\(HTTP 403\\b|Authentication failed with provider at (?:https?:\\/\\/)?${AWF_API_PROXY_HOST_RE_SOURCE}(?::\\d+)?[^\\n]*\\(HTTP 403\\))`,
+  "i"
+);
 const ALLOWED_FILES_ERROR_RE = /^(?<summary>.*outside the allowed-files list) \((?<files>.+?)\)\. (?<remediation>Add the files to the allowed-files configuration field or remove them from the (?:patch|bundle)\.)$/;
 
 /**
@@ -273,6 +281,7 @@ function buildFailureMatchCategories(options) {
   if (options.secretVerificationFailed) categories.push("secret_verification_failed");
   if (options.hasDockerSbxSecretsFailed) categories.push("docker_sbx_secrets_missing");
   if (options.inferenceAccessError) categories.push("inference_access_error");
+  if (options.copilotOrgBillingError) categories.push("copilot_org_billing_error");
   if (options.mcpPolicyError) categories.push("mcp_policy_error");
   if (options.modelNotSupportedError) categories.push("model_not_supported_error");
   if (options.http400ResponseError) categories.push("http_400_response_error");
@@ -325,6 +334,7 @@ function buildFailureMatchCategories(options) {
  * @param {boolean} options.http400ResponseError
  * @param {boolean} options.unknownModelAICredits
  * @param {boolean} [options.hasDockerSbxSecretsFailed]
+ * @param {boolean} [options.copilotOrgBillingError]
  * @param {boolean} [options.missingModelPricingError]
  * @param {string} [options.missingModelPricingModelName]
  * @param {boolean} [options.shellExpansionGuardRejected]
@@ -355,6 +365,7 @@ function buildFailureIssueTitle(options) {
   if (options.hasStaleLockFileFailed) return `[aw] ${workflowName} has stale lock file`;
   if (options.shellExpansionGuardRejected) return `[aw] ${workflowName} hit shell expansion guard rejection`;
   if (options.hasDockerSbxSecretsFailed) return `[aw] ${workflowName} is missing docker-sbx Docker Hub secrets`;
+  if (options.copilotOrgBillingError) return `[aw] ${workflowName} hit Copilot organization billing error`;
   if (options.isTimedOut) return `[aw] ${workflowName} timed out`;
   if (options.hasToolDenialsExceeded) return `[aw] ${workflowName} exceeded tool denial limit`;
   if (options.hasCacheMissMisconfiguration) return `[aw] ${workflowName} has cache-memory miss misconfiguration`;
@@ -1752,6 +1763,19 @@ function buildInferenceAccessErrorContext(hasInferenceAccessError) {
 }
 
 /**
+ * Build remediation for Copilot failures caused by unavailable organization billing.
+ * @param {boolean} hasCopilotOrgBillingError
+ * @returns {string}
+ */
+function buildCopilotOrgBillingErrorContext(hasCopilotOrgBillingError) {
+  if (!hasCopilotOrgBillingError) {
+    return "";
+  }
+
+  return "\n" + renderPromptTemplate("copilot_org_billing_error.md");
+}
+
+/**
  * Build a context string when MCP servers were blocked by enterprise/organization policy.
  * This is a persistent configuration error — retrying will not help.
  * @param {boolean} hasMCPPolicyError - Whether an MCP policy error was detected
@@ -2729,6 +2753,27 @@ function hasAgentTerminalReasonCompleted() {
 }
 
 /**
+ * Detect Copilot authorization failures while the API proxy is using the
+ * organization-billed GITHUB_TOKEN supplied by copilot-requests: write.
+ * @param {string} [stdioLogPathOverride]
+ * @returns {boolean}
+ */
+function detectCopilotOrgBillingErrorFromLog(stdioLogPathOverride) {
+  if (process.env.GH_AW_ENGINE_ID !== "copilot") {
+    return false;
+  }
+
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const stdioLogPath = stdioLogPathOverride || (agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log");
+  try {
+    const logContent = fs.readFileSync(stdioLogPath, "utf8");
+    return COPILOT_ORG_BILLING_MODE_RE.test(logContent) && COPILOT_ORG_BILLING_ERROR_RE.test(logContent);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Detect AWF firewall startup failure signals from log content.
  * Uses specific failure patterns to avoid false positives on successful runs
  * where container lifecycle lines (e.g., " Container awf-cli-proxy  Started")
@@ -3389,6 +3434,7 @@ async function main() {
     const timeoutMinutes = process.env.GH_AW_TIMEOUT_MINUTES || "";
     const { aiCredits, maxAICredits, aiCreditsRateLimitError, maxAICreditsExceeded } = resolveAICreditsFailureState();
     const inferenceAccessError = process.env.GH_AW_INFERENCE_ACCESS_ERROR === "true";
+    const copilotOrgBillingError = detectCopilotOrgBillingErrorFromLog();
     const mcpPolicyError = process.env.GH_AW_MCP_POLICY_ERROR === "true";
     const agenticEngineTimeout = process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT === "true";
     const modelNotSupportedError = process.env.GH_AW_MODEL_NOT_SUPPORTED_ERROR === "true";
@@ -3848,6 +3894,7 @@ async function main() {
       missingModelPricingError,
       missingModelPricingModelName,
       hasDockerSbxSecretsFailed,
+      copilotOrgBillingError,
     });
     const failureCategories = buildFailureMatchCategories({
       agentConclusion,
@@ -3868,6 +3915,7 @@ async function main() {
       secretVerificationFailed: hasSecretVerificationFailed,
       hasDockerSbxSecretsFailed,
       inferenceAccessError,
+      copilotOrgBillingError,
       mcpPolicyError,
       modelNotSupportedError,
       http400ResponseError,
@@ -4041,7 +4089,8 @@ async function main() {
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
 
         // Build inference access error context
-        const inferenceAccessErrorContext = buildInferenceAccessErrorContext(inferenceAccessError);
+        const copilotOrgBillingErrorContext = buildCopilotOrgBillingErrorContext(copilotOrgBillingError);
+        const inferenceAccessErrorContext = copilotOrgBillingErrorContext ? "" : buildInferenceAccessErrorContext(inferenceAccessError);
 
         // Build MCP policy error context
         const mcpPolicyErrorContext = buildMCPPolicyErrorContext(mcpPolicyError);
@@ -4073,7 +4122,7 @@ async function main() {
         const skillInstallFailureContext = buildSkillInstallFailureContext(hasSkillInstallFailures, skillInstallErrors);
 
         // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
-        const credentialAuthErrorContext = buildCredentialAuthErrorContext();
+        const credentialAuthErrorContext = copilotOrgBillingErrorContext ? "" : buildCredentialAuthErrorContext();
 
         // Create template context
         const templateContext = {
@@ -4086,6 +4135,7 @@ async function main() {
           secret_verification_context: buildSecretVerificationContext(secretVerificationResult, engineSecretFailureMessage),
           docker_sbx_secrets_context: buildDockerSbxSecretsContext(dockerSbxSecretsResult),
           credential_auth_error_context: credentialAuthErrorContext,
+          copilot_org_billing_error_context: copilotOrgBillingErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           skill_install_failure_context: skillInstallFailureContext,
@@ -4271,7 +4321,8 @@ async function main() {
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
 
         // Build inference access error context
-        const inferenceAccessErrorContext = buildInferenceAccessErrorContext(inferenceAccessError);
+        const copilotOrgBillingErrorContext = buildCopilotOrgBillingErrorContext(copilotOrgBillingError);
+        const inferenceAccessErrorContext = copilotOrgBillingErrorContext ? "" : buildInferenceAccessErrorContext(inferenceAccessError);
 
         // Build MCP policy error context
         const mcpPolicyErrorContext = buildMCPPolicyErrorContext(mcpPolicyError);
@@ -4303,7 +4354,7 @@ async function main() {
         const skillInstallFailureContext = buildSkillInstallFailureContext(hasSkillInstallFailures, skillInstallErrors);
 
         // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
-        const credentialAuthErrorContext = buildCredentialAuthErrorContext();
+        const credentialAuthErrorContext = copilotOrgBillingErrorContext ? "" : buildCredentialAuthErrorContext();
 
         // Build optimize token consumption context (shown when a guardrail was the failure root cause)
         const optimizeTokenConsumptionContext = buildOptimizeTokenConsumptionContext({ maxAICreditsExceeded, hasDailyAICExceeded, hasToolDenialsExceeded, isTimedOut, runUrl });
@@ -4320,6 +4371,7 @@ async function main() {
           secret_verification_context: buildSecretVerificationContext(secretVerificationResult, engineSecretFailureMessage),
           docker_sbx_secrets_context: buildDockerSbxSecretsContext(dockerSbxSecretsResult),
           credential_auth_error_context: credentialAuthErrorContext,
+          copilot_org_billing_error_context: copilotOrgBillingErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           skill_install_failure_context: skillInstallFailureContext,
@@ -4463,6 +4515,8 @@ module.exports = {
   detectAWFFirewallStartupFailureFromLog,
   buildReportIncompleteContext,
   buildMCPPolicyErrorContext,
+  buildCopilotOrgBillingErrorContext,
+  detectCopilotOrgBillingErrorFromLog,
   buildModelNotSupportedErrorContext,
   buildHTTP400ResponseErrorContext,
   buildMissingDataContext,
