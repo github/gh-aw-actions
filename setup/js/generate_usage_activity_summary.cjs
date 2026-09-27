@@ -7,14 +7,18 @@
 //   session: aggregate Copilot session event counters
 //   gateway: tool-call counts, sizes, durations, and per-server/tool breakdowns
 //   integrity: aggregate DIFC filtering counts from gateway/RPC logs
+//   steering: aggregate AWF steering-event counts by event type
 //   safe_outputs: total item count and per-type breakdown from safe-output-items manifest
 //   experiments: A/B experiment variant assignments for the current run
 //   working_set: cumulative input-token traffic relative to peak invocation input
+//   friction: precomputed cost of wasted work (AIC canonical) with attribution states
 
 const fs = require("fs");
 const path = require("path");
 const { readExperimentAssignments } = require("./experiment_helpers.cjs");
+const { countSteeringEventsByTypeInApiProxyJsonl } = require("./steering_helpers.cjs");
 const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
+const { computeFrictionCost } = require("./friction_cost_metrics.cjs");
 
 require("./shim.cjs");
 
@@ -29,6 +33,18 @@ const PLACEHOLDER_DEST_KEY = "-:-";
 const ERROR_DOMAIN_PREFIX = "error:";
 const AGENT_TOKEN_USAGE_PATH = "/tmp/gh-aw/usage/agent/token_usage.jsonl";
 const RPC_EVENT_TO_TYPE = { rpc_request: "REQUEST", rpc_response: "RESPONSE", difc_filtered: "DIFC_FILTERED" };
+const API_PROXY_EVENT_LOG_PATHS = [
+  "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/events.jsonl",
+  "/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/events.jsonl",
+  "/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/events.jsonl",
+  "/tmp/gh-aw/firewall-audit-logs/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/firewall-audit-logs/api-proxy-logs/events.jsonl",
+  "/tmp/gh-aw/firewall-logs/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/firewall-logs/api-proxy-logs/events.jsonl",
+];
 
 function findFiles(rootDir, shouldIncludeFile, maxDepth = Number.POSITIVE_INFINITY, currentDepth = 0) {
   if (!fs.existsSync(rootDir)) {
@@ -82,6 +98,47 @@ function parseWorkingSetMetrics(tokenUsagePath = AGENT_TOKEN_USAGE_PATH) {
   } catch (err) {
     throw new Error(`Failed to read working-set token usage from ${tokenUsagePath}: ${String(err)}`, { cause: err });
   }
+}
+
+/**
+ * Read the agent token-usage JSONL used by friction-cost attribution.
+ *
+ * @param {string} [tokenUsagePath]
+ * @returns {{ content: string, available: boolean }}
+ */
+function readTokenUsageContent(tokenUsagePath = AGENT_TOKEN_USAGE_PATH) {
+  if (!fs.existsSync(tokenUsagePath)) {
+    return { content: "", available: false };
+  }
+  try {
+    return { content: fs.readFileSync(tokenUsagePath, "utf-8"), available: true };
+  } catch {
+    return { content: "", available: false };
+  }
+}
+
+/**
+ * Compute the precomputed friction-cost section for the usage activity summary.
+ * Never throws: friction is an additive section and must not fail summary generation.
+ *
+ * @param {{ gateway: any, integrity: any, session: any, firewall: any }} activity
+ * @param {string} [tokenUsagePath]
+ * @returns {Record<string, any>}
+ */
+function buildFrictionSummary(activity, tokenUsagePath = AGENT_TOKEN_USAGE_PATH) {
+  const { content, available } = readTokenUsageContent(tokenUsagePath);
+  const { friction, warnings } = computeFrictionCost({
+    gateway: activity.gateway,
+    integrity: activity.integrity,
+    session: activity.session,
+    firewall: activity.firewall,
+    tokenUsageContent: content,
+    tokenUsageAvailable: available,
+  });
+  for (const warning of warnings) {
+    core.warning(warning);
+  }
+  return friction;
 }
 
 /**
@@ -276,10 +333,13 @@ function parseSessionLogs(sessionLogDirs = ["/tmp/gh-aw/sandbox/agent/logs/copil
     tool_execution_completes: 0,
     failed_tool_executions: 0,
   };
+  const skills = new Map();
+  const pendingSkills = new Map();
 
   for (const logDir of sessionLogDirs) {
     for (const eventsPath of findFiles(logDir, entry => entry.name === "events.jsonl", 1)) {
       try {
+        const pendingSkillsWithoutIDs = [];
         const content = fs.readFileSync(eventsPath, "utf-8");
         const lines = content.split("\n");
 
@@ -316,12 +376,60 @@ function parseSessionLogs(sessionLogDirs = ["/tmp/gh-aw/sandbox/agent/logs/copil
             session.reasoning_events += 1;
           } else if (eventType === "tool.execution_start") {
             session.tool_execution_starts += 1;
+            const data = entry.data && typeof entry.data === "object" ? entry.data : {};
+            if (
+              String(data.toolName || "")
+                .trim()
+                .toLowerCase() === "skill"
+            ) {
+              const input = data.input && typeof data.input === "object" ? data.input : data.arguments && typeof data.arguments === "object" ? data.arguments : {};
+              const skillName = String(input.skill || "").trim();
+              if (skillName) {
+                const aggregate = skills.get(skillName) || {
+                  name: skillName,
+                  invocation_count: 0,
+                  failed_count: 0,
+                  first_timestamp: String(entry.timestamp || ""),
+                  last_timestamp: String(entry.timestamp || ""),
+                };
+                aggregate.invocation_count += 1;
+                const timestamp = String(entry.timestamp || "");
+                if (timestamp && (!aggregate.first_timestamp || timestamp < aggregate.first_timestamp)) {
+                  aggregate.first_timestamp = timestamp;
+                }
+                if (timestamp && (!aggregate.last_timestamp || timestamp > aggregate.last_timestamp)) {
+                  aggregate.last_timestamp = timestamp;
+                }
+                skills.set(skillName, aggregate);
+                if (data.toolCallId) {
+                  pendingSkills.set(String(data.toolCallId), skillName);
+                } else {
+                  pendingSkillsWithoutIDs.push(skillName);
+                }
+              }
+            }
           } else if (eventType === "tool.execution_complete") {
             session.tool_execution_completes += 1;
             const data = entry.data || {};
             const success = typeof data === "object" ? data.success !== false : true;
+            let skillName = pendingSkills.get(String(data.toolCallId || ""));
+            if (
+              !skillName &&
+              String(data.toolName || "")
+                .trim()
+                .toLowerCase() === "skill"
+            ) {
+              // SDK events without IDs are paired in start order within this session file.
+              skillName = pendingSkillsWithoutIDs.shift();
+            }
             if (!success) {
               session.failed_tool_executions += 1;
+              if (skillName && skills.has(skillName)) {
+                skills.get(skillName).failed_count += 1;
+              }
+            }
+            if (typeof data === "object" && data.toolCallId) {
+              pendingSkills.delete(String(data.toolCallId));
             }
           }
         }
@@ -332,7 +440,39 @@ function parseSessionLogs(sessionLogDirs = ["/tmp/gh-aw/sandbox/agent/logs/copil
     }
   }
 
+  if (skills.size > 0) {
+    session.skills = {
+      total_invocations: Array.from(skills.values()).reduce((total, skill) => total + skill.invocation_count, 0),
+      unique_skills: skills.size,
+      items: Array.from(skills.values()).sort((left, right) => left.name.localeCompare(right.name)),
+    };
+  }
   return session.total_events > 0 ? session : null;
+}
+
+/**
+ * Parse the first AWF API proxy event log with steering events.
+ *
+ * @param {string[]} eventLogPaths
+ * @returns {{ total_events: number, event_counts: Record<string, number> } | null}
+ */
+function parseSteeringEvents(eventLogPaths = API_PROXY_EVENT_LOG_PATHS) {
+  for (const eventLogPath of eventLogPaths) {
+    try {
+      const stat = fs.statSync(eventLogPath);
+      if (!stat || stat.size <= 0) {
+        continue;
+      }
+      const eventCounts = countSteeringEventsByTypeInApiProxyJsonl(fs.readFileSync(eventLogPath, "utf-8"));
+      const totalEvents = Object.values(eventCounts).reduce((total, count) => total + count, 0);
+      if (totalEvents > 0) {
+        return { total_events: totalEvents, event_counts: eventCounts };
+      }
+    } catch {
+      // Ignore missing or unreadable candidate files and try the next layout.
+    }
+  }
+  return null;
 }
 
 /**
@@ -378,6 +518,8 @@ function getGatewayServer(gateway, serverName) {
       failed_calls: 0,
       total_input_size: 0,
       total_output_size: 0,
+      max_input_size: 0,
+      max_output_size: 0,
       total_duration_ms: 0,
     };
     gateway.servers.set(serverName, server);
@@ -438,6 +580,7 @@ function recordGatewayToolCall(gateway, serverName, toolName, inputSize, timesta
   server.request_count += 1;
   server.tool_call_count += 1;
   server.total_input_size += inputSize;
+  server.max_input_size = Math.max(server.max_input_size, inputSize);
   tool.call_count += 1;
   tool.total_input_size += inputSize;
   tool.max_input_size = Math.max(tool.max_input_size, inputSize);
@@ -464,6 +607,7 @@ function recordGatewayToolResult(gateway, serverName, toolName, result, call) {
   gateway.total_duration_ms += result.durationMs;
   gateway.max_duration_ms = Math.max(gateway.max_duration_ms, result.durationMs);
   server.total_output_size += result.outputSize;
+  server.max_output_size = Math.max(server.max_output_size, result.outputSize);
   server.total_duration_ms += result.durationMs;
   tool.total_output_size += result.outputSize;
   tool.max_output_size = Math.max(tool.max_output_size, result.outputSize);
@@ -668,6 +812,8 @@ function parseGatewayActivity(logRoots = ["/tmp/gh-aw", "/tmp/gh-aw/threat-detec
           failed_calls: activity.gateway.failed_calls,
           total_input_size: activity.gateway.total_input_size,
           total_output_size: activity.gateway.total_output_size,
+          avg_input_size: Math.round(activity.gateway.total_input_size / activity.gateway.total_calls),
+          avg_output_size: Math.round(activity.gateway.total_output_size / activity.gateway.total_calls),
           max_input_size: activity.gateway.max_input_size,
           max_output_size: activity.gateway.max_output_size,
           total_duration_ms: activity.gateway.total_duration_ms,
@@ -677,12 +823,16 @@ function parseGatewayActivity(logRoots = ["/tmp/gh-aw", "/tmp/gh-aw/threat-detec
             .sort((left, right) => left.server_name.localeCompare(right.server_name))
             .map(server => ({
               ...server,
+              avg_input_size: server.tool_call_count > 0 ? Math.round(server.total_input_size / server.tool_call_count) : 0,
+              avg_output_size: server.tool_call_count > 0 ? Math.round(server.total_output_size / server.tool_call_count) : 0,
               avg_duration_ms: server.tool_call_count > 0 ? server.total_duration_ms / server.tool_call_count : 0,
             })),
           tools: Array.from(activity.gateway.tools.values())
             .sort((left, right) => left.server_name.localeCompare(right.server_name) || left.tool_name.localeCompare(right.tool_name))
             .map(tool => ({
               ...tool,
+              avg_input_size: tool.call_count > 0 ? Math.round(tool.total_input_size / tool.call_count) : 0,
+              avg_output_size: tool.call_count > 0 ? Math.round(tool.total_output_size / tool.call_count) : 0,
               avg_duration_ms: tool.call_count > 0 ? tool.total_duration_ms / tool.call_count : 0,
             })),
         }
@@ -797,6 +947,10 @@ function main() {
   // Parse session logs
   const session = parseSessionLogs();
   if (session) {
+    if (session.skills) {
+      summary.skills = session.skills;
+      delete session.skills;
+    }
     summary.session = session;
   }
 
@@ -807,6 +961,11 @@ function main() {
   }
   if (gatewayActivity.integrity) {
     summary.integrity = gatewayActivity.integrity;
+  }
+
+  const steering = parseSteeringEvents();
+  if (steering) {
+    summary.steering = steering;
   }
 
   // Parse safe outputs manifest.
@@ -852,6 +1011,20 @@ function main() {
     core.warning(`Working-set rebuild measurement unavailable: ${String(err)}`);
   }
 
+  // Compute precomputed friction cost from every activity section already parsed.
+  // Consumers that only download the usage artifact read this instead of re-deriving
+  // friction from raw logs, so it is written even when no friction was detected.
+  try {
+    summary.friction = buildFrictionSummary({
+      gateway: summary.gateway || null,
+      integrity: summary.integrity || null,
+      session: summary.session || null,
+      firewall: summary.firewall || null,
+    });
+  } catch (err) {
+    core.warning(`Friction-cost measurement unavailable: ${String(err)}`);
+  }
+
   // Write summary to file
   const outputPath = "/tmp/gh-aw/usage/activity/summary.json";
   try {
@@ -870,12 +1043,15 @@ if (require.main === module) {
 module.exports = {
   parseFirewallLogs,
   parseSessionLogs,
+  parseSteeringEvents,
   parseGatewayLogs,
   parseGatewayActivity,
   parseSafeOutputsManifest,
   parseExperimentsData,
   calculateWorkingSetFromJSONL,
   parseWorkingSetMetrics,
+  buildFrictionSummary,
+  readTokenUsageContent,
   AGENT_TOKEN_USAGE_PATH,
   MANIFEST_FILE_PATH,
 };
