@@ -14,8 +14,23 @@ const { compileFileGlobPatterns, filterIneligibleMemoryFiles, isMemoryFileEligib
 const { parseAllowedRepos, validateRepo } = require("./repo_helpers.cjs");
 const { pushSignedCommits } = require("./push_signed_commits.cjs");
 const { loadTemporaryIdMapFromFile, replaceTemporaryIdReferencesInPatch } = require("./temporary_id.cjs");
+const { Ledger } = require("./ledger_store.cjs");
 
 const JSONL_MERGE_ATTRIBUTE = "*.jsonl merge=union";
+
+/**
+ * Exclude agent-supplied files that can mutate trusted ledger state.
+ *
+ * @param {string} relativePath
+ * @param {Set<string>} trustedSegments
+ * @returns {boolean}
+ */
+function isUntrustedLedgerArtifact(relativePath, trustedSegments) {
+  const normalizedPath = relativePath.replace(/\\/g, "/");
+  if (normalizedPath.startsWith("ledger/coverage/")) return true;
+  const match = /^ledger\/shards\/([0-9a-f-]{36})\.jsonl$/.exec(normalizedPath);
+  return Boolean(match && trustedSegments.has(match[1]));
+}
 
 /**
  * Configure a checkout-local merge policy that keeps both sides of conflicting
@@ -63,16 +78,16 @@ function isDeterministicPushValidationError(errorMessage) {
  * without creating a merge commit. JSONL conflicts keep both rows via the
  * checkout-local merge=union policy; non-JSONL conflicts keep this run's files.
  *
- * @param {{workspaceDir: string, branchName: string, repoUrlWithToken: string, previousBaseRef: string, remoteHead: string}} opts
+ * @param {{workspaceDir: string, branchName: string, repoUrl: string, previousBaseRef: string, remoteHead: string, gitAuthEnv?: Record<string, string>}} opts
  */
-function reconcileRepoMemoryRetry({ workspaceDir, branchName, repoUrlWithToken, previousBaseRef, remoteHead }) {
+function reconcileRepoMemoryRetry({ workspaceDir, branchName, repoUrl, previousBaseRef, remoteHead, gitAuthEnv }) {
   try {
     configureRepoMemoryMergePolicy(workspaceDir);
   } catch (mergePolicyError) {
     core.warning(`Failed to configure JSONL union-merge policy; concurrent JSONL rows may be lost on conflict: ${getErrorMessage(mergePolicyError)}`);
   }
 
-  execGitSync(["fetch", repoUrlWithToken, `refs/heads/${branchName}`], { cwd: workspaceDir, stdio: "pipe", suppressLogs: true });
+  execGitSync(["fetch", repoUrl, `refs/heads/${branchName}`], { cwd: workspaceDir, env: gitAuthEnv, stdio: "pipe", suppressLogs: true });
 
   const rebaseArgs = previousBaseRef ? ["rebase", "-X", "theirs", "--onto", remoteHead, previousBaseRef] : ["rebase", "-X", "theirs", "--onto", remoteHead, "--root"];
   try {
@@ -103,8 +118,8 @@ function reconcileRepoMemoryRetry({ workspaceDir, branchName, repoUrlWithToken, 
  * @param {typeof pushSignedCommits} [opts.pushSignedCommitsFn]
  * @param {typeof exec.getExecOutput} [opts.execGetExecOutput]
  * @param {(delay: number) => Promise<void>} [opts.sleepFn]
- * @param {string} [opts.repoUrlWithTokenForRetry]
  * @param {string} [opts.originUrlForPush]
+ * @param {string} [opts.repoUrlForRetry]
  */
 async function pushRepoMemoryChangesWithRetry({
   githubClient,
@@ -119,13 +134,10 @@ async function pushRepoMemoryChangesWithRetry({
   pushSignedCommitsFn = pushSignedCommits,
   execGetExecOutput = exec.getExecOutput,
   sleepFn = delay => new Promise(resolve => setTimeout(resolve, delay)),
-  repoUrlWithTokenForRetry,
   originUrlForPush,
+  repoUrlForRetry,
 }) {
-  // URL with embedded token used for the fetch/rebase-on-retry step only;
-  // pushSignedCommits authenticates via the git extraheader set by
-  // actions/checkout (and the gitAuthEnv fallback for the git-push path).
-  const repoUrlWithToken = repoUrlWithTokenForRetry || `https://x-access-token:${ghToken}@${serverHost}/${targetRepo}.git`;
+  const retryUrl = repoUrlForRetry || `https://${serverHost}/${targetRepo}.git`;
 
   // Point origin at the memory target repo so pushSignedCommits can resolve
   // the remote branch HEAD (ls-remote origin) and the git-push fallback
@@ -154,12 +166,12 @@ async function pushRepoMemoryChangesWithRetry({
         gitAuthEnv: getGitAuthEnv(ghToken),
       });
       core.info(`Successfully pushed changes to ${branchName} branch`);
-      return;
+      return true;
     } catch (error) {
       const errMsg = getErrorMessage(error);
       if (isDeterministicPushValidationError(errMsg)) {
         core.setFailed(`Failed to push changes: ${errMsg}`);
-        return;
+        return false;
       }
       if (attempt < MAX_RETRIES) {
         const ceiling = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * Math.pow(2, attempt));
@@ -172,14 +184,25 @@ async function pushRepoMemoryChangesWithRetry({
         // pushSignedCommits while still preserving concurrent JSONL rows via the
         // checkout-local merge=union policy.
         try {
-          const { stdout: lsOut } = await execGetExecOutput("git", ["ls-remote", repoUrlWithToken, `refs/heads/${branchName}`], { cwd: workspaceDir, silent: true });
+          const { stdout: lsOut } = await execGetExecOutput("git", ["ls-remote", retryUrl, `refs/heads/${branchName}`], {
+            cwd: workspaceDir,
+            env: getGitAuthEnv(ghToken),
+            silent: true,
+          });
           const remoteHead = lsOut.trim().split(/\s+/)[0] || "";
           if (remoteHead && remoteHead !== currentBaseRef) {
             const previousBaseRef = currentBaseRef;
             currentBaseRef = remoteHead;
             core.info(`Refreshed baseRef for retry: ${currentBaseRef}`);
             try {
-              reconcileRepoMemoryRetry({ workspaceDir, branchName, repoUrlWithToken, previousBaseRef, remoteHead });
+              reconcileRepoMemoryRetry({
+                workspaceDir,
+                branchName,
+                repoUrl: retryUrl,
+                previousBaseRef,
+                remoteHead,
+                gitAuthEnv: getGitAuthEnv(ghToken),
+              });
             } catch (reconcileError) {
               core.setFailed(`Failed to reconcile repo-memory changes onto refreshed head before retry: ${getErrorMessage(reconcileError)}`);
               return;
@@ -202,10 +225,11 @@ async function pushRepoMemoryChangesWithRetry({
         } else {
           core.setFailed(`Failed to push changes after ${MAX_RETRIES + 1} attempts: ${errMsg}`);
         }
-        return;
+        return false;
       }
     }
   }
+  return false;
 }
 
 /**
@@ -296,6 +320,36 @@ async function main() {
   const formatJSON = process.env.FORMAT_JSON === "true";
   const validationScriptBase64 = process.env.VALIDATION_SCRIPT_B64 || "";
   const validationTimeoutSeconds = Number(process.env.VALIDATION_TIMEOUT_SECONDS || "60");
+  const compactionOptionsBase64 = process.env.LEDGER_COMPACTION_OPTIONS_B64 || "";
+  /** @type {{compaction: {before: number, after: number, selected: number, records: number, replacement: string | null, retired: number, changed: boolean} | null, normalized: string[], saving: {changedFiles: number, patchBytes: number, pushed: boolean}}} */
+  const ledgerActivity = {
+    compaction: null,
+    normalized: [],
+    saving: { changedFiles: 0, patchBytes: 0, pushed: false },
+  };
+  const writeLedgerSummary = async () => {
+    if (!compactionOptionsBase64 && !formatJSON && ledgerActivity.normalized.length === 0) return;
+    const lines = ["<details>", "<summary>Repo-memory ledger activity</summary>", "", "### Compaction"];
+    if (ledgerActivity.compaction) {
+      lines.push(
+        `- ${ledgerActivity.compaction.before} stable shard(s) before compaction`,
+        `- ${ledgerActivity.compaction.after} shard(s) after compaction`,
+        `- ${ledgerActivity.compaction.selected} shard(s) selected; ${ledgerActivity.compaction.records} record(s) copied`,
+        `- Replacement: ${ledgerActivity.compaction.replacement || "none"}`,
+        `- ${ledgerActivity.compaction.retired} source shard(s) retired`,
+        `- ${ledgerActivity.compaction.changed ? "Compaction changed storage." : "Compaction was a no-op."}`
+      );
+    } else {
+      lines.push("- Not configured or not run.");
+    }
+    lines.push("", "### Normalizing");
+    lines.push(ledgerActivity.normalized.length ? `- Formatted ${ledgerActivity.normalized.length} JSON file(s).` : "- No JSON normalization requested.");
+    lines.push("", "### Saving");
+    lines.push(`- ${ledgerActivity.saving.changedFiles} managed file(s) changed; ${ledgerActivity.saving.patchBytes} staged patch byte(s).`, `- ${ledgerActivity.saving.pushed ? "Changes pushed." : "No changes pushed."}`, "", "</details>");
+    if (core.summary && typeof core.summary.addRaw === "function" && typeof core.summary.write === "function") {
+      await core.summary.addRaw(lines.join("\n")).write();
+    }
+  };
   if (
     !Number.isFinite(maxFileSize) ||
     !Number.isSafeInteger(maxFileSize) ||
@@ -553,6 +607,15 @@ async function main() {
   // but files go at the branch root, not in a nested subdirectory
   const destMemoryPath = workspaceDir;
   core.info(`Destination directory: ${destMemoryPath}`);
+  const existingLedgerShardDir = path.join(destMemoryPath, "ledger", "shards");
+  const existingLedgerSegments = fs.existsSync(existingLedgerShardDir)
+    ? new Set(
+        fs
+          .readdirSync(existingLedgerShardDir)
+          .filter(name => name.endsWith(".jsonl"))
+          .map(name => name.slice(0, -6))
+      )
+    : new Set();
 
   // Remove any pre-existing files in the checked-out branch that no longer pass the
   // current allowed-extensions/file-glob filters (e.g. left over from a prior run with
@@ -612,6 +675,12 @@ async function main() {
         }
         const normalizedRelPath = relativeFilePath.replace(/\\/g, "/");
 
+        if (isUntrustedLedgerArtifact(normalizedRelPath, existingLedgerSegments)) {
+          core.info(`  [skip] ${normalizedRelPath} (untrusted ledger artifact)`);
+          filteredOutFiles.push({ path: normalizedRelPath, reason: "untrusted ledger artifact" });
+          continue;
+        }
+
         // Allowed extensions and file-glob are persistence filters: files that do not
         // pass are logged and ignored (never uploaded, validated, counted toward
         // max-file-count/size/patch-size, or pushed) rather than causing a hard failure.
@@ -660,7 +729,7 @@ async function main() {
     return;
   }
 
-  if (filesToCopy.length === 0) {
+  if (filesToCopy.length === 0 && !compactionOptionsBase64 && !formatJSON) {
     core.info("No eligible files to copy from artifact (all files were filtered out or none present)");
     return;
   }
@@ -705,12 +774,59 @@ async function main() {
     return;
   }
 
+  if (compactionOptionsBase64) {
+    try {
+      const options = JSON.parse(Buffer.from(compactionOptionsBase64, "base64").toString("utf8"));
+      const shardDir = path.join(destMemoryPath, "ledger", "shards");
+      const excludedSegments = fs.existsSync(shardDir)
+        ? fs
+            .readdirSync(shardDir)
+            .filter(name => name.endsWith(".jsonl"))
+            .map(name => name.slice(0, -6))
+            .filter(id => !existingLedgerSegments.has(id))
+        : [];
+      // Shard limits are counts; the remaining ledger limits are expressed in KiB.
+      const parseLedgerCount = name => {
+        const value = process.env[name];
+        return value && /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
+      };
+      const parseLedgerLimitKb = name => {
+        const parsed = parseLedgerCount(name);
+        return parsed === undefined ? undefined : parsed * 1024;
+      };
+      const ledger = new Ledger({
+        memoryDir: destMemoryPath,
+        excludeSegments: excludedSegments,
+        maxFiles: parseLedgerCount("GH_AW_LEDGER_MAX_SHARDS"),
+        maxSegmentBytes: parseLedgerLimitKb("GH_AW_LEDGER_MAX_SEGMENT_KB"),
+        maxRecordBytes: parseLedgerLimitKb("GH_AW_LEDGER_MAX_RECORD_KB"),
+        maxPatchBytes: parseLedgerLimitKb("GH_AW_LEDGER_MAX_PATCH_KB"),
+      });
+      const before = ledger.listSegments({ closed: true, excludeCurrent: true }).length;
+      const compaction = await ledger.compact(options);
+      core.info(`Ledger compaction ${compaction.changed ? "retired source segments" : "was a no-op"}: ` + `${compaction.selected} selected, ${compaction.records} records copied, ${compaction.retired} retired.`);
+      ledgerActivity.compaction = {
+        before,
+        after: ledger.listSegments({ closed: true, excludeCurrent: true }).length,
+        selected: compaction.selected,
+        records: compaction.records,
+        replacement: compaction.replacement,
+        retired: compaction.retired,
+        changed: compaction.changed,
+      };
+      core.setOutput("ledger_compaction", JSON.stringify(ledgerActivity.compaction));
+    } catch (error) {
+      core.warning(`Ledger compaction failed open; continuing without compaction: ${getErrorMessage(error)}`);
+    }
+  }
+
   // Format JSON files if requested
   if (formatJSON) {
     core.info("FORMAT_JSON is enabled: formatting .json files as human-readable...");
 
     try {
       const formattedFiles = formatJSONFiles(destMemoryPath, maxFileSize);
+      ledgerActivity.normalized.push(...formattedFiles);
       for (const formattedFile of formattedFiles) {
         core.info(`Formatted JSON: ${formattedFile}`);
       }
@@ -757,6 +873,7 @@ async function main() {
   // preventing glob expansion or pathspec-magic interpretation (e.g. :(top),
   // wildcards) even when a filename happens to contain those characters.
   const literalPathspecs = Array.from(new Set(filesToCopy.map(file => `:(literal)${file.relativePath}`))).sort();
+  if (compactionOptionsBase64) literalPathspecs.push(":(glob)ledger/shards/*.jsonl");
 
   // Check if we have any changes to commit, scoped to managed memory files only.
   let changedFileCount = 0;
@@ -778,6 +895,7 @@ async function main() {
 
   if (changedFileCount === 0) {
     core.info("No changes detected after copying files");
+    await writeLedgerSummary();
     return;
   }
 
@@ -817,6 +935,8 @@ async function main() {
   // even though only a small portion of the data actually changed.
   try {
     const patchSizeBytes = getStagedPatchDiffSizeBytes({ execGitSyncFn: execGitSync, cwd: workspaceDir });
+    ledgerActivity.saving.changedFiles = changedFileCount;
+    ledgerActivity.saving.patchBytes = patchSizeBytes;
     const patchSizeKb = Math.ceil(patchSizeBytes / 1024);
     const maxPatchSizeKb = Math.floor(maxPatchSize / 1024);
     // Allow 20% overhead to account for git diff format (headers, context lines, etc.)
@@ -878,6 +998,8 @@ async function main() {
     ghToken,
     serverHost,
   });
+  ledgerActivity.saving.pushed = true;
+  await writeLedgerSummary();
 }
 
-module.exports = { applyTemporaryIdSubstitutions, configureRepoMemoryMergePolicy, isDeterministicPushValidationError, main, pushRepoMemoryChangesWithRetry, reconcileRepoMemoryRetry };
+module.exports = { applyTemporaryIdSubstitutions, configureRepoMemoryMergePolicy, isDeterministicPushValidationError, isUntrustedLedgerArtifact, main, pushRepoMemoryChangesWithRetry, reconcileRepoMemoryRetry };
