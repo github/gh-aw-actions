@@ -37,6 +37,7 @@ const path = require("path");
 const os = require("os");
 const { buildCopilotSDKPermissionHandler, getEnvPositiveIntOrDefault, parseMaxToolDenialsLimit, MAX_TOOL_DENIALS_DEFAULT } = require("./copilot_sdk_permissions.cjs");
 const { buildCopilotSDKSessionToolConfig } = require("./copilot_sdk_tool_config.cjs");
+const { buildCopilotSDKToolCallBudget } = require("./copilot_sdk_tool_budget.cjs");
 const { resolveModelWithFallback } = require("./model_fallback.cjs");
 const { extractShellCommandFromToolData, extractStructuredToolInput } = require("./tool_call_details.cjs");
 
@@ -107,6 +108,7 @@ function extractPromptFromArgs(args) {
  *   logger: (msg: string) => void,
  *   attempt?: number,
  *   model?: string,
+ *   reasoningEffort?: string,
  *   connectionToken?: string,
  *   providers?: import("@github/copilot-sdk").NamedProviderConfig[],
  *   models?: import("@github/copilot-sdk").ProviderModelConfig[],
@@ -136,6 +138,7 @@ async function runWithCopilotSDK({
   logger,
   attempt = 0,
   model,
+  reasoningEffort,
   connectionToken,
   providers,
   models: providerModels,
@@ -322,14 +325,21 @@ async function runWithCopilotSDK({
       onDenied: requestSummary => recordToolDenial(`permission denied: ${requestSummary}`),
       workspaceRoot: process.env.GITHUB_WORKSPACE,
     });
+    const toolCallBudget = buildCopilotSDKToolCallBudget(toolConfig?.maxToolCalls, event => {
+      writeDriverEvent(event.exhausted ? "guard.tool_call_budget_exceeded" : "guard.tool_call_budget_debit", event);
+    });
 
     // Build session config using the multi-provider surface.
+    /** @type {any} */
+    const sdkReasoningEffort = reasoningEffort;
     /** @type {import("@github/copilot-sdk").SessionConfig} */
     const sessionConfig = {
       model: model || resolveModelWithFallback(process.env, "COPILOT_MODEL") || undefined,
+      ...(sdkReasoningEffort ? { reasoningEffort: sdkReasoningEffort } : {}),
       providers,
       models: providerModels,
       onPermissionRequest,
+      ...(toolCallBudget ? { hooks: { onPreToolUse: toolCallBudget.onPreToolUse } } : {}),
       ...buildCopilotSDKSessionToolConfig(toolConfig, sdk, webFetchOptions),
     };
     log(`creating session with model="${sessionConfig.model || "(none)"}" providers=${providers?.length ?? 0} models=${providerModels?.length ?? 0}`);

@@ -164,7 +164,8 @@ fi
 FILE_COUNT_IN_DIR=$(ls -1 "${JS_SOURCE_DIR}" 2>/dev/null | wc -l)
 debug_log "Found ${FILE_COUNT_IN_DIR} files in ${JS_SOURCE_DIR}"
 
-# Copy all .cjs files from js/ to destination (excluding test files)
+# Copy all .cjs files from js/ to destination (excluding test files), including
+# shared runtime dependencies used by the Copilot harness and SDK driver.
 FILE_COUNT=0
 for file in "${JS_SOURCE_DIR}"/*.cjs; do
   if [ -f "$file" ]; then
@@ -294,6 +295,7 @@ echo "Successfully copied ${MCP_SCRIPTS_COUNT} mcp-scripts files to ${MCP_SCRIPT
 SAFE_OUTPUTS_DEST="${GH_AW_ROOT}/safeoutputs"
 debug_log "Copying safe-outputs files to ${SAFE_OUTPUTS_DEST}"
 create_dir "${SAFE_OUTPUTS_DEST}"
+create_dir "${SAFE_OUTPUTS_DEST}/dispatch-coordinator"
 
 SAFE_OUTPUTS_FILES=(
   "safe_outputs_mcp_server.cjs"
@@ -306,6 +308,8 @@ SAFE_OUTPUTS_FILES=(
   "safe_outputs_handlers.cjs"
   "ledger_append.cjs"
   "ledger_transactions.cjs"
+  "ledger_builtin.cjs"
+  "ledger_store.cjs"
   "symlink_guard.cjs"
   "intent_probe.cjs"
   "allowed_extensions_helpers.cjs"
@@ -383,6 +387,9 @@ SAFE_OUTPUTS_FILES=(
   "temporary_id.cjs"
   "invocation_context_helpers.cjs"
   "data_schema_normalizer.cjs"
+  "dispatch_work_coordinator_store.cjs"
+  "dispatch_work_coordinator_replay.cjs"
+  "dispatch_work_coordinator_codemods.cjs"
 )
 
 SAFE_OUTPUTS_COUNT=0

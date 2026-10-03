@@ -4,11 +4,12 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { Ledger, configuredLedgerLimits } = require("./ledger_store.cjs");
+const { Ledger, canonicalJSON, configuredLedgerLimits } = require("./ledger_store.cjs");
 const { execGitSync, getGitAuthEnv } = require("./git_helpers.cjs");
 const { pushRepoMemoryChangesWithRetry, configureRepoMemoryMergePolicy } = require("./push_repo_memory.cjs");
 const { finalId } = require("./ledger_transactions.cjs");
 const { validateValueAgainstSchema } = require("./mcp_scripts_validation.cjs");
+const { createReducer, validateOperation } = require("./ledger_builtin.cjs");
 
 const MAX_TRANSACTION_BYTES = 12 * 1024 * 1024;
 const LEDGER_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
@@ -53,6 +54,7 @@ function readLedgerConfig(value = process.env.GH_AW_LEDGER_CONFIG_BASE64) {
   if (!Array.isArray(ledgers)) throw new TypeError("Invalid trusted ledger configuration");
   const names = new Set();
   for (const ledger of ledgers) {
+    if (ledger && Object.hasOwn(ledger, "replay")) throw new TypeError("Custom ledger replay is no longer supported; use a built-in ledger type");
     if (
       !ledger ||
       typeof ledger.name !== "string" ||
@@ -123,7 +125,9 @@ function validateTransactions(artifact, ledgerConfigs) {
       const payload = { ...record };
       delete payload.id;
       validateRecordShape(payload);
-      if (config.schema) {
+      if (config.type) {
+        validateOperation(payload, config);
+      } else if (config.schema) {
         const schemaError = validateValueAgainstSchema(payload, config.schema);
         if (schemaError) throw new TypeError("Ledger record does not match configured schema");
       }
@@ -206,20 +210,38 @@ async function persistLedgerAppends({ appends, config, githubClient, owner, repo
       maxPatchBytes: limits.maxPatchBytes,
     });
 
+    // Validate the entire state transition before the first append mutates this branch.
+    const current = ledger.reconstruct();
+    if (current.diagnostics.length) throw new TypeError("Invalid canonical ledger history");
+    if (config.type) {
+      const reducer = createReducer(config);
+      for (const record of current.records) reducer.apply(record.payload, record);
+      const existing = new Set(current.records.map(record => (config.type === "notes" ? record.id : record.payload?.id)));
+      for (const append of appends)
+        if (!existing.has(append.record.id)) {
+          const record = config.type === "notes" ? Object.fromEntries(Object.entries(append.record).filter(([key]) => key !== "id")) : append.record;
+          reducer.apply(record, config.type === "notes" ? { id: append.record.id } : undefined);
+        }
+    }
     let persisted = 0;
     let alreadyPresent = 0;
+    const persistedIds = [];
     for (const append of appends) {
-      const exists = ledger.reconstruct().records.some(record => record.payload?.id === append.record.id);
+      const payload = config.type === "notes" ? Object.fromEntries(Object.entries(append.record).filter(([key]) => key !== "id")) : append.record;
+      const prior = current.records.find(record => (config.type === "notes" ? record.id === append.record.id : record.payload?.id === append.record.id));
+      if (prior && canonicalJSON(prior.payload) !== canonicalJSON(payload)) throw new TypeError("Conflicting ledger record ID");
+      const exists = Boolean(prior);
       if (exists) {
         alreadyPresent++;
         continue;
       }
-      ledger.append("ledger_append", append.record);
+      ledger.append("ledger_append", payload, config.type === "notes" ? append.record.id : undefined);
       persisted++;
+      persistedIds.push(append.record.id);
     }
     ledger.close();
     ledger = null;
-    if (!persisted) return { persisted: 0, already_present: alreadyPresent, reconciled: alreadyPresent };
+    if (!persisted) return { persisted: 0, already_present: alreadyPresent, reconciled: alreadyPresent, persisted_ids: [] };
 
     execGitSync(["add", "--", "ledger/shards"], { cwd: workspaceDir, stdio: "pipe" });
     execGitSync(["commit", "-m", `Append ${persisted} ledger record(s) from workflow run ${process.env.GITHUB_RUN_ID || "unknown"}`], {
@@ -237,13 +259,43 @@ async function persistLedgerAppends({ appends, config, githubClient, owner, repo
       ghToken: token,
       serverHost,
       originUrlForPush: repoUrl(serverHost, owner, repo),
+      validateBeforePush: config.type
+        ? () => {
+            const state = ledgerForValidation(workspaceDir, config);
+            const reducer = createReducer(config);
+            if (config.type === "notes") {
+              for (const record of state) if (record.payload.operation === "note") reducer.apply(record.payload, record);
+              for (const record of state) if (record.payload.operation !== "note") reducer.apply(record.payload, record);
+            } else {
+              for (const record of state) reducer.apply(record.payload);
+            }
+            reducer.output();
+          }
+        : undefined,
     });
     if (!pushed) throw new Error(`Failed to persist records to ${branchName}`);
-    return { persisted, already_present: alreadyPresent, reconciled: alreadyPresent };
+    return { persisted, already_present: alreadyPresent, reconciled: alreadyPresent, persisted_ids: persistedIds };
   } finally {
     if (ledger) ledger.close();
     execGitSync(["checkout", "--detach", originalHead], { cwd: workspaceDir, stdio: "pipe", suppressLogs: true });
     execGitSync(["clean", "-fd"], { cwd: workspaceDir, stdio: "pipe", suppressLogs: true });
+  }
+
+  function ledgerForValidation(workspaceDir, config) {
+    const limits = configuredLedgerLimits(config);
+    const ledger = new Ledger({
+      memoryDir: workspaceDir,
+      maxSegmentBytes: config.max_segment_kb * 1024,
+      maxRecordBytes: limits.maxRecordBytes,
+      maxPatchBytes: limits.maxPatchBytes,
+    });
+    try {
+      const state = ledger.reconstruct();
+      if (state.diagnostics.length) throw new TypeError("Invalid canonical ledger history");
+      return state.records;
+    } finally {
+      ledger.close();
+    }
   }
 }
 
@@ -258,18 +310,35 @@ async function main(options = {}) {
   const result = { version: 1, ledgers: {} };
   for (const config of ledgerConfigs) {
     const appends = artifact.ledgers[config.name]?.appends || [];
-    const persisted = appends.length
-      ? await (options.persistLedger || persistLedgerAppends)({
-          appends,
-          config,
-          githubClient: options.githubClient || github,
-          owner: options.owner || context.repo.owner,
-          repo: options.repo || context.repo.repo,
-          token: options.token || process.env.GH_TOKEN,
-          serverHost: options.serverHost || new URL(process.env.GITHUB_SERVER_URL || "https://github.com").host,
-          workspaceDir: options.workspaceDir || process.env.GITHUB_WORKSPACE || process.cwd(),
-        })
-      : { persisted: 0, already_present: 0, reconciled: 0 };
+    let persisted;
+    try {
+      persisted = appends.length
+        ? await (options.persistLedger || persistLedgerAppends)({
+            appends,
+            config,
+            githubClient: options.githubClient || github,
+            owner: options.owner || context.repo.owner,
+            repo: options.repo || context.repo.repo,
+            token: options.token || process.env.GH_TOKEN,
+            serverHost: options.serverHost || new URL(process.env.GITHUB_SERVER_URL || "https://github.com").host,
+            workspaceDir: options.workspaceDir || process.env.GITHUB_WORKSPACE || process.cwd(),
+          })
+        : { persisted: 0, already_present: 0, reconciled: 0 };
+    } catch (error) {
+      if (config.type === "notes" && error instanceof TypeError && error.message === "Vote references a missing note") {
+        result.ledgers[config.name] = { requested: appends.length, persisted: 0, rejected: 1, invalid_vote_requests: 1 };
+        const output = options.outputFile === undefined ? process.env.GITHUB_OUTPUT : options.outputFile;
+        if (output) {
+          try {
+            fs.appendFileSync(output, `ledger_result=${JSON.stringify(result)}\n`);
+          } catch {
+            globalThis.core?.warning?.("Failed to write invalid vote audit output");
+          }
+        }
+      }
+      throw error;
+    }
+    const addedNotes = config.type === "notes" ? appends.filter(append => persisted.persisted_ids?.includes(append.record.id) || (persisted.persisted === appends.length && !persisted.persisted_ids)) : [];
     result.ledgers[config.name] = {
       requested: appends.length,
       validated: appends.length,
@@ -278,6 +347,26 @@ async function main(options = {}) {
       reconciled: persisted.reconciled,
       rejected: 0,
       branch: `ledgers/${config.name}`,
+      ...(config.type
+        ? {
+            type: config.type,
+            ...(config.type === "notes"
+              ? {
+                  notes_added: addedNotes.filter(append => append.record.operation === "note").length,
+                  note_votes_added: addedNotes.filter(append => append.record.operation === "vote").length,
+                  upvotes: addedNotes.filter(append => append.record.operation === "vote" && append.record.vote === "up").length,
+                  downvotes: addedNotes.filter(append => append.record.operation === "vote" && append.record.vote === "down").length,
+                  invalid_vote_requests: 0,
+                }
+              : {}),
+            transactions: appends.map(append => ({
+              id: append.record.id,
+              transaction_id: append.transaction_id,
+              operation: append.record.operation,
+              validated: true,
+            })),
+          }
+        : {}),
     };
   }
   if (options.outputFile === undefined ? process.env.GITHUB_OUTPUT : options.outputFile) {

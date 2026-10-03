@@ -41,7 +41,7 @@ const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_age
 const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits, getBundlePrerequisites, isShallowOrSparseCheckout, linearizeRangeAsCommit } = require("./git_helpers.cjs");
 const { parseDiffGitHeader: parseDiffGitHeaderPaths, extractDiffGitHeaderEntries } = require("./patch_path_helpers.cjs");
 const { resolveTransportPaths } = require("./resolve_transport_paths.cjs");
-const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
 const {
   MANAGED_FALLBACK_ISSUE_LABEL,
   LABEL_MAX_RETRIES,
@@ -794,11 +794,11 @@ async function main(config = {}) {
   const stackTracker = createStackTracker();
   const githubClient = await createAuthenticatedGitHubClient(config);
   const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
-  let allowedMentionAliases = [];
+  let defaultMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
-    allowedMentionAliases = config.allowedMentionAliases;
+    defaultMentionAliases = config.allowedMentionAliases;
   } else if (config.mentions != null) {
-    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+    defaultMentionAliases = await resolveDefaultMentions(context, githubClient, core, config.mentions, defaultTargetRepo);
   }
 
   // Check if copilot assignment is enabled for fallback issues
@@ -1024,6 +1024,7 @@ async function main(config = {}) {
       };
     }
     const { repo: itemRepo, repoParts } = repoResult;
+    const allowedMentionAliases = await resolveMentionsForItem(context, githubClient, core, config.mentions, defaultMentionAliases, defaultTargetRepo, repoResult);
     core.info(`Target repository: ${itemRepo}`);
     let pushRepo = itemRepo;
     let pushRepoParts = repoParts;
@@ -2095,7 +2096,7 @@ ${issueSafeFallbackFooter}`;
 
               // Abort the failed git am before attempting any fallback
               try {
-                await exec.exec("git am --abort");
+                await exec.exec("git", ["am", "--abort"]);
                 core.info("Aborted failed git am");
               } catch (abortError) {
                 core.warning(`Failed to abort git am: ${getErrorMessage(abortError)}`);
@@ -2153,7 +2154,7 @@ ${issueSafeFallbackFooter}`;
                         core.warning(`Automatic add/add conflict recovery attempt failed during fallback: ${recoveredFallback.errorMessage}`);
                       }
                       try {
-                        await exec.exec("git am --abort");
+                        await exec.exec("git", ["am", "--abort"]);
                       } catch (abortFallbackError) {
                         core.warning(`Failed to abort fallback git am: ${getErrorMessage(abortFallbackError)}`);
                       }
@@ -2392,7 +2393,7 @@ ${issueSafeFallbackFooter}`;
             // Push the branch with an empty commit to allow PR creation
             try {
               // Create an empty commit to ensure there's a commit difference
-              await exec.exec(`git commit --allow-empty -m "Initialize"`);
+              await exec.exec("git", ["commit", "--allow-empty", "-m", "Initialize"]);
               core.info("Created empty commit");
 
               const forkCwd = process.cwd();

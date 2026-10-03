@@ -103,6 +103,7 @@ function readJSONFile(filePath) {
 const safeOutputsTools = readJSONFile(path.join(__dirname, "safe_outputs_tools.json"));
 
 const safeOutputsToolMap = new Map(safeOutputsTools.map(tool => [tool.name.replace(/-/g, "_"), tool]));
+const { validateOperation } = require("./ledger_builtin.cjs");
 
 /**
  * @param {string} error
@@ -592,6 +593,28 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         },
       ],
     };
+  };
+
+  const ledgerBuiltinHandler = (ledgerType, operation) => args => {
+    const ledgers = config.ledger_append?.ledgers || [];
+    const candidates = ledgers.filter(ledger => ledger.type === ledgerType);
+    const target = args?.ledger === undefined && candidates.length === 1 ? candidates[0] : candidates.find(ledger => ledger.name === args?.ledger);
+    if (!target) return buildIntentErrorResponse("Specify a configured ledger of the correct built-in type.");
+    const { ledger: _ledger, temp_id, ...fields } = args || {};
+    if (Object.hasOwn(fields, "operation")) return buildIntentErrorResponse("Invalid built-in ledger operation arguments.");
+    const record = { operation, ...fields };
+    try {
+      validateOperation(record, target);
+    } catch {
+      return buildIntentErrorResponse("Invalid built-in ledger operation arguments.");
+    }
+    return defaultHandler("ledger_append")({ ledger: target.name, ...(temp_id !== undefined && { temp_id }), ...record });
+  };
+  const ledgerAgentAppendHandler = args => {
+    const ledgers = config.ledger_append?.ledgers || [];
+    const target = ledgers.find(ledger => ledger.name === args?.ledger) || (args?.ledger === undefined && ledgers.length === 1 ? ledgers[0] : null);
+    if (target?.type === "notes") return buildIntentErrorResponse("Use ledger_note_add or ledger_note_vote for notes ledgers.");
+    return defaultHandler("ledger_append")(args);
   };
 
   const createIssueConfig = config.create_issue || {};
@@ -2306,13 +2329,16 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       );
     }
 
-    // Reject target:triggering early when no explicit item number and no issue/PR/discussion context.
+    const entry = { ...(args || {}), type: "add_comment" };
+    const commentIdValidationResult = validateAllowedAddCommentId(entry, addCommentConfig);
+    if (commentIdValidationResult.error) {
+      return commentIdValidationResult.error;
+    }
+
+    // Reject target:triggering early when no issue/PR/discussion target can be resolved.
     // Per Safe Outputs Specification MCE1: provides actionable feedback before writing to NDJSON.
-    // Mirrors update_issue validation; explicit item_number bypasses this check because the
-    // downstream handler resolves explicit numbers before falling back to triggering context.
     const effectiveAddCommentTarget = addCommentConfig.target || "triggering";
-    const hasExplicitItemNumber = args?.item_number != null || args?.issue_number != null || args?.["pr-number"] != null;
-    if (effectiveAddCommentTarget === "triggering" && !hasExplicitItemNumber) {
+    if (effectiveAddCommentTarget === "triggering") {
       /** @type {any} */
       let invocationContext = null;
       try {
@@ -2331,23 +2357,24 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         const isIssueContext = effectiveEventName === "issues" || (effectiveEventName === "issue_comment" && !isIssueCommentOnPR);
         const isPRContext = PR_EVENT_NAMES.has(effectiveEventName) || isIssueCommentOnPR;
         const isDiscussionContext = effectiveEventName === "discussion" || effectiveEventName === "discussion_comment";
-        if (!isIssueContext && !isPRContext && !isDiscussionContext) {
+        const triggeringNumber = isDiscussionContext
+          ? effectivePayload?.discussion?.number
+          : isPRContext
+            ? effectivePayload?.pull_request?.number || (isIssueCommentOnPR ? effectivePayload?.issue?.number : null)
+            : isIssueContext
+              ? effectivePayload?.issue?.number
+              : null;
+        if (!triggeringNumber) {
           return buildIntentErrorResponse(
-            `add_comment requires an issue, pull request, or discussion context but the workflow is running on a "${effectiveEventName}" event. ` +
+            `add_comment cannot resolve an issue, pull request, or discussion target from the "${effectiveEventName}" event payload. ` +
               `The add-comment handler uses target: triggering which only applies when an issue, pull request, or discussion triggered the workflow. ` +
               `To report results from this workflow, use create_discussion or create_issue instead. ` +
-              `If you need to comment on a specific item, provide an explicit item_number.`
+              `If you need to comment on a specific item, configure safe-outputs.add-comment.target to "*" and provide an explicit item_number.`
           );
         }
       }
     }
 
-    // Build the entry with a temporary_id
-    const entry = { ...(args || {}), type: "add_comment" };
-    const commentIdValidationResult = validateAllowedAddCommentId(entry, addCommentConfig);
-    if (commentIdValidationResult.error) {
-      return commentIdValidationResult.error;
-    }
     if (commentIdValidationResult.commentId === undefined) {
       // entry was spread from args, so a blank/whitespace comment_id (rather than an
       // absent one) could still be sitting on entry; strip it so downstream code never
@@ -3272,6 +3299,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
   return {
     defaultHandler,
+    ledgerBuiltinHandler,
+    ledgerAgentAppendHandler,
     uploadAssetHandler,
     uploadArtifactHandler,
     uploadCodeCoverageHandler,
