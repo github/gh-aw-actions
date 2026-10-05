@@ -1,9 +1,9 @@
 // @ts-check
 "use strict";
 
-const { loadDispatchCoordinatorSnapshot } = require("./dispatch_work_coordinator_mcp_server.cjs");
-const { replayTransactions } = require("./dispatch_work_coordinator_replay.cjs");
-const { readCoordinatorLog } = require("./dispatch_work_coordinator_store.cjs");
+const { loadWorkQueueSnapshot } = require("./work_queue_mcp_server.cjs");
+const { replayTransactions } = require("./work_queue_replay.cjs");
+const { readWorkQueueLog } = require("./work_queue_store.cjs");
 
 /**
  * @param {Record<string, string>} states
@@ -14,7 +14,7 @@ function countState(states, state) {
 }
 
 /**
- * @param {ReturnType<typeof loadDispatchCoordinatorSnapshot>} snapshot
+ * @param {ReturnType<typeof loadWorkQueueSnapshot>} snapshot
  * @param {ReturnType<typeof replayTransactions>} current
  */
 function renderSummary(snapshot, current) {
@@ -68,10 +68,10 @@ async function main(options = {}) {
   const coreApi = options.core || core;
   let summary;
   try {
-    const snapshot = loadDispatchCoordinatorSnapshot(options.snapshotPath);
+    const snapshot = loadWorkQueueSnapshot(options.snapshotPath);
     const githubClient = options.githubClient || github;
     const repositoryContext = options.context || context;
-    const readLog = options.readCoordinatorLog || readCoordinatorLog;
+    const readLog = options.readWorkQueueLog || readWorkQueueLog;
     const latest = await readLog({
       githubClient,
       owner: repositoryContext.repo.owner,

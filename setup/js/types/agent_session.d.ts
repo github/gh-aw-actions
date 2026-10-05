@@ -1,5 +1,32 @@
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
+/**
+ * @minimum 0
+ * @maximum 9007199254740991
+ * @multipleOf 1
+ */
+export type SessionCount = number;
+
+/** @minimum 0 */
+export type SessionMetric = number;
+
+/**
+ * @minimum 0
+ * @maximum 255
+ * @multipleOf 1
+ */
+export type SessionExitCode = number;
+
+/**
+ * @minimum -9007199254740991
+ * @maximum 9007199254740991
+ * @multipleOf 1
+ */
+export type SessionErrorNumber = number;
+
+/** @minLength 1 */
+export type SessionDiagnosticName = string;
+
 export interface EventMetadata {
   id?: string;
   parentId?: string | null;
@@ -41,7 +68,7 @@ export interface ToolExecutionCompleteData {
   output?: JsonValue;
   result?: JsonValue;
   error?: JsonValue;
-  durationMs?: number;
+  durationMs?: SessionMetric;
   exitCode?: number;
   status?: string;
   is_error?: boolean;
@@ -51,15 +78,17 @@ export interface ToolExecutionCompleteData {
 }
 
 export interface SessionUsage {
-  total_tokens?: number;
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheCreationInputTokens?: number;
-  cacheReadInputTokens?: number;
+  total_tokens?: SessionCount;
+  input_tokens?: SessionCount;
+  output_tokens?: SessionCount;
+  reasoning_output_tokens?: SessionCount;
+  cache_creation_input_tokens?: SessionCount;
+  cache_read_input_tokens?: SessionCount;
+  totalTokens?: SessionCount;
+  inputTokens?: SessionCount;
+  outputTokens?: SessionCount;
+  cacheCreationInputTokens?: SessionCount;
+  cacheReadInputTokens?: SessionCount;
   input_tokens_include_cache?: boolean;
   /** Unavailable aggregate fields whose contributions exceeded safe integer precision. */
   overflowed_tokens?: string[];
@@ -67,9 +96,11 @@ export interface SessionUsage {
 }
 
 export interface SessionResultData {
-  numTurns?: number;
-  durationMs?: number;
-  totalCostUsd?: number;
+  numTurns?: SessionCount;
+  durationMs?: SessionMetric;
+  totalCostUsd?: SessionMetric;
+  status?: string;
+  sourceType?: string;
   usage?: SessionUsage;
   errors?: JsonValue[];
   permissionDenials?: JsonValue[];
@@ -111,7 +142,24 @@ export interface SessionResultEvent extends EventMetadata {
   data: SessionResultData;
 }
 
+export interface AgentExecutionData {
+  /** @uniqueItems true */
+  categories: SessionDiagnosticName[];
+  /** @uniqueItems true */
+  errorCodes: (SessionDiagnosticName | SessionErrorNumber)[];
+  /** @uniqueItems true */
+  errorTypes: SessionDiagnosticName[];
+  exitCode?: SessionExitCode;
+  [key: string]: unknown;
+}
+
+export interface AgentExecutionEvent extends EventMetadata {
+  type: "agent.execution";
+  data: AgentExecutionData;
+}
+
 export interface SessionFileFormatData {
+  /** @minimum 1 @multipleOf 1 */
   version: number;
   [key: string]: unknown;
 }
@@ -121,9 +169,27 @@ export interface SessionFileFormatEvent extends EventMetadata {
   data: SessionFileFormatData;
 }
 
-export type CoreSessionEvent = SessionInitEvent | UserMessageEvent | AssistantMessageEvent | AssistantReasoningEvent | ToolExecutionStartEvent | ToolExecutionCompleteEvent | SessionResultEvent;
+export interface DetectionResultData {
+  jobResult?: string;
+  conclusion?: string;
+  reason?: string;
+  promptInjection?: boolean;
+  secretLeak?: boolean;
+  maliciousPatch?: boolean;
+  [key: string]: unknown;
+}
+
+export interface DetectionResultEvent extends EventMetadata {
+  type: "detection.result";
+  data: DetectionResultData;
+}
+
+export type CoreSessionEvent =
+  SessionInitEvent | UserMessageEvent | AssistantMessageEvent | AssistantReasoningEvent | ToolExecutionStartEvent | ToolExecutionCompleteEvent | SessionResultEvent | SessionFileFormatEvent | DetectionResultEvent | AgentExecutionEvent;
 
 export interface SessionEventDataMap {
+  "agent.execution": AgentExecutionData;
+  "detection.result": DetectionResultData;
   "session.format": SessionFileFormatData;
   "session.init": SessionInitData;
   "user.message": MessageData;
@@ -151,12 +217,9 @@ export interface SessionProvenance {
   phase: string;
   path: string;
   /** Position in the source's normalized event array, not necessarily a raw line. */
-  index: number;
+  index: SessionCount;
   /** Ordering key only; numeric native timestamp units are schema-dependent. */
   timestampMs?: number;
   /** Preserves a source event's preexisting provenance field. */
   native?: unknown;
 }
-
-export type UnifiedSessionEvent = SessionEvent & { provenance: SessionProvenance };
-export type UnifiedSession = UnifiedSessionEvent[];

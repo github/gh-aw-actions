@@ -52,8 +52,8 @@ function parseBoolFromFrontmatter(frontmatterText, key) {
  *
  * @param {string} workflowPath - Path to the workflow file
  * @param {Object} [options] - Optional configuration
- * @param {Function} [options.fileReader] - Custom file reader function (async (filePath) => content)
- *                                          If not provided, uses fs.readFileSync
+ * @param {Function} [options.fileReader] - Custom file reader function (async (filePath) => content); defaults to fs.readFileSync
+ * @param {"local"|"github-api"} [options.readerMode] - Reader source; set to "github-api" for API-backed readers, including wrappers
  * @param {boolean} [options.verbose] - When true, emits detailed debug logging via core.info()
  *                                      for every step of the computation. Useful when diagnosing
  *                                      unexpected hash mismatches.
@@ -61,6 +61,7 @@ function parseBoolFromFrontmatter(frontmatterText, key) {
  */
 async function computeFrontmatterHash(workflowPath, options = {}) {
   const fileReader = options.fileReader || defaultFileReader;
+  const readerMode = options.readerMode || "local";
   const verbose = options.verbose === true;
   // log is a thin helper that only emits when verbose mode is active.
   // It uses core.info when available (GitHub Actions environment) and falls back to
@@ -130,7 +131,7 @@ async function computeFrontmatterHash(workflowPath, options = {}) {
     log(`canonical.body-text (inlined-imports): ${canonical["body-text"].substring(0, 200)}...`);
   } else {
     // Extract template expressions with env. or vars.
-    const expressions = mergeSortedUniqueStrings(extractRelevantTemplateExpressions(markdown), await collectRuntimeImportTemplateExpressions(frontmatterText, markdown, baseDir, fileReader));
+    const expressions = mergeSortedUniqueStrings(extractRelevantTemplateExpressions(markdown), await collectRuntimeImportTemplateExpressions(frontmatterText, markdown, baseDir, fileReader, readerMode));
     if (expressions.length > 0) {
       canonical["template-expressions"] = expressions;
       log(`canonical.template-expressions: ${JSON.stringify(expressions)}`);
@@ -381,16 +382,17 @@ function extractAllTemplateExpressions(markdown) {
  * @param {string} markdown
  * @param {string} baseDir
  * @param {Function} fileReader
+ * @param {"local"|"github-api"} readerMode
  * @returns {Promise<string[]>}
  */
-async function collectRuntimeImportTemplateExpressions(frontmatterText, markdown, baseDir, fileReader) {
+async function collectRuntimeImportTemplateExpressions(frontmatterText, markdown, baseDir, fileReader, readerMode) {
   const seen = new Set();
-  let expressions = await extractRuntimeImportTemplateExpressionsFromMarkdown(markdown, baseDir, seen, fileReader);
+  let expressions = await extractRuntimeImportTemplateExpressionsFromMarkdown(markdown, baseDir, seen, fileReader, readerMode);
 
   const importedBodies = await collectImportedBodies(frontmatterText, baseDir, new Set(), fileReader);
   for (const body of importedBodies) {
     expressions = mergeSortedUniqueStrings(expressions, extractAllTemplateExpressions(body));
-    expressions = mergeSortedUniqueStrings(expressions, await extractRuntimeImportTemplateExpressionsFromMarkdown(body, baseDir, seen, fileReader));
+    expressions = mergeSortedUniqueStrings(expressions, await extractRuntimeImportTemplateExpressionsFromMarkdown(body, baseDir, seen, fileReader, readerMode));
   }
 
   return expressions;
@@ -401,17 +403,18 @@ async function collectRuntimeImportTemplateExpressions(frontmatterText, markdown
  * @param {string} baseDir
  * @param {Set<string>} seen
  * @param {Function} fileReader
+ * @param {"local"|"github-api"} readerMode
  * @returns {Promise<string[]>}
  */
-async function extractRuntimeImportTemplateExpressionsFromMarkdown(markdown, baseDir, seen, fileReader) {
+async function extractRuntimeImportTemplateExpressionsFromMarkdown(markdown, baseDir, seen, fileReader, readerMode) {
   const refs = extractRuntimeImportReferences(markdown);
   let expressions = [];
 
   for (const ref of refs) {
-    const body = await readRuntimeImportBodyForHash(ref, baseDir, seen, fileReader);
+    const body = await readRuntimeImportBodyForHash(ref, baseDir, seen, fileReader, readerMode);
     if (body === null) continue;
     expressions = mergeSortedUniqueStrings(expressions, extractAllTemplateExpressions(body));
-    expressions = mergeSortedUniqueStrings(expressions, await extractRuntimeImportTemplateExpressionsFromMarkdown(body, baseDir, seen, fileReader));
+    expressions = mergeSortedUniqueStrings(expressions, await extractRuntimeImportTemplateExpressionsFromMarkdown(body, baseDir, seen, fileReader, readerMode));
   }
 
   return expressions;
@@ -447,13 +450,15 @@ function extractRuntimeImportReferences(markdown) {
  * @param {string} baseDir
  * @param {Set<string>} seen
  * @param {Function} fileReader
+ * @param {"local"|"github-api"} readerMode
  * @returns {Promise<string|null>}
  */
-async function readRuntimeImportBodyForHash(ref, baseDir, seen, fileReader) {
+async function readRuntimeImportBodyForHash(ref, baseDir, seen, fileReader, readerMode) {
   for (const candidate of runtimeImportHashCandidatePaths(ref.path, baseDir)) {
     const key = `${candidate}:${ref.startLine ?? 0}-${ref.endLine ?? 0}`;
     if (seen.has(key)) return null;
-    if (fs.existsSync(candidate) && !runtimeImportHashRealPathAllowed(candidate, baseDir)) continue;
+    // API candidates use the allowlisted paths below and the reader's remote symlink resolution; local realpath checks inspect the unrelated runner checkout.
+    if (readerMode !== "github-api" && fs.existsSync(candidate) && !runtimeImportHashRealPathAllowed(candidate, baseDir)) continue;
     try {
       let content = await fileReader(candidate);
       seen.add(key);
@@ -537,7 +542,10 @@ function runtimeImportHashCandidatePaths(importPath, baseDir) {
  * @returns {string}
  */
 function runtimeImportHashWorkspaceRoot(baseDir) {
-  const normalized = baseDir.replace(/\\/g, "/");
+  const normalized = path.normalize(baseDir).replace(/\\/g, "/");
+  if (normalized === ".github" || normalized.startsWith(".github/")) {
+    return ".";
+  }
   const markerIndex = normalized.indexOf("/.github/");
   if (markerIndex >= 0) {
     return normalized.substring(0, markerIndex);

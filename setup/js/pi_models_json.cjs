@@ -32,8 +32,10 @@
 
 const fs = require("fs");
 const path = require("path");
-const { fetchAWFReflect, normalizeReflectProviderName, REFLECT_PROVIDER_ALIASES, resolveProviderEndpointFromReflect } = require("./awf_reflect.cjs");
+const { fetchAWFReflect, getCatalogModelEntry, normalizeReflectProviderName, REFLECT_PROVIDER_ALIASES, resolveProviderEndpointFromReflect } = require("./awf_reflect.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { loadModelsJson } = require("./model_costs.cjs");
+const { loadPiSDK, nativePiProvider, parsePiConfig } = require("./pi_runtime.cjs");
 
 const DEFAULT_PI_CODING_AGENT_DIR = "/tmp/gh-aw/pi-agent-dir";
 const COPILOT_CLAUDE_SONNET_5_CONTEXT_WINDOW = 1000000;
@@ -81,11 +83,11 @@ function resolveGatewayBaseUrl(options) {
  * "COPILOT_GITHUB_TOKEN") causes Pi to automatically use the value that is
  * already present in the container environment.
  *
- * @param {{ baseUrl: string, apiKeyEnvVar: string, modelId: string, api?: string, provider?: string, contextWindow?: number|string, logger?: (msg: string) => void }} options
+ * @param {{ baseUrl: string, apiKeyEnvVar: string, modelId: string, api?: string, provider?: string, nativeProvider?: string, contextWindow?: number|string, metadata?: Record<string, any>, logger?: (msg: string) => void }} options
  * @returns {string}
  */
 function buildModelsJSON(options) {
-  const { baseUrl, apiKeyEnvVar, modelId, api, provider, contextWindow: configuredContextWindow, logger = () => {} } = options;
+  const { baseUrl, modelId, api, provider, nativeProvider, metadata = {}, contextWindow: configuredContextWindow, logger = () => {} } = options;
   // Pi's built-in github-copilot catalog lists claude-sonnet-5 with a 1M context window.
   const fallbackContextWindow = provider === "github" && modelId === "claude-sonnet-5" ? COPILOT_CLAUDE_SONNET_5_CONTEXT_WINDOW : undefined;
   const resolvedContextWindow = resolveContextWindow(configuredContextWindow, logger);
@@ -95,9 +97,11 @@ function buildModelsJSON(options) {
       "aw-gateway": {
         baseUrl,
         api: api || "openai-completions",
-        apiKey: apiKeyEnvVar,
-        models: [{ id: modelId, ...(contextWindow ? { contextWindow } : {}) }],
+        // AWF owns the upstream credential; Pi only needs a non-secret placeholder.
+        apiKey: "awf-proxy",
+        models: [{ ...metadata, id: modelId, ...(contextWindow ? { contextWindow } : {}), ...(provider === "github" && modelId === "claude-haiku-4.5" ? { reasoning: false } : {}) }],
       },
+      ...(nativeProvider && !["github-copilot", "anthropic", "openai", "google"].includes(nativeProvider) ? { [nativeProvider]: { baseUrl, apiKey: "awf-proxy" } } : {}),
     },
   });
 }
@@ -144,10 +148,80 @@ function resolvePiApiForProvider(provider) {
   if (provider === "openai" || provider === "codex") {
     return "openai-responses";
   }
+  if (provider === "google" || provider === "gemini") return "google-generative-ai";
   return provider === "anthropic" ? "anthropic-messages" : "openai-completions";
 }
 
-async function main() {
+/**
+ * Fail before inference when a completed proxy model inventory excludes the selected model.
+ *
+ * @param {{ provider: string, modelId: string, reflectData?: any, logger?: (msg: string) => void }} options
+ */
+function validatePiModelAvailability(options) {
+  const { provider, modelId, reflectData, logger = () => {} } = options;
+  if (!reflectData) {
+    logger("awf-reflect: model availability check skipped (reflection data unavailable)");
+    return;
+  }
+  if (reflectData.models_fetch_complete !== true) {
+    logger("awf-reflect: model availability check skipped (model discovery incomplete)");
+    return;
+  }
+
+  const normalizedProvider = normalizeReflectProviderName(provider);
+  const aliases = REFLECT_PROVIDER_ALIASES[normalizedProvider] || new Set([normalizedProvider]);
+  const endpoint = reflectData.endpoints?.find(endpoint => endpoint?.configured === true && aliases.has(normalizeReflectProviderName(endpoint.provider)));
+  if (!endpoint) {
+    logger(`awf-reflect: model availability check skipped (no configured endpoint for provider=${normalizedProvider})`);
+    return;
+  }
+  if (!Array.isArray(endpoint.models)) {
+    logger(`awf-reflect: model availability check skipped (endpoint=${endpoint.provider} has no model inventory)`);
+    return;
+  }
+
+  const normalizedModelId = modelId.split("?")[0].toLowerCase();
+  const advertisedModels = endpoint.models.map(model => {
+    if (typeof model === "string") return model.toLowerCase();
+    if (model && typeof model === "object") return String(model.id || model.name || "").toLowerCase();
+    return "";
+  });
+  if (advertisedModels.includes(normalizedModelId)) {
+    logger(`awf-reflect: model availability confirmed (provider=${endpoint.provider}, model=${modelId})`);
+    return;
+  }
+  logger(`warning: awf-reflect model availability check failed (provider=${endpoint.provider}, model=${modelId})`);
+  throw new Error(`Pi model "${modelId}" is not advertised by the configured ${endpoint.provider} proxy endpoint; choose a model listed by AWF /reflect`);
+}
+
+/**
+ * Resolve a model-specific Pi API from model metadata, rejecting an explicit
+ * chat-completions override when the model only supports the Responses API.
+ *
+ * @param {{ provider: string, modelId: string, model?: any, modelsJson?: any, overrideApi?: string, logger?: (msg: string) => void }} options
+ * @returns {string}
+ */
+function resolvePiApiForModel(options) {
+  const { provider, modelId, model, modelsJson, overrideApi, logger = () => {} } = options;
+  const catalogProvider = ["github", "copilot", "github-copilot"].includes(provider) ? "github-copilot" : provider;
+  const catalogEntry = getCatalogModelEntry(modelsJson, modelId, catalogProvider);
+  const wireApi = String(catalogEntry?.wire_api || catalogEntry?.wireApi || "")
+    .toLowerCase()
+    .trim();
+  const requiresResponses = model?.api === "openai-responses" || wireApi === "responses";
+  logger(`Pi model API metadata (provider=${provider}, model=${modelId}, catalog_wire_api=${wireApi || "(unset)"}, catalog_api=${model?.api || "(unset)"}, override_api=${overrideApi || "(unset)"})`);
+  if (requiresResponses && overrideApi && overrideApi !== "openai-responses") {
+    logger(`warning: Pi model API override conflicts with Responses-only model (model=${modelId}, override_api=${overrideApi})`);
+    throw new Error(`Pi model "${modelId}" requires the OpenAI Responses API, but engine.config.model.api is "${overrideApi}"`);
+  }
+  const api = requiresResponses ? "openai-responses" : overrideApi || model?.api || resolvePiApiForProvider(provider);
+  const source = overrideApi ? "engine.config.model.api" : model?.api ? "Pi model catalog" : wireApi === "responses" ? "AWF model catalog" : "provider default";
+  logger(`resolved model API=${api} (provider=${provider}, model=${modelId}, source=${source})`);
+  return api;
+}
+
+/** @param {{ loadSDK?: typeof loadPiSDK, loadModelsJson?: typeof loadModelsJson }} [options] */
+async function main(options = {}) {
   const logger = DEFAULT_LOGGER;
   const modelId = process.env.GH_AW_PI_MODEL_ID || "";
   const apiKeyEnvVar = process.env.GH_AW_PI_GATEWAY_SECRET_ENV || "";
@@ -176,15 +250,44 @@ async function main() {
     }
   }
 
+  validatePiModelAvailability({ provider, modelId, reflectData, logger });
   const { baseUrl, source } = resolveGatewayBaseUrl({ provider, fallbackPort, reflectData, logger });
   logger(`resolved gateway baseUrl=${baseUrl} (source=${source}, provider=${provider}, fallbackPort=${fallbackPort})`);
 
-  const api = resolvePiApiForProvider(provider);
-  logger(`resolved gateway api=${api} (provider=${provider})`);
-
-  const modelsJSON = buildModelsJSON({ baseUrl, apiKeyEnvVar, modelId, api, provider, contextWindow, logger });
+  const overrides = parsePiConfig().model || {};
+  const nativeProvider = nativePiProvider(process.env.GH_AW_PI_NATIVE_PROVIDER || provider);
+  const modelsJson = (options.loadModelsJson || loadModelsJson)();
+  let catalogModel;
+  if (["reasoning", "input", "contextWindow", "maxTokens"].every(key => Object.hasOwn(overrides, key))) {
+    logger(`using explicit model metadata for ${nativeProvider}/${modelId}`);
+  } else {
+    const sdk = await (options.loadSDK || loadPiSDK)();
+    const runtime = await sdk.ModelRuntime.create({ modelsPath: null });
+    catalogModel = runtime.getModel(nativeProvider, modelId.split("?")[0]);
+  }
+  let api = resolvePiApiForModel({ provider, modelId, model: catalogModel, modelsJson, overrideApi: overrides.api, logger });
+  logger(`resolved gateway api=${api} (provider=${provider}, model=${modelId})`);
+  const metadata = {};
+  if (catalogModel) {
+    for (const key of ["name", "reasoning", "thinkingLevelMap", "input", "inputLimits", "cost", "promptCache", "contextWindow", "maxTokens", "samplingParams", "compat"]) {
+      if (catalogModel[key] !== undefined) metadata[key] = catalogModel[key];
+    }
+  } else {
+    logger(`warning: Pi has no catalog metadata for ${nativeProvider}/${modelId}; configure engine.config.model for a custom model`);
+  }
+  for (const key of Object.keys(overrides)) {
+    if (!["api", "name", "reasoning", "thinkingLevelMap", "input", "inputLimits", "cost", "promptCache", "contextWindow", "maxTokens", "samplingParams", "compat"].includes(key)) {
+      throw new Error(`Unsupported Pi model metadata field: ${key}`);
+    }
+  }
+  if (overrides.api !== undefined) {
+    if (!["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"].includes(overrides.api)) throw new Error("Pi model API must match a supported AWF protocol");
+    api = overrides.api;
+  }
+  Object.assign(metadata, overrides);
+  const modelsJSON = buildModelsJSON({ baseUrl, apiKeyEnvVar, modelId, api, provider, nativeProvider, contextWindow, metadata, logger });
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-  fs.writeFileSync(outputPath, modelsJSON, "utf8");
+  fs.writeFileSync(outputPath, modelsJSON, { encoding: "utf8", mode: 0o600 });
   logger(`wrote ${outputPath}`);
 }
 
@@ -195,4 +298,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, resolveGatewayBaseUrl, buildModelsJSON, resolvePiApiForProvider, DEFAULT_PI_CODING_AGENT_DIR };
+module.exports = { main, resolveGatewayBaseUrl, buildModelsJSON, resolvePiApiForProvider, resolvePiApiForModel, validatePiModelAvailability, DEFAULT_PI_CODING_AGENT_DIR };

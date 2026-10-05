@@ -28,6 +28,8 @@ const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp
 const { readDedupedTokenUsage, TOKEN_USAGE_PATHS } = require("./parse_token_usage.cjs");
 const { extractShellCommandFromToolData } = require("./tool_call_details.cjs");
 const { resolveFailureIssueRepo } = require("./repo_helpers.cjs");
+const { GITHUB_API_VERSION } = require("./constants.cjs");
+const { EMPTY_OUTPUT_CAUSES } = require("./empty_output_outcome.cjs");
 const fs = require("fs");
 const https = require("https");
 const os = require("os");
@@ -51,7 +53,6 @@ const FAILURE_ISSUE_WINDOW_MS = FAILURE_ISSUE_DEDUP_WINDOW_HOURS * 60 * 60 * 100
 const DEFAULT_OTEL_JSONL_PATH = "/tmp/gh-aw/otel.jsonl";
 /** Path to the failure categories file written by handle_agent_failure and read by the OTLP conclusion span. */
 const FAILURE_CATEGORIES_PATH = "/tmp/gh-aw/failure_categories.json";
-const GITHUB_API_VERSION = "2022-11-28";
 const COPILOT_SESSION_STATE_DIR = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state");
 const RECENT_TOOL_CALLS_WITH_COMMAND_PREVIEW = new Set(["bash", "shell"]);
 const ELLIPSIS = "...";
@@ -293,6 +294,7 @@ function buildFailureMatchCategories(options) {
   if (options.hasPushRepoMemoryFailure) categories.push("push_repo_memory_failure");
   if (options.hasMissingSafeOutputs) categories.push("missing_safe_outputs");
   if (options.hasReportIncomplete) categories.push("report_incomplete");
+  if (Object.prototype.hasOwnProperty.call(EMPTY_OUTPUT_CAUSES, options.emptyOutputCause)) categories.push(options.emptyOutputCause);
   if (options.hasMissingTool) categories.push("missing_tool");
   if (options.hasToolDenialsExceeded) categories.push("tool_denials_exceeded");
   if (options.hasMissingData) categories.push("missing_data");
@@ -357,6 +359,7 @@ function buildFailureMatchCategories(options) {
  * @param {boolean} [options.missingModelPricingError]
  * @param {string} [options.missingModelPricingModelName]
  * @param {boolean} [options.shellExpansionGuardRejected]
+ * @param {string} [options.emptyOutputCause]
  * @returns {string}
  */
 function buildFailureIssueTitle(options) {
@@ -391,6 +394,8 @@ function buildFailureIssueTitle(options) {
   if (options.isTimedOut) return `[aw] ${workflowName} timed out`;
   if (options.hasToolDenialsExceeded) return `[aw] ${workflowName} exceeded tool denial limit`;
   if (options.hasCacheMissMisconfiguration) return `[aw] ${workflowName} has cache-memory miss misconfiguration`;
+  const emptyOutputCauseTitle = typeof options.emptyOutputCause === "string" && Object.prototype.hasOwnProperty.call(EMPTY_OUTPUT_CAUSES, options.emptyOutputCause) ? EMPTY_OUTPUT_CAUSES[options.emptyOutputCause] : "";
+  if (emptyOutputCauseTitle) return `[aw] ${workflowName} ${emptyOutputCauseTitle}`;
   if (options.hasReportIncomplete) return `[aw] ${workflowName} reported incomplete result`;
   if (options.hasMissingSafeOutputs) return `[aw] ${workflowName} produced no safe outputs`;
   if (options.hasMissingTool) return `[aw] ${workflowName} is missing required tool`;
@@ -1710,6 +1715,69 @@ function buildReportIncompleteContext(items) {
 }
 
 /**
+ * Find the failed step in the agent job for generic failure reports.
+ * @returns {Promise<string>} The failed step name, or an empty string when unavailable
+ */
+async function getFailedAgentStep() {
+  try {
+    const { owner, repo } = context.repo;
+    const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+      owner,
+      repo,
+      run_id: context.runId,
+      per_page: 100,
+    });
+    const agentJob = jobs.find(job => job.name === "agent" && job.conclusion === "failure");
+    if (!agentJob) {
+      core.debug("No failed agent job found when looking up the failed agent step");
+      return "";
+    }
+    const failedStep = agentJob?.steps
+      ?.slice()
+      .reverse()
+      .find(step => step.conclusion === "failure" && typeof step.name === "string");
+    if (!failedStep) {
+      core.debug("No failed step found in the agent job");
+      return "";
+    }
+    return sanitizeContent(failedStep.name, 200);
+  } catch (error) {
+    const status = error && typeof error === "object" && "status" in error ? error.status : undefined;
+    if (status === 403) {
+      core.warning("Could not identify the failed agent step; ensure the conclusion job grants actions: read.");
+    } else {
+      core.warning("Could not identify the failed agent step because the workflow run jobs API request failed.");
+    }
+    return "";
+  }
+}
+
+/**
+ * Add step-level context to generic agent and infrastructure failures.
+ * @param {{failureCategories: string[], failingStep: string, engineFailureContext: string, items?: Array<any>}} options
+ * @returns {string}
+ */
+function buildFailureDiagnosticsContext({ failureCategories, failingStep, engineFailureContext, items = [] }) {
+  const infrastructureMessages = items.filter(item => item?.type === "report_incomplete" && item.reason === "infrastructure_error");
+  const isGenericFailure = failureCategories.includes("agent_failure") || infrastructureMessages.length > 0;
+  if (!isGenericFailure) {
+    return "";
+  }
+
+  let context = "\n### Failure Diagnostics\n\n";
+  if (failingStep) {
+    context += `**Failing step:** ${failingStep}\n\n`;
+  }
+
+  const hasInfrastructureDetails = infrastructureMessages.some(item => typeof item.details === "string" && item.details.trim());
+  if (!engineFailureContext.trim() && !hasInfrastructureDetails) {
+    context += "No cause was captured from the agent report or engine logs.\n\n";
+  }
+
+  return context;
+}
+
+/**
  * Build a context string with a frontmatter hint when the agent timed out.
  * @param {boolean} isTimedOut - Whether the agent job timed out
  * @param {string} timeoutMinutes - Current timeout value in minutes (e.g. "20")
@@ -2984,6 +3052,7 @@ function buildEngineFailureContext(options = {}) {
   // Derive agent-stdio.log path from the agent output file path (same directory)
   const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
   const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
+  const exitCodePath = path.join(path.dirname(stdioLogPath), "agent_execution_exit_code.txt");
 
   // Include engine ID in failure messages when available (e.g. "copilot", "claude", "codex")
   const engineId = process.env.GH_AW_ENGINE_ID || "";
@@ -2991,6 +3060,8 @@ function buildEngineFailureContext(options = {}) {
   const hasStructuredMaxCacheMissesSignal = maxCacheMissesExceededFromDetection || parseMaxCacheMissesExceededFromEventLog();
 
   try {
+    const exitCodeText = fs.existsSync(exitCodePath) ? fs.readFileSync(exitCodePath, "utf8").trim() : "";
+    const exitDetails = /^[1-9]\d{0,2}$/.test(exitCodeText) && Number(exitCodeText) <= 255 ? `**Driver exit code:** ${exitCodeText}\n\n` : "";
     if (!fs.existsSync(stdioLogPath)) {
       if (shellExpansionGuardRejectedFromDetection) {
         core.info("agent-stdio.log not found, but shell expansion guard rejection was detected — using dedicated context message");
@@ -3000,8 +3071,8 @@ function buildEngineFailureContext(options = {}) {
         core.info("agent-stdio.log not found, but structured max cache misses signal was detected — using dedicated context message");
         return buildEngineMaxCacheMissesExceededContext(engineLabel);
       }
-      core.info(`agent-stdio.log not found at ${stdioLogPath}, skipping engine failure context`);
-      return "";
+      core.info(`agent-stdio.log not found at ${stdioLogPath}`);
+      return exitDetails ? buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n" + exitDetails : "";
     }
 
     const logContent = fs.readFileSync(stdioLogPath, "utf8");
@@ -3014,7 +3085,7 @@ function buildEngineFailureContext(options = {}) {
         core.info("agent-stdio.log is empty, but structured max cache misses signal was detected — using dedicated context message");
         return buildEngineMaxCacheMissesExceededContext(engineLabel);
       }
-      return "";
+      return exitDetails ? buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n" + exitDetails : "";
     }
 
     const lines = logContent.split("\n");
@@ -3191,7 +3262,7 @@ function buildEngineFailureContext(options = {}) {
         return context;
       }
 
-      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n**Error details:**\n";
+      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n" + exitDetails + "**Error details:**\n";
       for (const message of errorMessages) {
         context += `- ${applyAddMaskRedaction(message, maskedValues)}\n`;
       }
@@ -3271,7 +3342,7 @@ function buildEngineFailureContext(options = {}) {
         process.env.GH_AW_ENGINE_ID === "copilot"
           ? "If this failure recurs, check the GitHub Copilot status page and review the firewall audit logs.\n\n"
           : "If this failure recurs, check the provider status page (if available) and review the firewall audit logs.\n\n";
-      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n";
+      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n" + exitDetails;
       context += "The engine exited immediately without producing any output. This often indicates a transient infrastructure issue (e.g., service unavailable, API rate limiting). " + recurringFailureGuidance;
       return context;
     }
@@ -3279,7 +3350,7 @@ function buildEngineFailureContext(options = {}) {
     const tailLines = agentLines.slice(-TAIL_LINES);
     core.info(`No specific error patterns found; including last ${tailLines.length} line(s) of agent-stdio.log as fallback`);
 
-    let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated unexpectedly.`) + "\n**Last agent output:**\n\`\`\`\n";
+    let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated unexpectedly.`) + "\n" + exitDetails + "**Last agent output:**\n\`\`\`\n";
     context += applyAddMaskRedaction(tailLines.join("\n"), maskedValues);
     context += "\n```\n\n";
     return context;
@@ -3656,6 +3727,7 @@ async function detectAndHandleFailureCascade(owner, repo, triggeringIssueNumber)
         repo,
         issue_number: existing.number,
         body: rollupBody,
+        headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
       });
       core.info(`✓ Updated cascade rollup issue #${existing.number}: ${existing.html_url}`);
     } else {
@@ -3694,6 +3766,57 @@ async function detectAndHandleFailureCascade(owner, repo, triggeringIssueNumber)
  * This script is called from the conclusion job when the agent job has failed
  * or when the agent succeeded but produced no safe outputs
  */
+async function isInvalidatedPRMergeCheckout() {
+  const prNumber = context.payload?.pull_request?.number;
+  if (process.env.GH_AW_DEFAULT_CHECKOUT_USES_TRIGGER_REF !== "true" || context.eventName !== "pull_request" || !Number.isSafeInteger(prNumber) || context.ref !== `refs/pull/${prNumber}/merge`) {
+    core.debug("PR merge-ref invalidation check skipped: requires a pull_request merge ref and compiler-confirmed default checkout");
+    return false;
+  }
+
+  try {
+    core.debug(`Checking PR #${prNumber} for merge-ref checkout invalidation`);
+    const { owner, repo } = context.repo;
+    const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+    if (pr.state !== "closed" || !pr.closed_at) {
+      core.debug("PR merge-ref invalidation not confirmed: PR is not closed with a closure timestamp");
+      return false;
+    }
+    const closedAt = Date.parse(pr.closed_at);
+    if (!Number.isFinite(closedAt)) {
+      core.debug("PR merge-ref invalidation not confirmed: invalid PR closure timestamp");
+      return false;
+    }
+    const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, { owner, repo, run_id: context.runId, per_page: 100 });
+    const invalidated = jobs.some(
+      job =>
+        job.name === "agent" &&
+        job.conclusion === "failure" &&
+        job.steps?.some(step => {
+          if (step.name !== "Checkout repository (gh-aw default)" || step.conclusion !== "failure" || !step.completed_at) {
+            return false;
+          }
+          const completedAt = Date.parse(step.completed_at);
+          if (Number.isFinite(completedAt)) {
+            core.debug(`PR merge-ref checkout timing: closed_at=${new Date(closedAt).toISOString()}, checkout_completed_at=${new Date(completedAt).toISOString()}`);
+          } else {
+            core.debug("PR merge-ref invalidation not confirmed: invalid checkout completion timestamp");
+          }
+          return Number.isFinite(completedAt) && closedAt <= completedAt;
+        })
+    );
+    core.debug(`PR merge-ref invalidation ${invalidated ? "confirmed" : "not confirmed"}: ${invalidated ? "closure preceded failed default checkout completion" : "no failed default checkout completed at or after PR closure"}`);
+    return invalidated;
+  } catch (error) {
+    const message = getErrorMessage(error);
+    if (error?.status === 403 || /Resource not accessible/i.test(message)) {
+      core.warning(`Could not check PR merge-ref invalidation; ensure the conclusion job grants actions: read and pull-requests: read: ${message}`);
+    } else {
+      core.warning(`Could not check PR merge-ref invalidation: ${message}`);
+    }
+    return false;
+  }
+}
+
 async function main() {
   try {
     // Get workflow context
@@ -4092,6 +4215,10 @@ async function main() {
       core.info("Skipping failure handling - failure was due to PR checkout (likely PR merged)");
       return;
     }
+    if (agentConclusion === "failure" && (await isInvalidatedPRMergeCheckout())) {
+      core.info("Skipping failure issue creation: PR merge ref was invalidated by closure during checkout");
+      return;
+    }
 
     // Determine the failure issue repository destination.
     // SEC-005: a literal GH_AW_FAILURE_ISSUE_REPO is set in the workflow frontmatter at
@@ -4145,8 +4272,11 @@ async function main() {
 
     // Sanitize workflow name for title
     const sanitizedWorkflowName = sanitizeContent(workflowName, { maxLength: 100 });
+    // Only the collector-written root metadata is trusted; report_incomplete.reason is agent-controlled.
+    const emptyOutputCause = agentOutputResult.success ? agentOutputResult.collectorEmptyOutputCause : undefined;
     const issueTitle = buildFailureIssueTitle({
       workflowName: sanitizedWorkflowName,
+      emptyOutputCause,
       isTimedOut,
       hasMissingSafeOutputs,
       hasReportIncomplete,
@@ -4174,6 +4304,7 @@ async function main() {
     });
     const failureCategories = buildFailureMatchCategories({
       agentConclusion,
+      emptyOutputCause,
       isTimedOut,
       hasAssignmentErrors,
       hasAssignCopilotFailures,
@@ -4264,6 +4395,11 @@ async function main() {
         return;
       }
     }
+
+    const agentOutputItems = Array.isArray(agentOutputResult.items) ? agentOutputResult.items : [];
+    const needsFailureDiagnostics =
+      failureCategories.includes("agent_failure") || failureCategories.includes("engine_driver_failure") || agentOutputItems.some(item => item?.type === "report_incomplete" && item.reason === "infrastructure_error");
+    const failingStep = needsFailureDiagnostics ? await getFailedAgentStep() : "";
 
     // Check if parent issue creation is enabled (defaults to false)
     const groupReports = process.env.GH_AW_GROUP_REPORTS === "true";
@@ -4379,6 +4515,12 @@ async function main() {
               maxCacheMissesExceeded,
             })
           : "";
+        const failureDiagnosticsContext = buildFailureDiagnosticsContext({
+          failureCategories,
+          failingStep,
+          engineFailureContext,
+          items: agentOutputItems,
+        });
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
 
@@ -4443,6 +4585,7 @@ async function main() {
           permission_denied_context: permissionDeniedContext,
           tool_denials_exceeded_context: toolDenialsExceededContext,
           report_incomplete_context: reportIncompleteContext,
+          failure_diagnostics_context: failureDiagnosticsContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
           engine_failure_context: engineFailureContext,
           timeout_context: timeoutContext,
@@ -4613,6 +4756,12 @@ async function main() {
         const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected)
           ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded })
           : "";
+        const failureDiagnosticsContext = buildFailureDiagnosticsContext({
+          failureCategories,
+          failingStep,
+          engineFailureContext,
+          items: agentOutputItems,
+        });
 
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
@@ -4682,6 +4831,7 @@ async function main() {
           permission_denied_context: permissionDeniedContext,
           tool_denials_exceeded_context: toolDenialsExceededContext,
           report_incomplete_context: reportIncompleteContext,
+          failure_diagnostics_context: failureDiagnosticsContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
           engine_failure_context: engineFailureContext,
           timeout_context: timeoutContext,
@@ -4794,6 +4944,7 @@ async function main() {
 }
 
 module.exports = {
+  isInvalidatedPRMergeCheckout,
   main,
   buildCodePushFailureContext,
   buildPushRepoMemoryFailureContext,
@@ -4814,6 +4965,8 @@ module.exports = {
   isDroppedPipeSafeOutputsCommand,
   detectAWFFirewallStartupFailureFromLog,
   buildReportIncompleteContext,
+  getFailedAgentStep,
+  buildFailureDiagnosticsContext,
   buildMCPPolicyErrorContext,
   buildCopilotOrgBillingErrorContext,
   detectCopilotOrgBillingErrorFromLog,

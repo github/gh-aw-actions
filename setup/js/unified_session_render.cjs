@@ -6,9 +6,12 @@ const { boundSummaryLines, escapeSummaryText, redactSessionForPublication } = re
 const { collectArtifactSecretValues, redactManifestValue } = require("./safe_output_manifest.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { normalizeUnifiedSessionEvent } = require("./unified_session_payload.cjs");
+const { ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
+const { validateAgentExecution } = require("./agent_execution.cjs");
 
 const RUNTIME_TYPES = new Set([
   "session.format",
+  "agent.execution",
   "session.collection",
   "session.collection_warning",
   "mcp.rpc.request",
@@ -43,8 +46,11 @@ function isUnifiedSessionTrace(events) {
 /** @param {Array<any>} events */
 function validateSessionFileHeader(events) {
   const header = events[0];
-  if (header?.type !== "session.format" || header.provenance?.component !== "collector") throw new Error("Unified session file is missing its leading session.format header");
-  if (header.data?.version !== 1) throw new Error(`Unsupported unified session file-format version: ${sessionOutputText(header.data?.version)}`);
+  if (header?.type !== "session.format" || header.provenance?.component !== "collector") throw new Error(`${ERR_VALIDATION}: Unified session file is missing its leading session.format header`);
+  if (header.data?.version !== 1) throw new Error(`${ERR_VALIDATION}: Unsupported unified session file-format version: ${sessionOutputText(header.data?.version)}`);
+  const executions = events.filter(event => event.type === "agent.execution");
+  if (executions.length > 1) throw new Error(`${ERR_VALIDATION}: Unified session contains multiple agent.execution records`);
+  for (const execution of executions) validateAgentExecution(execution.data);
 }
 
 /** @param {any} value @returns {string} */
@@ -82,6 +88,8 @@ function eventDetail(event) {
     }
     case "session.result":
       return fields(data, ["numTurns", "durationMs", "totalCostUsd"]);
+    case "agent.execution":
+      return fields({ ...data, categories: JSON.stringify(data.categories), errorCodes: JSON.stringify(data.errorCodes), errorTypes: JSON.stringify(data.errorTypes) }, ["categories", "errorCodes", "errorTypes", "exitCode"]);
     case "mcp.rpc.request":
       return fields(data, ["serverName", "direction", "rpcId", "method", "toolName"]);
     case "mcp.rpc.response":
@@ -97,7 +105,7 @@ function eventDetail(event) {
       return fields(data, ["event", "message", "reason"]);
     case "firewall.token_usage":
     case "usage.report":
-      return fields(data, ["provider", "model", "aic", "totalAic", "premiumRequests", "durationMs"]) + " " + fields(data.usage, ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]);
+      return fields(data, ["provider", "model", "aic", "totalAic", "premiumRequests", "durationMs"]) + " " + fields(data.usage, ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"]);
     case "mcp.event":
     case "firewall.event":
       return fields(data, ["event", "level", "status"]);
@@ -122,9 +130,9 @@ function eventDetail(event) {
     case "execution.result":
       return fields(data, ["outcome", "conclusion", "exitCode", "durationMs", "startedAt", "finishedAt"]);
     case "detection.result":
-      return fields(data, ["jobResult", "conclusion", "promptInjection", "secretLeak", "maliciousPatch"]);
+      return fields(data, ["jobResult", "conclusion", "reason", "promptInjection", "secretLeak", "maliciousPatch"]);
     case "workflow.info":
-      return fields(data, ["engine", "model", "workflow", "repository", "runId"]);
+      return fields(data, ["engineId", "requestedModel", "triggerType", "cliVersion", "awfVersion", "mcpgVersion", "agentVersion", "workflow", "repository", "runId"]);
     case "session.collection_warning":
       return fields(data, ["path", "line", "code"]);
     case "session.collection":
@@ -159,7 +167,7 @@ function publicationAgentSessions(events) {
   const secrets = collectArtifactSecretValues();
   const privateCopy = redactSessionForPublication(events, value => {
     const redacted = redactManifestValue(value, secrets);
-    if (typeof redacted !== "string") throw new Error("Expected redacted session string");
+    if (typeof redacted !== "string") throw new Error(`${ERR_VALIDATION}: Expected redacted session string`);
     return redacted;
   });
   return scopedAgentSessions(privateCopy);
@@ -174,9 +182,9 @@ function publicationAgentSessions(events) {
 function renderUnifiedSession(events, { markdown, maxBytes, maxLineBytes, agentStatistics }) {
   const headers = events.filter(event => event?.type === "session.format" && event.provenance?.component === "collector");
   if (headers.length) validateSessionFileHeader(events);
-  if (headers.length > 1) throw new Error("Unified session file contains multiple collector format headers");
+  if (headers.length > 1) throw new Error(`${ERR_VALIDATION}: Unified session file contains multiple collector format headers`);
   const redacted = redactManifestValue(events, collectArtifactSecretValues());
-  if (!Array.isArray(redacted)) throw new Error("Expected unified session events");
+  if (!Array.isArray(redacted)) throw new Error(`${ERR_VALIDATION}: Expected unified session events`);
   const lines = ["=== Unified session ==="];
   if (headers.length) lines.push(`File format version: ${headers[0].data.version}`);
   const counts = new Map();
@@ -221,7 +229,7 @@ async function publishUnifiedSessionSummary(filePath) {
       .filter(line => line.trim())
       .map(line => JSON.parse(line));
   } catch (error) {
-    throw new Error(`Failed to read unified session for summary: ${getErrorMessage(error)}`, { cause: error });
+    throw new Error(`${ERR_SYSTEM}: Failed to read unified session for summary: ${getErrorMessage(error)}`, { cause: error });
   }
   validateSessionFileHeader(events);
   const { generatePlainTextSummary, generateCopilotCliStyleSummary } = require("./log_parser_shared.cjs");
@@ -238,7 +246,7 @@ async function publishUnifiedSessionSummary(filePath) {
       }
       fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\n${markdown}\n`, "utf8");
     } catch (error) {
-      throw new Error(`Failed to publish unified session step summary: ${getErrorMessage(error)}`, { cause: error });
+      throw new Error(`${ERR_SYSTEM}: Failed to publish unified session step summary: ${getErrorMessage(error)}`, { cause: error });
     }
   } else if (core.summary?.addRaw) await core.summary.addRaw(generateCopilotCliStyleSummary(events)).write();
 }

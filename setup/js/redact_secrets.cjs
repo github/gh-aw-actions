@@ -11,6 +11,7 @@ const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { collectAddMaskedValues, redactArtifactMaskedValues } = require("./add_mask_redaction.cjs");
+const { redactPiSessionHTML } = require("./pi_session_redaction.cjs");
 /**
  * Recursively finds all files matching the specified extensions
  * @param {string} dir - Directory to search
@@ -23,21 +24,34 @@ function findFiles(dir, extensions) {
     if (!fs.existsSync(dir)) {
       return results;
     }
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isSymbolicLink()) {
-        fs.unlinkSync(fullPath);
-        core.warning(`Removed symbolic link before artifact upload: ${fullPath}`);
-      } else if (entry.isDirectory()) {
-        // Recursively search subdirectories
-        results.push(...findFiles(fullPath, extensions));
-      } else if (entry.isFile()) {
-        // Check if file has one of the target extensions
-        const ext = path.extname(entry.name).toLowerCase();
-        if (extensions.includes(ext)) {
-          results.push(fullPath);
+    const pending = [dir];
+    while (pending.length) {
+      const currentDir = pending.pop();
+      if (currentDir === undefined) break;
+      try {
+        let entries;
+        try {
+          entries = fs.readdirSync(currentDir, { withFileTypes: true });
+        } catch (error) {
+          if (error && typeof error === "object" && "code" in error && (error.code === "EACCES" || error.code === "EPERM")) {
+            core.warning(`Skipping inaccessible directory during secret redaction: ${currentDir}`);
+            continue;
+          }
+          throw error;
         }
+        for (const entry of entries) {
+          const fullPath = path.join(currentDir, entry.name);
+          if (entry.isSymbolicLink()) {
+            fs.unlinkSync(fullPath);
+            core.warning(`Removed symbolic link before artifact upload: ${fullPath}`);
+          } else if (entry.isDirectory()) {
+            pending.push(fullPath);
+          } else if (entry.isFile() && extensions.includes(path.extname(entry.name).toLowerCase())) {
+            results.push(fullPath);
+          }
+        }
+      } catch (error) {
+        throw new Error(`${ERR_VALIDATION}: Failed to scan directory ${currentDir}: ${getErrorMessage(error)}`, { cause: error });
       }
     }
   } catch (error) {
@@ -96,6 +110,7 @@ const MCP_GATEWAY_CONFIG_PATHS = [
       path.join("/tmp", "gh-aw/mcp-config/gateway-output.json"),
       path.join("/tmp", "gh-aw/mcp-config/mcp-servers.json"),
       path.join("/tmp", "gh-aw/mcp-config/config.toml"),
+      path.join("/tmp", "gh-aw/pi-agent-dir/mcp.json"),
       path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/gateway-output.json"),
       path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/mcp-servers.json"),
       path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/config.toml"),
@@ -262,12 +277,20 @@ function redactStepSummaryContent(content) {
 function processFile(filePath, secretValues, maskedValues = []) {
   try {
     const content = fs.readFileSync(filePath, "utf8");
-
-    const runtimeRedacted = redactArtifactMaskedValues(content, maskedValues);
+    const encodedResult =
+      path.extname(filePath).toLowerCase() === ".html"
+        ? redactPiSessionHTML(content, text => {
+            const masked = redactArtifactMaskedValues(text, maskedValues);
+            const builtIn = redactBuiltInPatterns(masked);
+            const custom = redactSecrets(builtIn.content, secretValues);
+            return { content: custom.content, redactionCount: builtIn.redactionCount + custom.redactionCount + (masked !== text ? 1 : 0) };
+          })
+        : { content, redactionCount: 0 };
+    const runtimeRedacted = redactArtifactMaskedValues(encodedResult.content, maskedValues);
     // First, redact built-in patterns
     const builtInResult = redactBuiltInPatterns(runtimeRedacted);
     let redacted = builtInResult.content;
-    let totalRedactions = builtInResult.redactionCount + (runtimeRedacted !== content ? 1 : 0);
+    let totalRedactions = encodedResult.redactionCount + builtInResult.redactionCount + (runtimeRedacted !== encodedResult.content ? 1 : 0);
 
     // Then, redact custom secrets
     const customResult = redactSecrets(redacted, secretValues);
@@ -280,14 +303,14 @@ function processFile(filePath, secretValues, maskedValues = []) {
     }
     return totalRedactions;
   } catch (error) {
-    if (maskedValues.length) {
+    if (maskedValues.length || path.extname(filePath).toLowerCase() === ".html") {
       // Uploads can run with always(); do not leave an unsanitized source behind.
       try {
         fs.unlinkSync(filePath);
       } catch (cleanupError) {
         throw new AggregateError([error, cleanupError], `${ERR_VALIDATION}: Failed to remove artifact source after runtime mask redaction failed`);
       }
-      core.warning(`Failed to process file ${filePath}: ${getErrorMessage(error)}`);
+      core.warning(`Failed to process file ${filePath}: runtime mask redaction failed`);
       core.setFailed(`${ERR_VALIDATION}: Removed artifact source after runtime mask redaction failed`);
       return 0;
     }
@@ -338,7 +361,7 @@ async function main() {
     core.info("Scanning for built-in credential patterns and custom secrets");
 
     // Find all target files in /tmp/gh-aw and ${RUNNER_TEMP}/gh-aw directories
-    const targetExtensions = [".txt", ".json", ".log", ".md", ".mdx", ".yml", ".jsonl", ".patch"];
+    const targetExtensions = [".txt", ".json", ".log", ".md", ".mdx", ".yml", ".jsonl", ".patch", ".html"];
     const tmpFiles = findFiles("/tmp/gh-aw", targetExtensions);
     const optFiles = findFiles(`${process.env.RUNNER_TEMP}/gh-aw`, targetExtensions);
     const files = [...new Set([...tmpFiles, ...optFiles])];
@@ -411,4 +434,4 @@ async function redactFilesInDir(dir) {
   }
 }
 
-module.exports = { main, redactFilesInDir, redactSecrets, redactBuiltInPatterns, redactStepSummaryContent, extractMCPGatewayTokens, BUILT_IN_PATTERNS, MCP_GATEWAY_CONFIG_PATHS };
+module.exports = { main, redactFilesInDir, findFiles, processFile, redactSecrets, redactBuiltInPatterns, redactStepSummaryContent, extractMCPGatewayTokens, BUILT_IN_PATTERNS, MCP_GATEWAY_CONFIG_PATHS };

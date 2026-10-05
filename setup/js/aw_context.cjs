@@ -168,9 +168,68 @@ function readInboundAwContext(payload) {
 }
 
 /**
+ * Resolve the compiler-managed workflow_dispatch work queue claim, falling
+ * back to the legacy assignment embedded in aw_context.
+ *
+ * @param {any} payload
+ * @returns {{work_id: string, claim_id: string, work: Record<string, unknown>} | null}
+ */
+function readInboundWorkQueueAssignment(payload) {
+  const rawClaim = payload?.inputs?.work_queue_claim ?? payload?.client_payload?.work_queue_claim;
+  const contextAssignment = readWorkQueueAssignment(readInboundAwContext(payload));
+  if (rawClaim == null || rawClaim === "") return contextAssignment;
+
+  const claim = parseInboundAwContext(rawClaim);
+  if (!claim) throw new TypeError("work_queue_claim must be a JSON object");
+  const inputAssignment = readWorkQueueAssignment({ work_queue: claim });
+  if (contextAssignment) {
+    throw new TypeError("work_queue_claim cannot be combined with an assignment in aw_context");
+  }
+  return inputAssignment;
+}
+
+/**
+ * @param {Record<string, unknown> | null} awContext
+ * @returns {{work_id: string, claim_id: string, work: Record<string, unknown>} | null}
+ */
+function readWorkQueueAssignment(awContext) {
+  if (!awContext) return null;
+  const hasCurrent = Object.hasOwn(awContext, "work_queue");
+  const hasLegacy = Object.hasOwn(awContext, "work_claim");
+  if (hasCurrent && hasLegacy) {
+    throw new TypeError("aw_context cannot contain both work_queue and the legacy work_claim assignment");
+  }
+  if (!hasCurrent && !hasLegacy) return null;
+  const assignment = hasCurrent ? awContext.work_queue : awContext.work_claim;
+  if (!isRecord(assignment) || Object.keys(assignment).length !== 3 || typeof assignment.work_id !== "string" || !assignment.work_id || typeof assignment.claim_id !== "string" || !assignment.claim_id || !isRecord(assignment.work)) {
+    throw new TypeError("work queue assignment has an invalid shape");
+  }
+  return { work_id: assignment.work_id, claim_id: assignment.claim_id, work: assignment.work };
+}
+
+/**
+ * @param {Record<string, unknown>} awContext
+ * @param {unknown} [rawWorkQueueClaim]
+ * @returns {Record<string, unknown>}
+ */
+function normalizeWorkQueueContext(awContext, rawWorkQueueClaim) {
+  let assignment = readWorkQueueAssignment(awContext);
+  if (rawWorkQueueClaim != null && rawWorkQueueClaim !== "") {
+    const claim = parseInboundAwContext(rawWorkQueueClaim);
+    if (!claim) throw new TypeError("work_queue_claim must be a JSON object");
+    if (assignment) throw new TypeError("work_queue_claim cannot be combined with an assignment in aw_context");
+    assignment = readWorkQueueAssignment({ work_queue: claim });
+  }
+  const normalized = { ...awContext };
+  delete normalized.work_claim;
+  if (assignment) normalized.work_queue = assignment;
+  return normalized;
+}
+
+/**
  * Builds the aw_context object that identifies the calling workflow run.
- * This metadata is injected into dispatched workflows that declare an
- * aw_context input, allowing them to trace back to their caller and
+ * This metadata is injected into compiler-managed dispatched workflows,
+ * allowing them to trace back to their caller and
  * resolve the current item (issue, pull request, discussion, check, etc.)
  * that triggered the calling workflow.
  *
@@ -357,4 +416,4 @@ function buildAwContext() {
   };
 }
 
-module.exports = { buildAwContext, buildWorkflowCallId, resolveItemContext, parseInboundAwContext };
+module.exports = { buildAwContext, buildWorkflowCallId, resolveItemContext, parseInboundAwContext, readInboundAwContext, readInboundWorkQueueAssignment, readWorkQueueAssignment, normalizeWorkQueueContext };

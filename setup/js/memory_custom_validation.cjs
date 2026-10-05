@@ -112,8 +112,9 @@ function boundedOutput(output) {
 /**
  * @param {string} dirPath
  * @param {number} maxFileSize
+ * @param {(relativePath: string) => boolean} [isEligibleFile]
  */
-function formatJSONFiles(dirPath, maxFileSize) {
+function formatJSONFiles(dirPath, maxFileSize, isEligibleFile = () => true) {
   if (!fs.existsSync(dirPath)) {
     return [];
   }
@@ -122,18 +123,20 @@ function formatJSONFiles(dirPath, maxFileSize) {
 
   /**
    * @param {string} currentDir
+   * @param {string} relativePath
    */
-  function visit(currentDir) {
+  function visit(currentDir, relativePath) {
     const entries = readDirectory(currentDir);
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
+      const relativeFilePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
       if (entry.isDirectory()) {
         if (entry.name !== ".git") {
-          visit(fullPath);
+          visit(fullPath, relativeFilePath);
         }
         continue;
       }
-      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+      if (!entry.isFile() || !entry.name.endsWith(".json") || !isEligibleFile(relativeFilePath.replace(/\\/g, "/"))) {
         continue;
       }
       const raw = readFile(fullPath, "utf8");
@@ -159,7 +162,7 @@ function formatJSONFiles(dirPath, maxFileSize) {
     }
   }
 
-  visit(dirPath);
+  visit(dirPath, "");
   return formattedFiles;
 }
 
@@ -240,10 +243,34 @@ function runCustomMemoryValidation(options) {
   const timeoutSeconds = typeof rawTimeoutSeconds === "number" && Number.isFinite(rawTimeoutSeconds) && rawTimeoutSeconds > 0 ? Math.floor(rawTimeoutSeconds) : DEFAULT_VALIDATION_TIMEOUT_SECONDS;
   const timeoutMs = timeoutSeconds * 1000;
   const memoryId = options.memoryId || "default";
+  const validationDir = makeTempDirectory();
+  const validationMemoryDir = path.join(validationDir, "memory");
+  const scriptPath = path.join(validationDir, "validator.cjs");
+  try {
+    fs.cpSync(options.memoryDir, validationMemoryDir, {
+      recursive: true,
+      dereference: true,
+      filter: sourcePath => {
+        const relativePath = path.relative(options.memoryDir, sourcePath);
+        return relativePath === "" || relativePath.split(path.sep)[0] !== ".git";
+      },
+    });
+  } catch (error) {
+    removePath(validationDir, { recursive: true, force: true });
+    return {
+      ok: false,
+      exitCode: null,
+      timedOut: false,
+      stdout: "",
+      stderr: `Unable to prepare memory for custom validation: ${getErrorMessage(error)}`,
+    };
+  }
+
   let beforeDigest;
   try {
-    beforeDigest = memoryTreeDigest(options.memoryDir);
+    beforeDigest = memoryTreeDigest(validationMemoryDir);
   } catch (error) {
+    removePath(validationDir, { recursive: true, force: true });
     return {
       ok: false,
       exitCode: null,
@@ -252,12 +279,11 @@ function runCustomMemoryValidation(options) {
       stderr: `Unable to snapshot memory before custom validation: ${getErrorMessage(error)}`,
     };
   }
-  const validationDir = makeTempDirectory();
-  const scriptPath = path.join(validationDir, "validator.cjs");
+
   const wrapper = `"use strict";
 const fs = require("fs");
 const path = require("path");
-const memoryRoot = ${JSON.stringify(options.memoryDir)};
+const memoryRoot = ${JSON.stringify(validationMemoryDir)};
 const memoryDir = memoryRoot;
 const memoryId = ${JSON.stringify(memoryId)};
 const memoryKind = ${JSON.stringify(options.kind)};
@@ -281,10 +307,10 @@ ${script}
     process.exit(1);
   });
 `;
-  writeFile(scriptPath, wrapper, { encoding: "utf8", mode: 0o600 });
   try {
+    writeFile(scriptPath, wrapper, { encoding: "utf8", mode: 0o600 });
     const result = childProcess.spawnSync(process.execPath, [scriptPath], {
-      cwd: options.memoryDir,
+      cwd: validationMemoryDir,
       encoding: "utf8",
       env: sanitizedValidationEnv(process.env),
       timeout: timeoutMs,
@@ -295,7 +321,7 @@ ${script}
     let memoryChanged = false;
     let snapshotError = "";
     try {
-      memoryChanged = beforeDigest !== memoryTreeDigest(options.memoryDir);
+      memoryChanged = beforeDigest !== memoryTreeDigest(validationMemoryDir);
     } catch (error) {
       snapshotError = `Unable to snapshot memory after custom validation: ${getErrorMessage(error)}`;
     }
