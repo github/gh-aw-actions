@@ -7,6 +7,32 @@
 const { normalizeAgentSession, createSessionEvent, accumulateSessionUsage, isTokenCount, isMetric } = require("./agent_session.cjs");
 const { isDeepStrictEqual } = require("node:util");
 
+const COPILOT_CONVERSATION_EVENT_TYPES = new Set(["assistant.message", "assistant.message_delta", "user.message", "tool.execution_start", "tool.execution_complete"]);
+
+/**
+ * @param {Array<any>} events
+ * @returns {boolean}
+ */
+function hasCopilotConversation(events) {
+  return events.some(event => COPILOT_CONVERSATION_EVENT_TYPES.has(event?.type));
+}
+
+/**
+ * @param {string} content
+ * @returns {boolean}
+ */
+function hasMalformedJsonl(content) {
+  return content.split(/\r?\n/).some(line => {
+    if (!line.trim()) return false;
+    try {
+      JSON.parse(line);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+}
+
 /**
  * Copilot persists lifecycle events but emits assistant.usage only on the live
  * transport. Keep those observations and project their accounting separately.
@@ -25,7 +51,21 @@ function normalizeCopilotSession(entries) {
   const projections = new Map();
   const projectionKey = (label, event) => JSON.stringify([label, event.type, event.id, event.timestamp]);
   const projectionData = data => Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined));
-  const projectionEvidence = event => projectionData({ ...event, data: projectionData(event.data) });
+  /** @param {unknown} value @returns {unknown} */
+  const projectionProvenance = value => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => !["index", "timestampMs", "persistedPath"].includes(key))
+        .map(([key, nested]) => [key, key === "native" ? projectionProvenance(nested) : nested])
+    );
+  };
+  const projectionEvidence = event =>
+    projectionData({
+      ...event,
+      data: projectionData(event.data),
+      ...(Object.hasOwn(event, "provenance") ? { provenance: projectionProvenance(event.provenance) } : {}),
+    });
   for (const event of source) {
     if (!event.copilotProjection) continue;
     const key = projectionKey(event.copilotProjection, event);
@@ -45,6 +85,41 @@ function normalizeCopilotSession(entries) {
       .map(event => event.data.messageId)
       .filter(id => id !== undefined)
   );
+  const summaryScopes = [];
+  const sourceSessions = new Map();
+  const originScopes = new Map();
+  const summaryMessages = new Map();
+  const emittedMessages = new Map();
+  const summaryDeltas = new Map();
+  const retainedSummaries = new Set();
+  for (const [index, event] of source.entries()) {
+    const provenance = event.provenance && typeof event.provenance === "object" ? event.provenance : {};
+    const sourceKey = JSON.stringify(["phase" in provenance ? provenance.phase : undefined, "path" in provenance ? provenance.path : undefined, event.agentId]);
+    if (["session.start", "session.init"].includes(event.type) && event.data.sessionId !== undefined) sourceSessions.set(sourceKey, event.data.sessionId);
+    const originKey = JSON.stringify([sourceKey, event.id, event.timestamp]);
+    const observedScope = JSON.stringify([sourceKey, event.session_id ?? sourceSessions.get(sourceKey)]);
+    const scope = event.copilotProjection && event.id !== undefined ? (originScopes.get(originKey) ?? observedScope) : observedScope;
+    summaryScopes[index] = scope;
+    if (!event.copilotProjection && event.id !== undefined) originScopes.set(originKey, scope);
+    if (event.type === "assistant.message_delta" && typeof event.data.deltaContent === "string") {
+      const identity = JSON.stringify([scope, event.data.messageId ?? index]);
+      const previous = summaryDeltas.get(identity);
+      summaryDeltas.set(identity, { scope, content: (previous?.content ?? "") + event.data.deltaContent });
+    }
+    if (event.type !== "assistant.message" || typeof event.data.content !== "string") continue;
+    if (!summaryMessages.has(scope)) summaryMessages.set(scope, new Set());
+    summaryMessages.get(scope).add(event.data.content);
+    if (event.copilotProjection !== "session.task_complete") {
+      if (!emittedMessages.has(scope)) emittedMessages.set(scope, new Set());
+      emittedMessages.get(scope).add(event.data.content);
+    }
+  }
+  for (const { scope, content } of summaryDeltas.values()) {
+    if (!summaryMessages.has(scope)) summaryMessages.set(scope, new Set());
+    summaryMessages.get(scope).add(content);
+    if (!emittedMessages.has(scope)) emittedMessages.set(scope, new Set());
+    emittedMessages.get(scope).add(content);
+  }
   let sessionId;
   let finalizedTurns = 0;
   let hasTurnResult = false;
@@ -53,6 +128,12 @@ function normalizeCopilotSession(entries) {
     const event = source[index];
     /** @type {Record<string, any>} */
     const data = event.data;
+    const summaryScope = summaryScopes[index];
+    if (event.type === "assistant.message" && event.copilotProjection === "session.task_complete") {
+      const identity = JSON.stringify([summaryScope, data.content]);
+      if (emittedMessages.get(summaryScope)?.has(data.content) || retainedSummaries.has(identity)) continue;
+      retainedSummaries.add(identity);
+    }
     events.push(event);
     /**
      * @template {SessionEvent["type"]} T
@@ -100,6 +181,14 @@ function normalizeCopilotSession(entries) {
       project("assistant.reasoning", { content: data.reasoningText });
     } else if (event.type === "assistant.message_delta" && typeof data.deltaContent === "string" && !snapshots.has(data.messageId)) {
       project("assistant.message", { content: data.deltaContent });
+    } else if (event.type === "session.task_complete" && typeof data.summary === "string" && data.summary.trim()) {
+      const messages = summaryMessages.get(summaryScope) ?? new Set();
+      if (!messages.has(data.summary)) {
+        project("assistant.message", { content: data.summary });
+        messages.add(data.summary);
+        summaryMessages.set(summaryScope, messages);
+        retainedSummaries.add(JSON.stringify([summaryScope, data.summary]));
+      }
     } else if (event.type === "assistant.turn_end") {
       const identity = data.turnId !== undefined ? JSON.stringify([sessionId, event.agentId, data.turnId]) : event.id;
       if (identity === undefined || !turns.has(identity)) {
@@ -167,4 +256,4 @@ function copilotUsage(data) {
   return usage;
 }
 
-module.exports = { normalizeCopilotSession };
+module.exports = { hasCopilotConversation, hasMalformedJsonl, normalizeCopilotSession };
