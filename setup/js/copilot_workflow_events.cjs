@@ -17,9 +17,12 @@ const COPILOT_WORKFLOW_EVENT_FIELDS = {
     toolCallId: ["toolCallId"],
     agentName: ["agentName"],
     agentDisplayName: ["agentDisplayName"],
+    agentType: ["agentType"],
     parentId: ["parentId"],
     model: ["model"],
+    modelSelectionSource: ["modelSelectionSource"],
     executionMode: ["executionMode"],
+    spawnDepth: ["spawnDepth", "spawn_depth"],
   },
   "subagent.configured": { model: ["model"], contextTier: ["contextTier"], reasoningEffort: ["reasoningEffort"], multiTurn: ["multiTurn"] },
   "subagent.completed": {
@@ -27,12 +30,13 @@ const COPILOT_WORKFLOW_EVENT_FIELDS = {
     agentName: ["agentName"],
     agentDisplayName: ["agentDisplayName"],
     model: ["model"],
+    firstDispatchedModel: ["firstDispatchedModel"],
     durationMs: ["durationMs"],
     totalTokens: ["totalTokens"],
     totalToolCalls: ["totalToolCalls"],
     cancelled: ["cancelled"],
   },
-  "subagent.failed": { toolCallId: ["toolCallId"], agentName: ["agentName"], model: ["model"], durationMs: ["durationMs"], error: ["error"] },
+  "subagent.failed": { toolCallId: ["toolCallId"], agentName: ["agentName"], model: ["model"], durationMs: ["durationMs"], totalTokens: ["totalTokens"], totalToolCalls: ["totalToolCalls"], error: ["error"] },
 };
 
 const COPILOT_WORKFLOW_EVENT_TYPES = new Set(Object.keys(COPILOT_WORKFLOW_EVENT_FIELDS));

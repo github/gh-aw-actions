@@ -5,6 +5,9 @@
 const { computeInferenceAIC, findModelPricing } = require("./model_costs.cjs");
 const { COPILOT_WORKFLOW_EVENT_FIELDS } = require("./copilot_workflow_events.cjs");
 const { DYNAMIC_WORKFLOW_EVENT_TYPES } = require("./dynamic_workflow_session.cjs");
+const { sessionContext } = require("./agent_session.cjs");
+
+const SCOPED_AGENT_TYPES = new Set(["session.init", "session.start", "user.message", "assistant.message", "assistant.reasoning", "assistant.refusal", "tool.execution_start", "tool.execution_complete", "session.result"]);
 
 /** @type {Fields} */
 const USAGE_FIELDS = {
@@ -88,6 +91,11 @@ const MESSAGE_FIELDS = {
   sessionId: ["sessionId", "session_id"],
   agentId: ["agentId"],
   parentToolUseId: ["parentToolUseId", "parent_tool_use_id"],
+  model: ["model"],
+  apiCallId: ["apiCallId"],
+  interactionId: ["interactionId"],
+  turnId: ["turnId"],
+  parentToolCallId: ["parentToolCallId"],
 };
 
 /** @type {Fields} */
@@ -106,8 +114,8 @@ const EVENT_FIELDS = {
   ...COPILOT_WORKFLOW_EVENT_FIELDS,
   "session.format": { version: ["version"] },
   "agent.execution": { categories: ["categories"], errorCodes: ["errorCodes"], errorTypes: ["errorTypes"], exitCode: ["exitCode", "exit_code"] },
-  "session.init": { sourceEngine: ["sourceEngine"], model: ["model"], sessionId: ["sessionId", "session_id"], cwd: ["cwd"] },
-  "user.message": { content: ["content"] },
+  "session.init": { sourceEngine: ["sourceEngine"], model: ["model", "selectedModel"], sessionId: ["sessionId", "session_id"], cwd: ["cwd"], reasoningEffort: ["reasoningEffort"] },
+  "user.message": MESSAGE_FIELDS,
   "prompt.system": { content: ["content"] },
   "prompt.user": { content: ["content"] },
   "assistant.message": MESSAGE_FIELDS,
@@ -129,6 +137,7 @@ const EVENT_FIELDS = {
     workflowRunId: ["workflowRunId"],
   },
   "session.result": {
+    sourceEngine: ["sourceEngine"],
     numTurns: ["numTurns", "num_turns"],
     durationMs: ["durationMs", "duration_ms"],
     totalCostUsd: ["totalCostUsd", "total_cost_usd"],
@@ -136,6 +145,7 @@ const EVENT_FIELDS = {
     sourceType: ["sourceType"],
     errors: ["errors"],
     permissionDenials: ["permissionDenials", "permission_denials"],
+    agentMetrics: ["agentMetrics"],
   },
   "mcp.rpc.request": MCP_FIELDS,
   "mcp.rpc.response": MCP_FIELDS,
@@ -267,6 +277,9 @@ function normalizeUnifiedSessionEvent(event, phase) {
   const source = event.data;
   const known = Object.hasOwn(EVENT_FIELDS, event.type);
   const data = known ? selectFields(source, EVENT_FIELDS[event.type]) : structuredClone(source);
+  if (SCOPED_AGENT_TYPES.has(event.type) || (Object.hasOwn(COPILOT_WORKFLOW_EVENT_FIELDS, event.type) && event.type.startsWith("subagent."))) {
+    for (const [key, value] of Object.entries(sessionContext(event))) if (!Object.hasOwn(data, key)) data[key] = value;
+  }
   if (known && event.type.startsWith("dynamicWorkflows.")) {
     if (!Object.hasOwn(data, "status") && source.patch?.status !== undefined) data.status = structuredClone(source.patch.status);
     const usage = selectFields(source.usage, { totalTokens: ["totalTokens", "total_tokens"], toolUses: ["toolUses", "tool_uses"], durationMs: ["durationMs", "duration_ms"] });
@@ -290,7 +303,7 @@ function normalizeUnifiedSessionEvent(event, phase) {
       );
     }
   }
-  if (event.type === "assistant.message" || event.type === "assistant.reasoning") {
+  if (event.type === "user.message" || event.type === "assistant.message" || event.type === "assistant.reasoning") {
     const metadata = selectFields(event, MESSAGE_FIELDS);
     delete metadata.content;
     for (const [key, value] of Object.entries(metadata)) if (!Object.hasOwn(data, key)) data[key] = value;
