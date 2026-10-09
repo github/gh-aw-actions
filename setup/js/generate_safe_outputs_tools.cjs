@@ -46,6 +46,8 @@ const ADD_LABELS_STRICT_FIELD_DESC =
   'Labels to add. Each label must be an object with required fields: name (string), rationale (string, max 280 chars), and confidence (exactly one of: LOW, MEDIUM, HIGH). Plain string label names are not permitted. Example: [{"name": "bug", "rationale": "The report describes reproducible incorrect behavior.", "confidence": "HIGH"}]. Labels must exist in the repository.';
 const ADD_LABELS_OPTIONAL_FIELD_DESC =
   'Labels to add. Prefer structured label objects: {"name": "bug", "rationale": "The report describes reproducible incorrect behavior.", "confidence": "HIGH", "suggest": true}. Plain strings are also accepted for compatibility. Include rationale (string, max 280 chars) and confidence (LOW, MEDIUM, or HIGH) to improve transparency; use suggest: true to route for human review. Labels must exist in the repository.';
+const ADD_LABELS_OBJECT_ONLY_FIELD_DESC = "Labels to add. Each label must be an object matching the configured item schema; plain string label names are not permitted. Labels must exist in the repository.";
+const ADD_LABELS_STRING_ONLY_FIELD_DESC = "Labels to add. Each label must be a plain string matching the configured item schema. Labels must exist in the repository.";
 const ASSIGN_TO_AGENT_EXAMPLE_USAGE_REGEX = /Example usage: assign_to_agent\([^)]+\)(?: or assign_to_agent\([^)]+\))?/g;
 const ASSIGN_TO_AGENT_STRICT_EXAMPLE_USAGE =
   'Example usage: assign_to_agent(issue_number=123, agent="copilot", rationale="Delegate this coding task to the agent.", confidence="HIGH") or assign_to_agent(pull_number=456, agent="copilot", pull_request_repo="owner/repo", rationale="The agent should implement this PR fix.", confidence="HIGH")';
@@ -286,7 +288,7 @@ async function main() {
   }
 
   // Load tools meta (description suffixes, repo params, dynamic tools)
-  /** @type {{description_suffixes?: Record<string, string>, repo_params?: Record<string, {type: string, description: string}>, dynamic_tools?: Array<unknown>, required_field_removals?: Record<string, string[]>, required_field_additions?: Record<string, string[]>, property_injections?: Record<string, Record<string, unknown>>}} */
+  /** @type {{work_queue_scoped?: boolean, description_suffixes?: Record<string, string>, repo_params?: Record<string, {type: string, description: string}>, dynamic_tools?: Array<any>, required_field_removals?: Record<string, string[]>, required_field_additions?: Record<string, string[]>, property_injections?: Record<string, Record<string, unknown>>, item_schemas?: Record<string, Record<string, unknown>>}} */
   let toolsMeta = { description_suffixes: {}, repo_params: {}, dynamic_tools: [] };
   if (fs.existsSync(toolsMetaPath)) {
     /** @type {string} */
@@ -315,6 +317,12 @@ async function main() {
       .map(normalizeToolName)
       .filter(name => sourceToolNames.has(name))
   );
+  /** @type {{ledger_append?: {ledgers?: Array<{name: string, type?: string}>}}} */
+  const ledgerConfig = config;
+  const configuredLedgers = ledgerConfig.ledger_append?.ledgers;
+  if (Array.isArray(configuredLedgers) && configuredLedgers.length > 0 && configuredLedgers.every(ledger => ledger.type === "map")) {
+    enabledToolNames.delete("ledger_append");
+  }
   // Filter predefined tools to those enabled in config and apply enhancements
   const filteredTools = allTools
     .filter(tool => enabledToolNames.has(normalizeToolName(tool.name)))
@@ -328,6 +336,15 @@ async function main() {
         enhancedTool = structuredClone(tool);
       } catch (err) {
         throw new Error(`${ERR_CONFIG}: ` + "Failed to deep-copy tool " + tool.name + ": " + getErrorMessage(err), { cause: err });
+      }
+      if (tool.name === "ledger_append" && Array.isArray(configuredLedgers)) {
+        const generalNames = configuredLedgers.filter(ledger => ledger.type !== "map").map(ledger => ledger.name);
+        if (generalNames.length < configuredLedgers.length) {
+          enhancedTool.inputSchema.properties.ledger.enum = generalNames;
+          if (configuredLedgers.length > 1) {
+            enhancedTool.inputSchema.required = [...new Set([...(enhancedTool.inputSchema.required || []), "ledger"])];
+          }
+        }
       }
 
       // Apply description suffix if available (e.g., " CONSTRAINTS: Maximum 5 issues.")
@@ -445,6 +462,31 @@ async function main() {
         }
       }
 
+      const itemSchemas = toolsMeta.item_schemas?.[tool.name];
+      if (itemSchemas && typeof itemSchemas === "object") {
+        for (const [propertyName, itemSchema] of Object.entries(itemSchemas)) {
+          const propertySchema = enhancedTool.inputSchema?.properties?.[propertyName];
+          if (propertySchema?.type === "array") {
+            propertySchema.items = itemSchema;
+            if (tool.name === "add_labels" && propertyName === "labels") {
+              /** @type {{type?: unknown, properties?: Record<string, unknown>, required?: unknown}} */
+              const configuredItemSchema = itemSchema && typeof itemSchema === "object" ? itemSchema : {};
+              if (configuredItemSchema.type === "object") {
+                propertySchema.description = isIssueIntentEnabledForTool(tool.name, config[tool.name]) ? ADD_LABELS_STRICT_FIELD_DESC : ADD_LABELS_OBJECT_ONLY_FIELD_DESC;
+                const itemProperties = configuredItemSchema.properties && typeof configuredItemSchema.properties === "object" ? configuredItemSchema.properties : {};
+                const required = Array.isArray(configuredItemSchema.required) ? configuredItemSchema.required : [];
+                if (!isIssueIntentEnabledForTool(tool.name, config[tool.name]) && (!("rationale" in itemProperties) || !("confidence" in itemProperties) || required.includes("rationale") || required.includes("confidence"))) {
+                  enhancedTool.description = (enhancedTool.description || "").replace(ISSUE_INTENT_OPTIONAL_SUFFIX, "").trim();
+                }
+              } else if (configuredItemSchema.type === "string") {
+                propertySchema.description = ADD_LABELS_STRING_ONLY_FIELD_DESC;
+                enhancedTool.description = (enhancedTool.description || "").replace(ISSUE_INTENT_OPTIONAL_SUFFIX, "").trim();
+              }
+            }
+          }
+        }
+      }
+
       applyAssignMilestoneAlternativeRequirements(enhancedTool);
 
       return enhancedTool;
@@ -453,6 +495,19 @@ async function main() {
   // Append dynamic tools (custom jobs, dispatch_workflow, call_workflow)
   const dynamicTools = Array.isArray(toolsMeta.dynamic_tools) ? toolsMeta.dynamic_tools : [];
   const allFilteredTools = [...filteredTools, ...dynamicTools];
+  if (toolsMeta.work_queue_scoped === true) {
+    for (const tool of allFilteredTools) {
+      tool.inputSchema.properties ||= {};
+      if (Object.prototype.hasOwnProperty.call(tool.inputSchema.properties, "claim_handle")) throw new Error(`${ERR_CONFIG}: claim_handle is reserved for trusted queue scope`);
+      tool.inputSchema.properties.claim_handle = {
+        type: "string",
+        minLength: 1,
+        maxLength: 256,
+        "x-preserve-blank": true,
+        description: "Immutable assignment Claim handle. May be omitted only for an originally single-Claim assignment. Explicit blank or foreign handles are rejected.",
+      };
+    }
+  }
 
   // Write the result to the output path
   try {

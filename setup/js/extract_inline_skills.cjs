@@ -34,6 +34,7 @@
 const fs = require("fs");
 const path = require("path");
 const { collectInlineEndMarkers, unknownInlineEndMarkerError } = require("./inline_marker_helpers.cjs");
+const { inlineArtifactTarget } = require("./inline_artifact_target.cjs");
 
 // Supported frontmatter fields for inline skills.
 // Any other field is stripped with a warning.
@@ -303,7 +304,7 @@ function closeUnterminatedSkillMarkers(content) {
  *
  * Each AI engine stores its skill definitions in a different location:
  *   claude   → .claude/skills/<name>.md
- *   codex    → .codex/skills/<name>.md
+ *   codex    → .codex/skills/<name>/SKILL.md
  *   gemini   → .gemini/skills/<name>.md
  *   copilot  → .github/skills/<name>/SKILL.md  (default)
  *   others   → .github/skills/<name>/SKILL.md  (fallback)
@@ -316,9 +317,11 @@ function getEngineSkillTarget(engineId) {
     case "claude":
       return { dir: ".claude/skills", ext: ".md" };
     case "codex":
-      return { dir: ".codex/skills", ext: ".md" };
+      return { dir: ".codex/skills", ext: "/SKILL.md" };
     case "gemini":
       return { dir: ".gemini/skills", ext: ".md" };
+    case "pi":
+      return { dir: ".pi/skills", ext: "/SKILL.md" };
     default:
       return { dir: ".github/skills", ext: "/SKILL.md" };
   }
@@ -330,7 +333,7 @@ function getEngineSkillTarget(engineId) {
  *
  * The target directory and filename extension are determined by engineId:
  *   - claude  → <base>/.claude/skills/<name>.md
- *   - codex   → <base>/.codex/skills/<name>.md
+ *   - codex   → <base>/.codex/skills/<name>/SKILL.md
  *   - gemini  → <base>/.gemini/skills/<name>.md
  *   - default → <base>/.github/skills/<name>/SKILL.md
  *
@@ -359,7 +362,7 @@ function writeInlineSkills(content, workspaceDir, skillsBaseDir, engineId) {
   }
 
   const baseDir = skillsBaseDir || workspaceDir;
-  const { dir, ext } = getEngineSkillTarget(engineId);
+  const { dir, ext } = inlineArtifactTarget("SKILL", getEngineSkillTarget(engineId));
   const skillsDir = path.join(baseDir, dir);
   core.info(`[extractInlineSkills] Engine: "${engineId || "(default)"}" → dir="${dir}" ext="${ext}"`);
   core.info(`[extractInlineSkills] Writing ${skills.length} skill(s) to: ${skillsDir}`);

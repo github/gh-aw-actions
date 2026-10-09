@@ -5,13 +5,12 @@
  *
  * Wraps the OpenAI Codex CLI command with retry logic for failures that occur after the
  * session has been partially executed.  Passes all arguments to the codex subprocess,
- * forwarding stdout/stderr; stdin is closed since the prompt is delivered via
- * --prompt-file, not stdin.
+ * forwarding stdout/stderr and delivering --prompt-file contents through stdin.
  *
  * Retry policy:
  *   - If the process produced any output (hasOutput) and exits with a non-zero code, the
- *     session is considered partially executed.  The driver retries with a fresh run
- *     because Codex does not support a --continue-style session resumption.
+ *     session is considered partially executed. Eligible retries resume the exact observed
+ *     thread; failures after staged task output are never replayed.
  *   - Rate-limit errors (HTTP 429 / "rate_limit_exceeded") and server errors (HTTP 500,
  *     503) are well-known transient failure modes and are logged explicitly, but
  *     any partial-execution failure is retried — not just those specific errors.
@@ -24,8 +23,7 @@
  *
  * Prompt handling:
  *   - The harness expects a `--prompt-file <path>` argument in the args list.
- *   - It reads the file and appends the content as the last positional argument, which is
- *     where the Codex CLI (`codex exec`) expects the prompt.
+ *   - It reads the file and supplies `-` as the prompt argument, passing contents through stdin.
  *   - The `--prompt-file` flag is a harness-only argument and is not forwarded to codex.
  *
  * Usage: node codex_harness.cjs <command> [args...]
@@ -36,6 +34,9 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const fs = require("fs");
+const { DEFAULT_MCP_CALL_WATCHDOG_MS, MCP_CALL_TRANSPORT_GRACE_MS } = require("./constants.cjs");
+const { loadCompiledConfig, mergeConfig } = require("./codex_config.cjs");
+const { parseJsonPrefix } = require("./parse_json_prefix.cjs");
 const { runProcess, formatDuration, sleep, MIN_POST_RESULT_WATCHDOG_TIMEOUT_MS, DEFAULT_POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS, MAX_POST_RESULT_WATCHDOG_TIMEOUT_MS, resolvePostResultWatchdogIdleTimeoutMs } = require("./process_runner.cjs");
 const { runHarnessRetryLoop, shouldSkipForNoopSafeOutputs, shouldStopForNoopSafeOutputs } = require("./harness_retry_runner.cjs");
 const {
@@ -56,9 +57,11 @@ const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractD
 const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal, isAuthenticationFailedError, parseAICreditsExceededProxyRejection } = require("./harness_retry_guard.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
 const { resolveRetryConfig } = require("./harness_retry_config.cjs");
-const { applyModelFallback, injectModelFlagAfterExec } = require("./model_fallback.cjs");
+const { applyModelFallback, injectModelFlagAfterExec, normalizeCodexModel, normalizeCodexModelArgs } = require("./model_fallback.cjs");
 const { parseMaxAICreditsExceededFromAuditLog } = require("./ai_credits_context.cjs");
 const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
+const { resolveAWFModelRoutingSelection, mapAWFRoutingEffort, recordAWFModelRoutingOutcome, getAWFModelRoutingPolicy } = require("./awf_model_routing.cjs");
+const CODEX_ROUTING_POLICY = getAWFModelRoutingPolicy("codex");
 
 // Pattern to detect OpenAI rate-limit errors.
 // Matches the JSON error type field ("rate_limit_exceeded"), the HTTP status code
@@ -88,11 +91,68 @@ const MISSING_API_KEY_PATTERN = /Missing environment variable:\s*`?(?:CODEX_API_
 // These are transient infrastructure failures that may resolve on retry.
 const SERVER_ERROR_PATTERN = /InternalServerError|ServiceUnavailableError|500 Internal Server Error|503 Service Unavailable/i;
 
-// Pattern to detect deterministic request-validation failures (HTTP 400 `invalid_request_error`)
+// Pattern to detect deterministic request-validation failures (HTTP 400 `invalid_request_error`
+// or `invalid_request_body`, including invalid replayed item IDs during resume)
 // within Codex's outer `turn.failed` event. The provider rejects the serialized request itself
 // (e.g. `"code": "empty_array"` on `messages[N].content`), so an identical fresh run produces
 // an identical rejection: retrying only re-bills the turns that succeeded before the failure point.
-const INVALID_REQUEST_ERROR_PATTERN = /invalid_request_error/i;
+const INVALID_REQUEST_ERROR_PATTERN = /invalid_request_(?:error|body)/i;
+
+function resolveMCPServerToolTimeouts(config, runtimeToolTimeoutSeconds) {
+  const configuredServers = config.defaults?.mcp_servers && typeof config.defaults.mcp_servers === "object" ? config.defaults.mcp_servers : {};
+  const defaults = {
+    ...config.defaults,
+    mcp_servers: Object.fromEntries(
+      Object.entries(configuredServers).map(([name, value]) => [
+        name,
+        typeof value === "object" && value !== null && !Array.isArray(value)
+          ? { ...value, ...(Number.isSafeInteger(runtimeToolTimeoutSeconds) && runtimeToolTimeoutSeconds > 0 ? { tool_timeout_sec: runtimeToolTimeoutSeconds } : {}) }
+          : value,
+      ])
+    ),
+  };
+  const effectiveServers = mergeConfig(defaults, config.overrides || {}).mcp_servers || {};
+  return Object.fromEntries(
+    Object.entries(effectiveServers).flatMap(([name, value]) => (typeof value?.tool_timeout_sec === "number" && Number.isSafeInteger(value.tool_timeout_sec) && value.tool_timeout_sec > 0 ? [[name, value.tool_timeout_sec]] : []))
+  );
+}
+
+function createMCPCallWatchdog(timeoutMs, now = Date.now) {
+  const pending = new Map();
+  function track(eventType, item) {
+    if (item?.type !== "mcp_tool_call" || typeof item.id !== "string") return;
+    if (eventType === "item.started") {
+      const callTimeoutMs = typeof timeoutMs === "function" ? timeoutMs(item) : timeoutMs;
+      pending.set(item.id, { startedAt: now(), timeoutMs: Number.isSafeInteger(callTimeoutMs) && callTimeoutMs > 0 ? callTimeoutMs : DEFAULT_MCP_CALL_WATCHDOG_MS });
+    }
+    if (eventType === "item.completed" || eventType === "item.failed") pending.delete(item.id);
+  }
+  return {
+    observe(line) {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+      track(event?.type, event?.item);
+    },
+    observePrefix(prefix) {
+      const event = parseJsonPrefix(prefix);
+      track(event?.type, event?.item);
+    },
+    expiredTimeoutMs() {
+      const current = now();
+      for (const call of pending.values()) {
+        if (current - call.startedAt >= call.timeoutMs) return call.timeoutMs;
+      }
+      return null;
+    },
+    expired() {
+      return this.expiredTimeoutMs() !== null;
+    },
+  };
+}
 
 // Codex's `turn.failed` event nests the actual provider error as a JSON string inside
 // `error.message` (sometimes doubly-nested, e.g. `error.message` -> `{"error": {...}}`).
@@ -242,21 +302,32 @@ function isInvalidModelError(output) {
 
 /**
  * Determines if Codex emitted a `turn.failed` provider event containing a deterministic
- * request-validation failure (HTTP 400 `invalid_request_error`). Such schema-level rejections
- * can never succeed on a fresh run with the same input, so they are treated as terminal.
+ * request-validation failure (HTTP 400 `invalid_request_error` or `invalid_request_body`).
+ * Such schema-level rejections cannot succeed by replaying the same request or session.
  * Tokens in agent transcripts and tool responses are intentionally ignored.
  * @param {string} output - Collected stdout+stderr from the process
  * @returns {boolean}
  */
 function isInvalidRequestError(output) {
-  return output.split(/\r?\n/).some(line => {
+  return extractInvalidRequestErrorCode(output) !== null;
+}
+
+/**
+ * @param {string} output
+ * @returns {string | null}
+ */
+function extractInvalidRequestErrorCode(output) {
+  for (const line of output.split(/\r?\n/)) {
     try {
       const event = JSON.parse(line);
-      return event?.type === "turn.failed" && event.error && INVALID_REQUEST_ERROR_PATTERN.test(JSON.stringify(event.error));
+      if (event?.type !== "turn.failed" || !event.error) continue;
+      const match = JSON.stringify(event.error).match(INVALID_REQUEST_ERROR_PATTERN);
+      if (match) return match[0].toLowerCase();
     } catch {
-      return false;
+      // Ignore non-JSON diagnostic lines.
     }
-  });
+  }
+  return null;
 }
 
 /**
@@ -345,6 +416,32 @@ function resolveCodexPromptFileArgs(args) {
 }
 
 /**
+ * Keep prompt contents out of argv. `-` is Codex's explicit stdin prompt.
+ * @param {string[]} args
+ * @returns {{ args: string[], stdin?: string }}
+ */
+function resolveCodexPromptInput(args) {
+  if (!args.includes("--prompt-file")) return { args };
+  if (args.at(-1) === "--prompt-file") throw new Error("--prompt-file requires a readable file path");
+  const resolved = resolveCodexPromptFileArgs(args);
+  const stdin = resolved.pop();
+  return { args: [...resolved, "-"], stdin };
+}
+
+/**
+ * Resume only an exact, observed thread that was allowed to persist.
+ * @param {string[]} args
+ * @param {string} threadId
+ * @returns {string[] | null}
+ */
+function buildCodexResumeArgs(args, threadId) {
+  if (args[0] !== "exec" || args.at(-1) !== "-" || args.some(arg => ["resume", "fork", "review", "--", "--ephemeral", "--last"].includes(arg)) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId))
+    return null;
+  // Exec-only options remain before the subcommand, preserving permissions and configuration.
+  return [...args.slice(0, -1), "resume", threadId, "-"];
+}
+
+/**
  * Inject `--json` after `exec` in the args list so that Codex streams structured
  * JSON Lines (JSONL) to stdout.  This enables machine-readable output for CI
  * pipelines without changing how stderr progress output works.
@@ -371,6 +468,73 @@ function getCodexModelEnvVar(env = process.env) {
     return "GH_AW_MODEL_AGENT_CODEX";
   }
   return "";
+}
+
+/**
+ * Remove fixed model and reasoning-effort settings before applying a routed selection.
+ * @param {string[]} args
+ * @returns {string[]}
+ */
+function removeCodexRoutingOverrides(args) {
+  const result = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--model" || arg === "-m") {
+      i++;
+      continue;
+    }
+    if (arg.startsWith("--model=") || arg.startsWith("-m=")) continue;
+    if ((arg === "-c" || arg === "--config") && /^model_reasoning_effort\s*=/.test(args[i + 1] || "")) {
+      i++;
+      continue;
+    }
+    if (/^--config=model_reasoning_effort\s*=/.test(arg)) continue;
+    result.push(arg);
+  }
+  return result;
+}
+
+/**
+ * Inject the router-selected Codex reasoning effort as a CLI config override.
+ * @param {string[]} args
+ * @param {string} effort
+ * @returns {string[]}
+ */
+function applyCodexRoutingEffort(args, effort) {
+  const execIndex = args.indexOf("exec");
+  const index = execIndex < 0 ? args.length : execIndex + 1;
+  return [...args.slice(0, index), "-c", `model_reasoning_effort="${effort}"`, ...args.slice(index)];
+}
+
+/**
+ * Resolve and apply AWF's selection to a Codex invocation.
+ * @param {any} reflectData
+ * @param {string[]} args
+ * @returns {{selection: any, model: string, args: string[], error: string|null}}
+ */
+function resolveCodexModelRouting(reflectData, args) {
+  const result = resolveAWFModelRoutingSelection(reflectData, true, CODEX_ROUTING_POLICY.endpoints, CODEX_ROUTING_POLICY.allowEndpointOverride);
+  if (result.error || !result.selection) {
+    recordAWFModelRoutingOutcome({ status: reflectData?.routing?.status === "failed" ? "failed" : "rejected", failure_code: reflectData?.routing?.failure_code, detail: result.error });
+    return { selection: null, model: "", args, error: result.error || "AWF model routing selection is missing" };
+  }
+  const mappedEffort = mapAWFRoutingEffort("codex", result.selection.effort);
+  if (mappedEffort.error) {
+    recordAWFModelRoutingOutcome({ status: "rejected", failure_code: "unsupported_effort", detail: mappedEffort.error });
+    return { selection: null, model: "", args, error: mappedEffort.error };
+  }
+  let routedArgs = removeCodexRoutingOverrides(args);
+  routedArgs = injectModelFlagAfterExec(routedArgs, result.selection.wire_model);
+  if (mappedEffort.effort) routedArgs = applyCodexRoutingEffort(routedArgs, mappedEffort.effort);
+  recordAWFModelRoutingOutcome({
+    status: "selected",
+    wire_model: result.selection.wire_model,
+    endpoint: result.selection.endpoint,
+    selected_endpoint: result.selection.selected_endpoint,
+    effort: result.selection.effort,
+    applied_effort: mappedEffort.effort,
+  });
+  return { selection: result.selection, model: result.selection.wire_model, args: routedArgs, error: null };
 }
 
 /**
@@ -530,7 +694,7 @@ function configureCodexProviderFromReflect(options) {
     log(`configured OPENAI_BASE_URL from /reflect for provider=${provider}: ${resolved.baseUrl}`);
     if (codexConfigPath) {
       const tomlContent = fs.readFileSync(codexConfigPath, "utf8");
-      const providerSectionPattern = /\[model_providers\.openai-proxy\][\s\S]*?(?:\n\[|$)/;
+      const providerSectionPattern = /\[model_providers\.openai-proxy\][\s\S]*?(?=\n\[|$)/;
       const baseLine = `base_url = "${resolved.baseUrl}"`;
       if (providerSectionPattern.test(tomlContent)) {
         const rewritten = tomlContent.replace(providerSectionPattern, section => {
@@ -660,9 +824,10 @@ function evaluateContextRebuildCircuitBreakerForAttempt(workingSet, config, opti
 
 /**
  * Main entry point: run codex with retry logic for transient API failures.
- * Codex does not support --continue session resumption, so all retries are fresh runs.
+ * Eligible retries use Codex's native exact-session resume command.
  */
 async function main() {
+  const driverStartTime = Date.now();
   const [, , command, ...args] = process.argv;
 
   if (!command) {
@@ -700,8 +865,10 @@ async function main() {
   // Resolve the prompt for the initial run (reads --prompt-file content).
   // A missing or unreadable prompt file is treated as a fatal startup error.
   let resolvedArgs;
+  let promptInput;
   try {
-    resolvedArgs = resolveCodexPromptFileArgs(args);
+    promptInput = resolveCodexPromptInput(args);
+    resolvedArgs = promptInput.args;
   } catch (err) {
     const e = /** @type {Error} */ err;
     log(`fatal: ${e.message}`);
@@ -709,25 +876,44 @@ async function main() {
   }
 
   const codexModelEnvVar = getCodexModelEnvVar(process.env);
-  const resolvedModel = codexModelEnvVar ? applyModelFallback(process.env, codexModelEnvVar, log) : "";
-  resolvedArgs = injectModelFlagAfterExec(resolvedArgs, resolvedModel);
+  const modelOptions = { env: process.env, logger: log };
+  const modelRoutingRequired = process.env.GH_AW_MODEL_ROUTING === "1";
+  /** @type {any} */
+  let reflectData = null;
+  if (process.env.AWF_REFLECT_ENABLED === "1" || modelRoutingRequired) {
+    const reflectResult = await fetchAWFReflect({ logger: log });
+    if (reflectResult.ok && reflectResult.reflectData) reflectData = reflectResult.reflectData;
+  }
+  let resolvedModel;
+  if (modelRoutingRequired) {
+    const result = resolveCodexModelRouting(reflectData, resolvedArgs);
+    if (result.error || !result.selection) {
+      log(`fatal: ${result.error || "AWF model routing selection is missing"}; refusing to start Codex`);
+      process.exit(1);
+      return;
+    }
+    resolvedModel = result.model;
+    resolvedArgs = result.args;
+    const endpointOverride = result.selection.selected_endpoint && result.selection.selected_endpoint !== result.selection.endpoint ? ` selected_endpoint=${result.selection.selected_endpoint}` : "";
+    log(`inference routing: mode=awf-routed model=${resolvedModel} effort=${result.selection.effort || "(unset)"} endpoint=${result.selection.endpoint}${endpointOverride}`);
+  } else {
+    resolvedModel = normalizeCodexModel(codexModelEnvVar ? applyModelFallback(process.env, codexModelEnvVar, log) : "", process.env.GH_AW_LLM_PROVIDER || "openai", modelOptions);
+    resolvedArgs = normalizeCodexModelArgs(resolvedArgs, process.env.GH_AW_LLM_PROVIDER || "openai", modelOptions);
+    resolvedArgs = injectModelFlagAfterExec(resolvedArgs, resolvedModel);
+  }
+  if (codexModelEnvVar && resolvedModel) {
+    process.env[codexModelEnvVar] = resolvedModel;
+    codexChildEnv[codexModelEnvVar] = resolvedModel;
+  }
 
-  // Safe arg list for logging: when --prompt-file was present, the last element of
-  // resolvedArgs is the resolved prompt content. Replace it with a placeholder so that
-  // task instructions are never written to stderr or captured in agent logs.
+  // Prompts remain on stdin; use a placeholder in the argument diagnostic.
   const hadPromptFile = args.includes("--prompt-file");
-  const safeArgs = hadPromptFile && resolvedArgs.length > 0 ? [...resolvedArgs.slice(0, -1), "<prompt omitted>"] : resolvedArgs;
+  const safeArgs = hadPromptFile && resolvedArgs.length > 0 ? [...resolvedArgs.slice(0, -1), "<prompt via stdin>"] : resolvedArgs;
 
   // Inject --json after `exec` to stream structured JSONL events to stdout, making
   // Codex output machine-readable in CI without affecting the stderr progress stream.
   resolvedArgs = injectJsonFlag(resolvedArgs);
 
-  // Fetch AWF API proxy reflection data before running the agent to capture initial proxy state.
-  // This is best-effort: failures are logged but do not affect the agent run.
-  // Skip when AWF_REFLECT_ENABLED is not "1" (e.g. no api-proxy running in sandbox or test mode).
-  if (process.env.AWF_REFLECT_ENABLED === "1") {
-    await fetchAWFReflect({ logger: log });
-  }
   const codexHome = process.env.CODEX_HOME || "";
   let codexEnv = codexChildEnv;
   const providerConfig = configureCodexProviderFromReflect({
@@ -751,13 +937,17 @@ async function main() {
   }
 
   let lastExitCode = 1;
-  const driverStartTime = Date.now();
-  // Soft-timeout guard: polled at the top of the retry loop and after each backoff sleep.
-  // It does not preempt a running attempt — if a single invocation runs past the soft
-  // deadline the guard fires on the next iteration. Individual attempts are expected to
-  // complete within the SOFT_TIMEOUT_BUFFER_MS window.
+  // The deadline includes preflight time and is checked both between and during attempts.
   const softTimeoutGuard = buildSoftTimeoutGuard(driverStartTime);
   const contextRebuildCircuitBreaker = resolveContextRebuildCircuitBreakerConfig(process.env);
+  const configuredToolTimeout = Number(codexEnv.GH_AW_TOOL_TIMEOUT);
+  const fallbackToolTimeoutMs = Number.isSafeInteger(configuredToolTimeout) && configuredToolTimeout > 0 ? configuredToolTimeout * 1000 + MCP_CALL_TRANSPORT_GRACE_MS : DEFAULT_MCP_CALL_WATCHDOG_MS;
+  const serverToolTimeouts = resolveMCPServerToolTimeouts(loadCompiledConfig(), configuredToolTimeout);
+  /** @type {string[] | null} */
+  let resumeArgs = null;
+  let lastThreadId = "";
+  const tokenUsagePaths = process.env.GH_AW_CODEX_TOKEN_USAGE_PATH ? [process.env.GH_AW_CODEX_TOKEN_USAGE_PATH] : TOKEN_USAGE_PATHS;
+  const resumePrompt = "Continue the interrupted task using the existing session. Preserve previously staged safe outputs; do not emit them again. Complete only unfinished work.";
   log(
     `context-rebuild circuit breaker: enabled=${contextRebuildCircuitBreaker.enabled}` +
       ` maxRebuildFactor=${contextRebuildCircuitBreaker.maxRebuildFactor}` +
@@ -773,34 +963,68 @@ async function main() {
     harnessName: "Codex harness",
     log,
     softTimeoutGuard,
-    getRetryMode: () => "fresh run",
+    getRetryMode: () => (resumeArgs ? `resume ${lastThreadId}` : "fresh run"),
     runAttempt: async attempt => {
+      const terminalErrors = [];
+      const mcpWatchdog = createMCPCallWatchdog(item => {
+        const server = item.server ?? item.server_name ?? item.serverName;
+        return serverToolTimeouts[server] ? serverToolTimeouts[server] * 1000 + MCP_CALL_TRANSPORT_GRACE_MS : fallbackToolTimeoutMs;
+      });
+      let nextContextCheckAt = Date.now() + contextRebuildCircuitBreaker.pollIntervalMs;
       // Track the file size before this attempt so the watchdog only arms on output
       // written by this attempt, not by a previous retry.
       const safeOutputsByteOffset = safeOutputsPath ? getSafeOutputsByteOffset(safeOutputsPath) : 0;
 
       const result = await runProcess({
         command,
-        args: resolvedArgs,
+        args: resumeArgs || resolvedArgs,
         attempt,
         log,
-        logArgs: safeArgs,
+        logArgs: resumeArgs ? [...resumeArgs.slice(0, -1), "<resume prompt via stdin>"] : safeArgs,
         env: codexEnv,
-        runtimeGuard: contextRebuildCircuitBreaker.enabled
-          ? {
-              pollIntervalMs: contextRebuildCircuitBreaker.pollIntervalMs,
-              termGraceMs: contextRebuildCircuitBreaker.termGraceMs,
-              shouldTerminate: async () =>
-                evaluateContextRebuildCircuitBreakerForAttempt(
-                  await readWorkingSetFromTokenUsage(TOKEN_USAGE_PATHS),
-                  {
-                    maxRebuildFactor: contextRebuildCircuitBreaker.maxRebuildFactor,
-                    minCumulativeInputTokens: contextRebuildCircuitBreaker.minCumulativeInputTokens,
-                  },
-                  { safeOutputsPath, safeOutputsByteOffset, logger: log }
-                ),
+        stdin: resumeArgs ? resumePrompt : promptInput.stdin,
+        maxCollectedOutputBytes: 4 * 1024 * 1024,
+        onStdoutLine: line => {
+          mcpWatchdog.observe(line);
+          try {
+            const event = JSON.parse(line);
+            if (event.type === "thread.started" && typeof event.thread_id === "string") lastThreadId = event.thread_id;
+            if (event.type === "turn.failed" || event.type === "error") {
+              terminalErrors.push(line);
+              if (terminalErrors.length > 8) terminalErrors.shift();
             }
-          : undefined,
+          } catch {}
+        },
+        onStdoutLinePrefix: prefix => mcpWatchdog.observePrefix(prefix),
+        runtimeGuard: {
+          pollIntervalMs: Math.min(contextRebuildCircuitBreaker.pollIntervalMs, 1000),
+          termGraceMs: contextRebuildCircuitBreaker.termGraceMs,
+          onTriggered: decision => {
+            if (decision.event) process.stdout.write(`${JSON.stringify(decision.event)}\n`);
+          },
+          shouldTerminate: async () => {
+            if (softTimeoutGuard && Date.now() >= softTimeoutGuard.softDeadlineMs) return { terminate: true, reason: "Codex reached the soft execution deadline; stopping to preserve structured output before the step timeout." };
+            const expiredMCPCallTimeoutMs = mcpWatchdog.expiredTimeoutMs();
+            if (expiredMCPCallTimeoutMs !== null) {
+              return {
+                terminate: true,
+                reason: `transport_wedge: MCP tool call timed out after ${Math.round(expiredMCPCallTimeoutMs / 1000)}s`,
+                event: { type: "agent.execution", data: { categories: ["transport_wedge"], errorCodes: [], errorTypes: [] } },
+              };
+            }
+            if (!contextRebuildCircuitBreaker.enabled) return false;
+            if (Date.now() < nextContextCheckAt) return false;
+            nextContextCheckAt = Date.now() + contextRebuildCircuitBreaker.pollIntervalMs;
+            return evaluateContextRebuildCircuitBreakerForAttempt(
+              await readWorkingSetFromTokenUsage(tokenUsagePaths),
+              {
+                maxRebuildFactor: contextRebuildCircuitBreaker.maxRebuildFactor,
+                minCumulativeInputTokens: contextRebuildCircuitBreaker.minCumulativeInputTokens,
+              },
+              { safeOutputsPath, safeOutputsByteOffset, logger: log }
+            );
+          },
+        },
         postResultWatchdog: safeOutputsPath
           ? {
               shouldArm: () =>
@@ -814,6 +1038,8 @@ async function main() {
             }
           : undefined,
       });
+      const missingErrors = terminalErrors.filter(line => !result.output.includes(line));
+      if (missingErrors.length) result.output = `${missingErrors.join("\n")}\n${result.output}`;
       // A guard-terminated run must never be reported as a success: Codex may handle SIGTERM
       // and exit cleanly, and `runHarnessRetryLoop` short-circuits on exitCode 0 before
       // `handleFailure` runs. Normalize the exit code so the failure handler always sees it.
@@ -857,7 +1083,8 @@ async function main() {
       const isServer = isServerError(result.output);
       const isInvalidModel = isInvalidModelError(result.output);
       const isUnsupportedModelTools = isUnsupportedModelToolsError(result.output);
-      const isInvalidRequest = isInvalidRequestError(result.output);
+      const invalidRequestErrorCode = extractInvalidRequestErrorCode(result.output);
+      const isInvalidRequest = invalidRequestErrorCode !== null;
       const permissionDeniedCount = countPermissionDeniedIssues(result.output);
       const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
       log(
@@ -884,6 +1111,12 @@ async function main() {
       }
 
       const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
+      if (nonRetryableGuard.apiProxyGuardRejection) {
+        const guard = nonRetryableGuard.apiProxyGuardRejection.guard;
+        emitInfrastructureIncomplete(`AWF API proxy rejected the request: ${guard}`, { logger: log });
+        log(`attempt ${attempt + 1}: ${guard} — not retrying (terminal proxy guard)`);
+        return { action: "stop" };
+      }
       const proxyAICreditsRejection = parseAICreditsExceededProxyRejection(result.output);
       if (proxyAICreditsRejection) {
         log(`attempt ${attempt + 1}: AWF API proxy rejected the request with HTTP 403 max-AI-credits (${proxyAICreditsRejection.aiCredits}/${proxyAICreditsRejection.maxAICredits}) — trusted budget-abort evidence`);
@@ -924,6 +1157,11 @@ async function main() {
         return { action: "stop" };
       }
 
+      if (result.exitCode === 2 && /^error:/m.test(result.output) && /\bUsage:\s*codex\b/i.test(result.output)) {
+        log(`attempt ${attempt + 1}: Codex rejected command-line arguments — not retrying (startup configuration error)`);
+        return { action: "stop" };
+      }
+
       if (isInvalidModel) {
         log(`attempt ${attempt + 1}: invalid/unsupported model configuration — not retrying (specify a valid engine model name in workflow frontmatter)`);
         return { action: "stop" };
@@ -939,7 +1177,10 @@ async function main() {
       }
 
       if (isInvalidRequest) {
-        log(`attempt ${attempt + 1}: invalid_request_error (HTTP 400) — not retrying (the provider rejected the request payload; an identical fresh run would fail the same way)`);
+        emitInfrastructureIncomplete(`Codex request-body rejection (${invalidRequestErrorCode}): the provider rejected the request payload; not retrying because replaying the same request or session would fail identically.`, {
+          logger: log,
+        });
+        log(`attempt ${attempt + 1}: ${invalidRequestErrorCode} (HTTP 400) — not retrying (the provider rejected the request payload; replaying the same request or session would fail the same way)`);
         return { action: "stop" };
       }
 
@@ -965,9 +1206,17 @@ async function main() {
       }
 
       const isTransient = isRateLimit || isServer;
+      // An interrupted run may already have staged irreversible work. Neither a fresh
+      // prompt nor a model continuation can guarantee that those outputs are not repeated.
+      if (safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
+        emitInfrastructureIncomplete("Codex failed after staging task output. Preserving existing outputs and stopping to avoid replaying completed work.", { logger: log });
+        log(`attempt ${attempt + 1}: task output already staged — preserving output and not retrying`);
+        return { action: "stop" };
+      }
       if (attempt < MAX_RETRIES && (result.hasOutput || isTransient)) {
+        resumeArgs = lastThreadId ? buildCodexResumeArgs(resolvedArgs, lastThreadId) : null;
         const reason = isRateLimit ? "rate_limit_exceeded (transient)" : isServer ? "server_error (transient)" : "partial execution";
-        log(`attempt ${attempt + 1}: ${reason} — will retry as fresh run (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
+        log(`attempt ${attempt + 1}: ${reason} — will retry as ${resumeArgs ? `resume ${lastThreadId}` : "fresh run"} (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
         return { action: "retry" };
       }
 
@@ -984,17 +1233,20 @@ async function main() {
 
   // Fetch AWF API proxy reflection data and persist to disk for post-run step summary.
   // Skip when AWF_REFLECT_ENABLED is not "1" (e.g. no api-proxy running in sandbox or test mode).
-  if (process.env.AWF_REFLECT_ENABLED === "1") {
+  if (!retryRun.lastResult?.cancelled && process.env.AWF_REFLECT_ENABLED === "1") {
     await fetchAWFReflect({ logger: log });
   }
 
   log(`done: exitCode=${lastExitCode} totalDuration=${formatDuration(Date.now() - driverStartTime)}`);
-  process.exit(lastExitCode);
+  // Let queued parent stdout/stderr writes drain instead of truncating large transcripts.
+  process.exitCode = lastExitCode;
 }
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     resolveCodexPromptFileArgs,
+    resolveCodexPromptInput,
+    buildCodexResumeArgs,
     injectJsonFlag,
     isRateLimitError,
     isTokenPerMinuteRateLimitError,
@@ -1004,6 +1256,7 @@ if (typeof module !== "undefined" && module.exports) {
     isInvalidModelError,
     isUnsupportedModelToolsError,
     isInvalidRequestError,
+    extractInvalidRequestErrorCode,
     isReconnectExhaustedError,
     countPermissionDeniedIssues,
     hasNumerousPermissionDeniedIssues,
@@ -1030,8 +1283,13 @@ if (typeof module !== "undefined" && module.exports) {
     resolveRetryConfig,
     applyModelFallback,
     injectModelFlagAfterExec,
+    removeCodexRoutingOverrides,
+    applyCodexRoutingEffort,
+    resolveCodexModelRouting,
     getCodexModelEnvVar,
     resolvePostResultWatchdogIdleTimeoutMs,
+    createMCPCallWatchdog,
+    resolveMCPServerToolTimeouts,
     POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS,
     DEFAULT_POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS,
     MIN_POST_RESULT_WATCHDOG_TIMEOUT_MS,

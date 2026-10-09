@@ -68,16 +68,6 @@ function collectAddMaskedValues(logContent) {
 }
 
 /**
- * Escape a literal string for use inside a regular expression.
- *
- * @param {string} value
- * @returns {string}
- */
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
  * Replace all occurrences of the masked values with `***`.
  *
  * @param {string} text
@@ -86,9 +76,50 @@ function escapeRegExp(value) {
  */
 function redactMaskedValues(text, maskedValues) {
   if (!text || !maskedValues || maskedValues.length === 0) return text;
-  const escapedAlternatives = maskedValues.map(escapeRegExp).join("|");
-  const pattern = new RegExp(`(?:${escapedAlternatives})`, "g");
-  return text.replace(pattern, MASK_REPLACEMENT);
+  const pending = [];
+  for (let order = 0; order < maskedValues.length; order++) {
+    const value = maskedValues[order];
+    if (!value) continue;
+    const index = text.indexOf(value);
+    if (index !== -1) pending.push({ value, index, order });
+  }
+  const precedes = (a, b) => a.index < b.index || (a.index === b.index && a.order < b.order);
+  const siftDown = start => {
+    let parent = start;
+    while (parent * 2 + 1 < pending.length) {
+      let child = parent * 2 + 1;
+      if (child + 1 < pending.length && precedes(pending[child + 1], pending[child])) child++;
+      if (!precedes(pending[child], pending[parent])) break;
+      [pending[parent], pending[child]] = [pending[child], pending[parent]];
+      parent = child;
+    }
+  };
+  for (let i = Math.floor(pending.length / 2) - 1; i >= 0; i--) siftDown(i);
+  const parts = [];
+  let cursor = 0;
+  let replacements = 0;
+  while (pending.length && cursor < text.length) {
+    const next = pending[0];
+    if (next.index >= cursor) {
+      if (next.index > cursor) {
+        if (replacements) parts.push(MASK_REPLACEMENT.repeat(replacements));
+        replacements = 0;
+        parts.push(text.slice(cursor, next.index));
+      }
+      replacements++;
+      cursor = next.index + next.value.length;
+    }
+    // Only refresh consumed or overlapping occurrences; later candidates stay cached.
+    next.index = text.indexOf(next.value, cursor);
+    if (next.index === -1) {
+      const last = pending.pop();
+      if (pending.length) pending[0] = last;
+    }
+    siftDown(0);
+  }
+  if (replacements) parts.push(MASK_REPLACEMENT.repeat(replacements));
+  parts.push(text.slice(cursor));
+  return parts.join("");
 }
 
 /**
@@ -107,12 +138,61 @@ function applyAddMaskRedaction(text, maskedValues) {
   return redactMaskedValues(withoutCommands, maskedValues);
 }
 
+/**
+ * Sanitize artifact sources while runtime masks are still available in memory.
+ * Decode JSON strings first so escaping cannot hide a registered value, and
+ * preserve untouched records byte-for-byte.
+ * @param {string} content
+ * @param {string[]} maskedValues
+ * @returns {string}
+ */
+function redactArtifactMaskedValues(content, maskedValues) {
+  if (!content || !maskedValues.length) return content;
+  const redactValue = value => {
+    if (typeof value === "string") return applyAddMaskRedaction(value, maskedValues);
+    if (Array.isArray(value)) return value.map(redactValue);
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, nested]) => [redactMaskedValues(key, maskedValues), redactValue(nested)]));
+    return value;
+  };
+  const redactJson = text => {
+    try {
+      const value = JSON.parse(text);
+      const redacted = JSON.stringify(redactValue(value));
+      return redacted === JSON.stringify(value) ? text : text.match(/^\s*/)[0] + redacted + text.match(/\s*$/)[0];
+    } catch {
+      return undefined;
+    }
+  };
+  const json = redactJson(content);
+  if (json !== undefined) return json;
+  return content
+    .split("\n")
+    .filter(line => !isAddMaskCommandLine(line))
+    .map(line => {
+      const jsonLine = redactJson(line);
+      if (jsonLine !== undefined) return jsonLine;
+      // Mixed or malformed logs can still contain recoverable JSON strings.
+      const decoded = line.replace(/"(?:[^"\\]|\\.)*"/g, encoded => {
+        try {
+          const value = JSON.parse(encoded);
+          const redacted = redactValue(value);
+          return redacted === value ? encoded : JSON.stringify(redacted);
+        } catch {
+          return encoded;
+        }
+      });
+      return redactMaskedValues(decoded, maskedValues);
+    })
+    .join("\n");
+}
+
 module.exports = {
   ADD_MASK_COMMAND_RE,
   MASK_REPLACEMENT,
   applyAddMaskRedaction,
   collectAddMaskedValues,
   isAddMaskCommandLine,
+  redactArtifactMaskedValues,
   redactMaskedValues,
   unescapeWorkflowCommandValue,
 };

@@ -2,8 +2,10 @@
 /// <reference types="@actions/github-script" />
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { EMPTY_OUTPUT_FAILURE_CAUSES } = require("./empty_output_outcome.cjs");
 
 const fs = require("fs");
+const { normalizeRuntimeMessage, readClaimScopeContext, currentClaimHandle } = require("./work_queue_claim_scope.cjs");
 
 /**
  * Maximum content length to log for debugging purposes
@@ -32,16 +34,28 @@ function truncateForLogging(content) {
  * 3. Validating the JSON structure
  * 4. Returning parsed items array
  *
+ * @param {{partitioning?: boolean}} [options]
  * @returns {{
  *   success: true,
- *   items: any[]
+ *   items: any[],
+ *   collectorEmptyOutputCause?: string,
+ *   collectorFailureCause?: string,
+ *   collectorDriverExitCode?: number,
+ *   collectorRetryCount?: number,
+ *   collectorEngineErrorType?: string
  * } | {
  *   success: false,
  *   items?: undefined,
  *   error?: string
  * }} Result object with success flag and items array (if successful) or error message
  */
-function loadAgentOutput() {
+function loadAgentOutput(options = {}) {
+  const claimHandle = currentClaimHandle();
+  const scope = claimHandle ? null : readClaimScopeContext();
+  const queueEnabled = Boolean(scope || claimHandle);
+  if (!options.partitioning && scope && !claimHandle) {
+    return { success: false, error: "Queue standalone handlers require a trusted per-Claim execution context" };
+  }
   const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
 
   // No agent output file specified
@@ -73,7 +87,7 @@ function loadAgentOutput() {
   // Parse the validated output JSON
   let validatedOutput;
   try {
-    validatedOutput = JSON.parse(outputContent);
+    validatedOutput = queueEnabled ? require("./work_queue_codec.cjs").parseStrictJSON(outputContent) : JSON.parse(outputContent);
   } catch (error) {
     const errorMessage = `Error parsing agent output JSON: ${getErrorMessage(error)}`;
     core.error(errorMessage);
@@ -88,7 +102,32 @@ function loadAgentOutput() {
     return { success: false };
   }
 
-  return { success: true, items: validatedOutput.items };
+  return {
+    success: true,
+    items: queueEnabled
+      ? validatedOutput.items
+          .map(item => {
+            try {
+              return normalizeRuntimeMessage(item);
+            } catch (error) {
+              return {
+                type: item?.type,
+                ...(item && Object.hasOwn(item, "claim_handle") ? { claim_handle: item.claim_handle } : {}),
+                _claimScopeError: getErrorMessage(error),
+                _claimScopeErrorCode: error.code,
+              };
+            }
+          })
+          .filter(item => !claimHandle || (!item._claimScopeError && item.claim_handle === claimHandle))
+      : validatedOutput.items,
+    ...(typeof validatedOutput.collectorEmptyOutputCause === "string" ? { collectorEmptyOutputCause: validatedOutput.collectorEmptyOutputCause } : {}),
+    ...(Object.hasOwn(EMPTY_OUTPUT_FAILURE_CAUSES, validatedOutput.collectorFailureCause) ? { collectorFailureCause: validatedOutput.collectorFailureCause } : {}),
+    ...(Number.isSafeInteger(validatedOutput.collectorDriverExitCode) && validatedOutput.collectorDriverExitCode >= 0 && validatedOutput.collectorDriverExitCode <= 255
+      ? { collectorDriverExitCode: validatedOutput.collectorDriverExitCode }
+      : {}),
+    ...(Number.isSafeInteger(validatedOutput.collectorRetryCount) && validatedOutput.collectorRetryCount >= 0 ? { collectorRetryCount: validatedOutput.collectorRetryCount } : {}),
+    ...(typeof validatedOutput.collectorEngineErrorType === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(validatedOutput.collectorEngineErrorType) ? { collectorEngineErrorType: validatedOutput.collectorEngineErrorType } : {}),
+  };
 }
 
 module.exports = { loadAgentOutput, truncateForLogging, MAX_LOG_CONTENT_LENGTH };

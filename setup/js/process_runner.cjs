@@ -4,8 +4,8 @@
  * Shared process runner utilities for agent harnesses.
  *
  * Provides a common runProcess helper used by both the Claude and Copilot
- * harnesses to spawn child processes, forward stdout/stderr (stdin is closed;
- * prompts are delivered via file/argument, not stdin), collect output for
+ * harnesses to spawn child processes, forward stdout/stderr and optionally write
+ * prompt data to stdin, collect output for
  * retry decisions, track byte counts, and surface spawn errors.
  *
  * Each harness retains its own logging prefix and argument-redaction logic;
@@ -17,6 +17,7 @@
 
 const { spawn } = require("child_process");
 const os = require("os");
+const { StringDecoder } = require("string_decoder");
 
 /**
  * Convert a Node.js child-process termination signal (e.g. "SIGSYS") into the
@@ -60,8 +61,8 @@ function sleep(ms) {
 }
 
 /**
- * Run a command with the given arguments, forwarding stdout/stderr (stdin is closed;
- * see the spawn call below for why).
+ * Run a command with the given arguments, forwarding stdout/stderr. Optional stdin data
+ * is written and then the stream is closed; without data the child observes immediate EOF.
  * Also collects combined stdout+stderr output for error pattern detection.
  *
  * The child process is spawned with `cwd` set to `process.env.GH_AW_ENGINE_CWD` when
@@ -76,6 +77,13 @@ function sleep(ms) {
  *   log: (message: string) => void,
  *   logArgs?: string[],
  *   env?: NodeJS.ProcessEnv,
+ *   stdin?: string | Buffer,
+ *   onStdoutLine?: (line: string) => void,
+ *   onStdoutLinePrefix?: (prefix: string) => void,
+ *   onStderrLine?: (line: string) => void,
+ *   shutdownGraceMs?: number,
+ *   drainTimeoutMs?: number,
+ *   maxCollectedOutputBytes?: number,
  *   postResultWatchdog?: {
  *     shouldArm: () => boolean,
  *     inactivityTimeoutMs: number,
@@ -83,9 +91,10 @@ function sleep(ms) {
  *     termGraceMs?: number
  *   },
  *   runtimeGuard?: {
- *     shouldTerminate: () => boolean | { terminate: boolean, reason?: string } | Promise<boolean | { terminate: boolean, reason?: string }>,
+ *     shouldTerminate: () => boolean | { terminate: boolean, reason?: string, event?: Record<string, any> } | Promise<boolean | { terminate: boolean, reason?: string, event?: Record<string, any> }>,
  *     pollIntervalMs?: number,
- *     termGraceMs?: number
+ *     termGraceMs?: number,
+ *     onTriggered?: (decision: { terminate: true, reason?: string, event?: Record<string, any> }) => void
  *   },
  *   stallWarningIntervalMs?: number
  * }} options
@@ -100,16 +109,34 @@ function sleep(ms) {
  *                 GH_AW_HARNESS_STALL_WARNING_MS; 0 disables the warnings. An explicit
  *                 caller value is used as-is (not clamped to the environment range) so
  *                 tests can use short intervals.
- * @returns {Promise<{exitCode: number, output: string, hasOutput: boolean, durationMs: number, watchdogFired: boolean, runtimeGuardFired: boolean, runtimeGuardReason: string}>}
+ * @returns {Promise<{exitCode: number, output: string, stdout: string, stderr: string, hasOutput: boolean, durationMs: number, watchdogFired: boolean, runtimeGuardFired: boolean, runtimeGuardReason: string, cancelled: boolean}>}
  */
-function runProcess({ command, args, attempt, log, logArgs, env, postResultWatchdog, runtimeGuard, stallWarningIntervalMs }) {
+function runProcess({
+  command,
+  args,
+  attempt,
+  log,
+  logArgs,
+  env,
+  stdin,
+  onStdoutLine,
+  onStdoutLinePrefix,
+  onStderrLine,
+  shutdownGraceMs = 5000,
+  drainTimeoutMs = 2000,
+  maxCollectedOutputBytes = Infinity,
+  postResultWatchdog,
+  runtimeGuard,
+  stallWarningIntervalMs,
+}) {
   return new Promise(resolve => {
     const startTime = Date.now();
     // Guard against the promise being settled more than once.  On some systems Node
     // emits 'close' after 'error' (or vice-versa); only the first terminal event should
     // log and resolve so callers receive a deterministic result.
     let settled = false;
-    /** @param {{exitCode: number, output: string, hasOutput: boolean, durationMs: number, watchdogFired: boolean, runtimeGuardFired: boolean, runtimeGuardReason: string}} result */
+    let childExited = false;
+    /** @param {Awaited<ReturnType<typeof runProcess>>} result */
     function settle(result) {
       if (settled) return;
       settled = true;
@@ -117,27 +144,181 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
       if (runtimeGuardTimer) clearInterval(runtimeGuardTimer);
       if (runtimeGuardKillTimer) clearTimeout(runtimeGuardKillTimer);
       if (stallWatchdogTimer) clearInterval(stallWatchdogTimer);
+      if (shutdownTimer) clearTimeout(shutdownTimer);
+      if (drainTimer) clearTimeout(drainTimer);
+      for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler);
+      process.stdout.removeListener("drain", resumeStdout);
+      process.stderr.removeListener("drain", resumeStderr);
+      if (!childExited) signalTree("SIGKILL");
       resolve(result);
     }
 
     const argsForLog = logArgs ?? args;
     log(`attempt ${attempt + 1}: spawning: ${command} ${argsForLog.join(" ").substring(0, 200)}`);
 
-    // stdin is closed (not inherited) rather than forwarded: every harness delivers the
-    // prompt via a file or CLI argument, so the child never needs to read from stdin.
-    // Closing it means a CLI that unexpectedly falls back to an interactive
-    // "read from stdin" mode (e.g. due to an unrecognized argument) sees immediate EOF
-    // and exits/errors quickly instead of hanging silently until the step's
-    // timeout-minutes budget is exhausted.
     const child = spawn(command, args, {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       env: env ?? process.env,
       cwd: process.env.GH_AW_ENGINE_CWD || process.env.GITHUB_WORKSPACE || undefined,
+      // Own a process group, rather than terminating only the CLI while its tools survive.
+      detached: process.platform !== "win32",
     });
+
+    // Always close stdin. When a prompt is supplied, write it before closing; otherwise
+    // preserve the previous behavior where children immediately observe EOF. A child can
+    // exit before a large prompt has been fully written, so handle EPIPE explicitly rather
+    // than allowing an unhandled stream error to terminate the harness.
+    child.stdin.on(
+      "error",
+      /** @param {NodeJS.ErrnoException} err */ err => {
+        if (err.code !== "EPIPE") {
+          log(`attempt ${attempt + 1}: failed to write process stdin: ${err.message}`);
+        }
+      }
+    );
+    child.stdin.end(stdin);
 
     log(`attempt ${attempt + 1}: process started (pid=${child.pid ?? "unknown"})`);
 
-    let collectedOutput = "";
+    let stdout = "";
+    let stderr = "";
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let stdoutPaused = false;
+    let stderrPaused = false;
+    function resumeStdout() {
+      stdoutPaused = false;
+      child.stdout.resume();
+    }
+    function resumeStderr() {
+      stderrPaused = false;
+      child.stderr.resume();
+    }
+    let cancelled = false;
+    /** @type {NodeJS.Signals | null} */
+    let cancellationSignal = null;
+    /** @type {number | null} */
+    let exitedCode = null;
+    /** @type {NodeJS.Signals | null} */
+    let exitedSignal = null;
+    /** @type {NodeJS.Timeout | null} */
+    let shutdownTimer = null;
+    let shutdownEscalated = false;
+    /** @type {{ code: number|null, signal: NodeJS.Signals|null }|null} */
+    let closedResult = null;
+    /** @type {NodeJS.Timeout | null} */
+    let drainTimer = null;
+    /** @type {Array<[NodeJS.Signals, () => void]>} */
+    const signalHandlers = [];
+    const outputLimit = Number.isFinite(maxCollectedOutputBytes) ? Math.max(1024, maxCollectedOutputBytes) : Infinity;
+    const collect = (previous, text) => {
+      const combined = previous + text;
+      if (Buffer.byteLength(combined) <= outputLimit) return combined;
+      // Complete output still goes to the parent's log streams. Keep a bounded classifier tail.
+      return Buffer.from(combined).subarray(-outputLimit).toString("utf8");
+    };
+    const lineObserver = (callback, onOversizedLine) => {
+      let pending = "";
+      let dropping = false;
+      return (text, final = false) => {
+        if (!callback) return;
+        for (const part of text.split(/(?<=\n)/)) {
+          if (!dropping) pending += part;
+          if (pending.length > 1024 * 1024) {
+            onOversizedLine?.(pending.slice(0, 64 * 1024));
+            pending = "";
+            dropping = true;
+          }
+          if (!part.endsWith("\n")) continue;
+          if (!dropping) callback(pending.replace(/\r?\n$/, ""));
+          pending = "";
+          dropping = false;
+        }
+        if (final && pending && !dropping) callback(pending);
+        if (final) pending = "";
+      };
+    };
+    const observeStdout = lineObserver(onStdoutLine, onStdoutLinePrefix);
+    const observeStderr = lineObserver(onStderrLine);
+    /** @param {NodeJS.Signals} signal */
+    function signalTree(signal) {
+      if (!child.pid) return;
+      try {
+        if (process.platform === "win32") {
+          const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+          killer.on("error", error => log(`attempt ${attempt + 1}: failed to terminate process tree: ${error.message}`));
+        } else {
+          process.kill(-child.pid, signal);
+        }
+      } catch (error) {
+        if (/** @type {NodeJS.ErrnoException} */ error.code !== "ESRCH") log(`attempt ${attempt + 1}: process-tree ${signal} failed: ${/** @type {Error} */ error.message}`);
+      }
+    }
+    function finish(code, signal) {
+      if (settled) return;
+      if (shutdownTimer && !shutdownEscalated) {
+        // The CLI can close before TERM-resistant descendants exit. Complete the
+        // owned-group escalation before clearing timers and resolving the attempt.
+        closedResult = { code, signal };
+        return;
+      }
+      const stdoutTail = stdoutDecoder.end();
+      const stderrTail = stderrDecoder.end();
+      stdout += stdoutTail;
+      stderr += stderrTail;
+      observeStdout(stdoutTail, true);
+      observeStderr(stderrTail, true);
+      const exitCode = cancelled ? (exitCodeForSignal(cancellationSignal) ?? 1) : (code ?? exitCodeForSignal(signal) ?? 1);
+      settle({
+        exitCode,
+        output: stdout && stderr ? `${stdout}${stdout.endsWith("\n") ? "" : "\n"}${stderr}` : stdout || stderr,
+        stdout,
+        stderr,
+        hasOutput,
+        durationMs: Date.now() - startTime,
+        watchdogFired: watchdogSentSigtermAt > 0,
+        runtimeGuardFired,
+        runtimeGuardReason,
+        cancelled,
+      });
+    }
+    /** @param {NodeJS.Signals} signal @param {number} graceMs */
+    function terminateTree(signal, graceMs) {
+      signalTree(signal);
+      if (shutdownTimer) return;
+      shutdownTimer = setTimeout(
+        () => {
+          shutdownEscalated = true;
+          log(`attempt ${attempt + 1}: shutdown grace of ${graceMs}ms expired; terminating remaining descendants`);
+          signalTree("SIGKILL");
+          if (closedResult) {
+            finish(closedResult.code, closedResult.signal);
+            return;
+          }
+          drainTimer = setTimeout(
+            () => {
+              child.stdout.destroy();
+              child.stderr.destroy();
+              finish(exitedCode, exitedSignal || signal);
+            },
+            Math.max(50, drainTimeoutMs)
+          );
+        },
+        Math.max(50, graceMs)
+      );
+    }
+    /** @type {NodeJS.Signals[]} */
+    const cancellationSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
+    for (const signal of cancellationSignals) {
+      const handler = () => {
+        cancelled = true;
+        cancellationSignal = signal;
+        log(`attempt ${attempt + 1}: forwarding cancellation ${signal} to process tree`);
+        terminateTree(signal, shutdownGraceMs);
+      };
+      signalHandlers.push([signal, handler]);
+      process.on(signal, handler);
+    }
     let hasOutput = false;
     let stdoutBytes = 0;
     let stderrBytes = 0;
@@ -185,9 +366,15 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
       /** @param {Buffer} data */ data => {
         hasOutput = true;
         stdoutBytes += data.length;
-        collectedOutput += data.toString();
+        const text = stdoutDecoder.write(data);
+        stdout = collect(stdout, text);
+        observeStdout(text);
         recordActivity();
-        process.stdout.write(data);
+        if (!process.stdout.write(data) && !stdoutPaused) {
+          stdoutPaused = true;
+          child.stdout.pause();
+          process.stdout.once("drain", resumeStdout);
+        }
       }
     );
 
@@ -196,9 +383,15 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
       /** @param {Buffer} data */ data => {
         hasOutput = true;
         stderrBytes += data.length;
-        collectedOutput += data.toString();
+        const text = stderrDecoder.write(data);
+        stderr = collect(stderr, text);
+        observeStderr(text);
         recordActivity();
-        process.stderr.write(data);
+        if (!process.stderr.write(data) && !stderrPaused) {
+          stderrPaused = true;
+          child.stderr.pause();
+          process.stderr.once("drain", resumeStderr);
+        }
       }
     );
 
@@ -210,6 +403,7 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
     if (stallIntervalMs > 0) {
       stallWatchdogTimer = setInterval(() => {
         if (settled) return;
+        if (stdoutPaused || stderrPaused) return;
         const idleMs = Date.now() - lastActivityAt;
         if (idleMs < stallIntervalMs) return;
         if (stalledSinceMs === 0) stalledSinceMs = lastActivityAt;
@@ -237,17 +431,18 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
           }
         }
         if (!watchdogArmed) return;
+        if (stdoutPaused || stderrPaused) return;
         const idleMs = Date.now() - lastActivityAt;
         if (watchdogSentSigtermAt === 0 && idleMs >= watchdogInactivityTimeoutMs) {
           watchdogSentSigtermAt = Date.now();
           log(`attempt ${attempt + 1}: post-result watchdog terminating idle process after ${idleMs}ms (SIGTERM)`);
-          child.kill("SIGTERM");
+          terminateTree("SIGTERM", watchdogTermGraceMs);
           return;
         }
         if (watchdogSentSigtermAt > 0 && watchdogSentSigkillAt === 0 && Date.now() - watchdogSentSigtermAt >= watchdogTermGraceMs) {
           watchdogSentSigkillAt = Date.now();
           log(`attempt ${attempt + 1}: post-result watchdog forcing process exit after ${watchdogTermGraceMs}ms grace (SIGKILL)`);
-          child.kill("SIGKILL");
+          signalTree("SIGKILL");
         }
       }, watchdogPollIntervalMs);
     }
@@ -260,7 +455,7 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
         if (settled || guardSentSigkillAt > 0) return;
         guardSentSigkillAt = Date.now();
         log(`attempt ${attempt + 1}: runtime guard forcing process exit after ${runtimeGuardTermGraceMs}ms grace (SIGKILL)`);
-        child.kill("SIGKILL");
+        signalTree("SIGKILL");
       };
       // Guards against overlapping polls when `shouldTerminate` is asynchronous.
       let guardCheckInFlight = false;
@@ -282,10 +477,17 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
         if (!terminate) return;
         runtimeGuardFired = true;
         runtimeGuardReason = typeof decision === "object" && decision !== null && typeof decision.reason === "string" ? decision.reason : "";
+        if (typeof decision === "object" && decision !== null) {
+          try {
+            runtimeGuard.onTriggered?.({ ...decision, terminate: true });
+          } catch {
+            log(`attempt ${attempt + 1}: runtime guard trigger callback failed`);
+          }
+        }
         const reasonSuffix = runtimeGuardReason ? ` (${runtimeGuardReason})` : "";
         guardSentSigtermAt = Date.now();
         log(`attempt ${attempt + 1}: runtime guard requested termination${reasonSuffix} (SIGTERM)`);
-        child.kill("SIGTERM");
+        terminateTree("SIGTERM", runtimeGuardTermGraceMs);
         if (runtimeGuardTimer) {
           clearInterval(runtimeGuardTimer);
           runtimeGuardTimer = null;
@@ -295,7 +497,21 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
     }
 
     child.on("exit", (code, signal) => {
+      childExited = true;
+      exitedCode = code;
+      exitedSignal = signal;
       log(`attempt ${attempt + 1}: process exit event` + ` exitCode=${code ?? exitCodeForSignal(signal) ?? 1}` + (signal ? ` signal=${signal}` : ""));
+      if (!shutdownTimer) {
+        drainTimer = setTimeout(
+          () => {
+            signalTree("SIGKILL");
+            child.stdout.destroy();
+            child.stderr.destroy();
+            finish(code, signal);
+          },
+          Math.max(50, drainTimeoutMs)
+        );
+      }
     });
 
     // Resolve on 'close', not 'exit', to ensure stdio streams are fully drained.
@@ -317,7 +533,7 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
           (runtimeGuardFired ? ` runtimeGuardFired=true` : "") +
           (stallWarnings > 0 ? ` stallWarnings=${stallWarnings}` : "")
       );
-      settle({ exitCode, output: collectedOutput, hasOutput, durationMs, watchdogFired, runtimeGuardFired, runtimeGuardReason });
+      finish(code, signal);
     });
 
     child.on("error", err => {
@@ -327,15 +543,7 @@ function runProcess({ command, args, attempt, log, logArgs, env, postResultWatch
       const errCode = errno.code ?? "unknown";
       const errSyscall = errno.syscall ?? "unknown";
       log(`attempt ${attempt + 1}: failed to start process '${command}': ${err.message}` + ` (code=${errCode} syscall=${errSyscall})`);
-      settle({
-        exitCode: 1,
-        output: collectedOutput,
-        hasOutput,
-        durationMs,
-        watchdogFired: false,
-        runtimeGuardFired: false,
-        runtimeGuardReason: "",
-      });
+      finish(1, null);
     });
   });
 }

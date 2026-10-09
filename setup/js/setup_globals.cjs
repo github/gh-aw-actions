@@ -9,6 +9,26 @@
 
 const { createRateLimitAwareGithub } = require("./github_rate_limit_logger.cjs");
 const { parseRuntimeFeatures, hasRuntimeFeature, getRuntimeFeatureValue } = require("./runtime_features.cjs");
+const { GITHUB_API_VERSION } = require("./constants.cjs");
+
+/**
+ * @param {Record<string, string | number | undefined>} headers
+ * @param {Record<string, string | number | undefined>} [defaults]
+ * @returns {void}
+ */
+function applyGitHubApiVersion(headers, defaults = {}) {
+  const headerNames = new Set(Object.keys(headers).map(name => name.toLowerCase()));
+  for (const [name, value] of Object.entries(defaults)) {
+    const normalizedName = name.toLowerCase();
+    if (!headerNames.has(normalizedName)) {
+      headers[normalizedName] = value;
+      headerNames.add(normalizedName);
+    }
+  }
+  if (!headerNames.has("x-github-api-version")) {
+    headers["x-github-api-version"] = GITHUB_API_VERSION;
+  }
+}
 
 /**
  * Stores GitHub Actions builtin objects (core, github, context, exec, io, getOctokit) in the global scope
@@ -24,32 +44,27 @@ const { parseRuntimeFeatures, hasRuntimeFeature, getRuntimeFeatureValue } = requ
  * @param {typeof exec} execModule - The @actions/exec module
  * @param {typeof io} ioModule - The @actions/io module
  * @param {typeof getOctokit} getOctokitFn - The getOctokit function (builtin in actions/github-script@v9)
+ * @param {string} [defaultCredentialSource] - Provenance for the injected github client
  */
-function setupGlobals(coreModule, githubModule, contextModule, execModule, ioModule, getOctokitFn) {
+function setupGlobals(coreModule, githubModule, contextModule, execModule, ioModule, getOctokitFn, defaultCredentialSource = "unknown") {
   global.core = coreModule;
   const runtimeFeatures = Object.freeze(parseRuntimeFeatures(process.env.GH_AW_RUNTIME_FEATURES));
   global.runtimeFeatures = runtimeFeatures;
   global.hasRuntimeFeature = key => hasRuntimeFeature(runtimeFeatures, key);
   global.getRuntimeFeatureValue = key => getRuntimeFeatureValue(runtimeFeatures, key);
-  // Inject X-GitHub-Api-Version header on every request to suppress the
-  // "@octokit/request: endpoint is deprecated" warning that fires when the
-  // unversioned GitHub REST API is used.
+  // Pin a supported REST API version, preserving explicit overrides even
+  // after Octokit normalizes header names to lowercase.
   githubModule.hook.before("request", options => {
-    if (!options.headers["X-GitHub-Api-Version"]) {
-      options.headers["X-GitHub-Api-Version"] = "2022-11-28";
-    }
+    applyGitHubApiVersion(options.headers);
   });
-  // @ts-expect-error - Assigning to global properties that are declared as const
   // Wrap the github object so every github.rest.*.*() call automatically logs
   // x-ratelimit-* headers to github_rate_limits.jsonl for observability.
-  global.github = createRateLimitAwareGithub(githubModule);
+  global.github = createRateLimitAwareGithub(githubModule, defaultCredentialSource);
   global.context = contextModule;
-  // @ts-expect-error - Assigning to global properties that are declared as const
   global.exec = execModule;
-  // @ts-expect-error - Assigning to global properties that are declared as const
   global.io = ioModule;
   // Wrap getOctokit so every client created via global.getOctokit(token) also
-  // carries X-GitHub-Api-Version, suppressing the deprecation warning for
+  // carries the default X-GitHub-Api-Version for
   // per-handler authenticated clients (cross-repo PAT operations, etc.).
   // Also validates that the token is not an OAuth token (gho_...) which is
   // unsuitable for automation.
@@ -62,13 +77,15 @@ function setupGlobals(coreModule, githubModule, contextModule, execModule, ioMod
           "at: https://github.com/settings/personal-access-tokens/new"
       );
     }
-    return getOctokitFn(token, {
-      ...options,
-      headers: {
-        "X-GitHub-Api-Version": "2022-11-28",
-        ...(options.headers || {}),
-      },
+    const clientOptions = { ...options };
+    const source = clientOptions.credentialSource;
+    delete clientOptions.credentialSource;
+    const client = getOctokitFn(token, clientOptions);
+    // Octokit constructor options do not apply top-level headers to requests.
+    client.hook.before("request", requestOptions => {
+      applyGitHubApiVersion(requestOptions.headers, clientOptions.headers);
     });
+    return createRateLimitAwareGithub(client, source);
   };
 }
 

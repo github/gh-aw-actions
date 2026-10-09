@@ -25,6 +25,7 @@ const { createDiscussionComment, resolveTopLevelDiscussionCommentId } = require(
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { ERR_NOT_FOUND } = require("./error_codes.cjs");
 const { isPayloadUserBot } = require("./resolve_mentions.cjs");
+const { getMentionsGithubClient, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
@@ -672,26 +673,9 @@ async function main(config = {}) {
         });
 
         if (!targetResult.success) {
-          if (targetResult.shouldFail) {
-            const hasExplicitWildcardTargetField = WILDCARD_TARGET_FIELDS.some(field => message[field] != null);
-            const missingWildcardTarget = commentTarget === "*" && !hasExplicitWildcardTargetField;
-            if (missingWildcardTarget) {
-              core.info(targetResult.error);
-              return {
-                success: false,
-                skipped: true,
-                reasonCode: "NO_CONTEXT",
-                reason: "No target context available",
-                error: targetResult.error,
-              };
-            }
-            core.warning(targetResult.error);
-            return {
-              success: false,
-              error: targetResult.error,
-            };
-          } else {
-            // No triggering context (e.g. schedule run) — silently skip rather than fail
+          const hasExplicitWildcardTargetField = WILDCARD_TARGET_FIELDS.some(field => message[field] != null);
+          const missingWildcardTarget = commentTarget === "*" && !hasExplicitWildcardTargetField;
+          if (missingWildcardTarget) {
             core.info(targetResult.error);
             return {
               success: false,
@@ -701,6 +685,11 @@ async function main(config = {}) {
               error: targetResult.error,
             };
           }
+          const error = targetResult.shouldFail
+            ? targetResult.error
+            : 'Cannot resolve add_comment target "triggering" without an issue, pull request, or discussion context; set safe-outputs.add-comment.target to "*" and provide an item_number';
+          core.warning(error);
+          return { success: false, error };
         }
 
         itemNumber = targetResult.number;
@@ -764,7 +753,8 @@ async function main(config = {}) {
         if (itemTargetResult.number != null || hasExplicitCommentId) {
           // Explicit item_number/issue_number: fetch the issue/PR to get its author
           try {
-            const { data: issueData } = await githubClient.rest.issues.get({
+            const mentionsGithubClient = getMentionsGithubClient(githubClient);
+            const { data: issueData } = await mentionsGithubClient.rest.issues.get({
               owner: repoParts.owner,
               repo: repoParts.repo,
               issue_number: itemNumber,
@@ -791,7 +781,8 @@ async function main(config = {}) {
         }
       }
     }
-    const allowedMentionAliases = deduplicateCaseInsensitive([...parentAuthors, ...preResolvedMentionAliases, ...configuredMentionAliases]);
+    const itemMentionAliases = await resolveMentionsForItem(effectiveContext, githubClient, core, config.mentions, preResolvedMentionAliases, defaultTargetRepo, repoResult);
+    const allowedMentionAliases = deduplicateCaseInsensitive([...parentAuthors, ...itemMentionAliases, ...configuredMentionAliases]);
 
     if (allowedMentionAliases.length > 0) {
       core.info(`[MENTIONS] Allowing aliases in comment: ${allowedMentionAliases.join(", ")}`);

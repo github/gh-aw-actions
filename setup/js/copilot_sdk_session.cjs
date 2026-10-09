@@ -5,7 +5,7 @@
  *
  * Runs a single Copilot agentic session using the @github/copilot-sdk.
  * Serializes all SDK session events to a JSONL file so that
- * unified_timeline.cjs can render them in the step summary.
+ * unified_session.cjs can collect them for the unified session step summary.
  *
  * Event mapping:
  *   SDK "user.message"            → JSONL "user.message"
@@ -22,7 +22,7 @@
  * The JSONL file is written to:
  *   /tmp/gh-aw/sandbox/agent/logs/copilot-session-state/{sessionId}/events.jsonl
  * which mirrors the path that copy_copilot_session_state.sh produces and that
- * unified_timeline.cjs reads.
+ * unified_session.cjs reads.
  *
  * Consumed directly by copilot_sdk_driver.cjs (the built-in gh-aw driver) and
  * available to any custom driver that wants the same session lifecycle and JSONL
@@ -37,8 +37,10 @@ const path = require("path");
 const os = require("os");
 const { buildCopilotSDKPermissionHandler, getEnvPositiveIntOrDefault, parseMaxToolDenialsLimit, MAX_TOOL_DENIALS_DEFAULT } = require("./copilot_sdk_permissions.cjs");
 const { buildCopilotSDKSessionToolConfig } = require("./copilot_sdk_tool_config.cjs");
+const { buildCopilotSDKToolCallBudget } = require("./copilot_sdk_tool_budget.cjs");
 const { resolveModelWithFallback } = require("./model_fallback.cjs");
 const { extractShellCommandFromToolData, extractStructuredToolInput } = require("./tool_call_details.cjs");
+const { COPILOT_WORKFLOW_EVENT_TYPES } = require("./copilot_workflow_events.cjs");
 
 // Default timeout for a single sendAndWait call: 10 minutes.
 // This is intentionally generous — the headless Copilot CLI has its own internal
@@ -78,7 +80,7 @@ const SDK_POST_COMPLETION_IDLE_MS_DEFAULT = 30 * 1000;
  * Extract the prompt text from a resolved args array.
  * Looks for the first occurrence of "-p <value>" or "--prompt <value>".
  *
- * @param {string[]} args - Resolved args (after resolvePromptFileArgs has run).
+ * @param {string[]} args - Resolved CLI arguments.
  * @returns {string | null} The prompt text, or null if not found.
  */
 function extractPromptFromArgs(args) {
@@ -99,7 +101,7 @@ function extractPromptFromArgs(args) {
  * both modes uniformly.
  *
  * All SDK events are serialised to a JSONL file under the session state directory
- * so that unified_timeline.cjs can render them in the step summary.
+ * so that unified_session.cjs can collect them for the step summary.
  *
  * @param {{
  *   sdkUri: string,
@@ -107,6 +109,7 @@ function extractPromptFromArgs(args) {
  *   logger: (msg: string) => void,
  *   attempt?: number,
  *   model?: string,
+ *   reasoningEffort?: string,
  *   connectionToken?: string,
  *   providers?: import("@github/copilot-sdk").NamedProviderConfig[],
  *   models?: import("@github/copilot-sdk").ProviderModelConfig[],
@@ -136,6 +139,7 @@ async function runWithCopilotSDK({
   logger,
   attempt = 0,
   model,
+  reasoningEffort,
   connectionToken,
   providers,
   models: providerModels,
@@ -166,7 +170,7 @@ async function runWithCopilotSDK({
   }
   log(`max-tool-denials threshold: ${maxToolDenialsLimit}`);
 
-  // Session state directory — mirrors the target path used by unified_timeline.cjs.
+  // Session state directory — mirrors the source path used by unified_session.cjs.
   // /tmp/gh-aw/sandbox/agent/logs/copilot-session-state/{sessionId}/events.jsonl
   // GH_AW_SESSION_STATE_BASE_DIR may be set in tests to redirect writes to an isolated directory.
   const defaultSessionStateBase = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state");
@@ -322,14 +326,21 @@ async function runWithCopilotSDK({
       onDenied: requestSummary => recordToolDenial(`permission denied: ${requestSummary}`),
       workspaceRoot: process.env.GITHUB_WORKSPACE,
     });
+    const toolCallBudget = buildCopilotSDKToolCallBudget(toolConfig?.maxToolCalls, event => {
+      writeDriverEvent(event.exhausted ? "guard.tool_call_budget_exceeded" : "guard.tool_call_budget_debit", event);
+    });
 
     // Build session config using the multi-provider surface.
+    /** @type {any} */
+    const sdkReasoningEffort = reasoningEffort;
     /** @type {import("@github/copilot-sdk").SessionConfig} */
     const sessionConfig = {
       model: model || resolveModelWithFallback(process.env, "COPILOT_MODEL") || undefined,
+      ...(sdkReasoningEffort ? { reasoningEffort: sdkReasoningEffort } : {}),
       providers,
       models: providerModels,
       onPermissionRequest,
+      ...(toolCallBudget ? { hooks: { onPreToolUse: toolCallBudget.onPreToolUse } } : {}),
       ...buildCopilotSDKSessionToolConfig(toolConfig, sdk, webFetchOptions),
     };
     log(`creating session with model="${sessionConfig.model || "(none)"}" providers=${providers?.length ?? 0} models=${providerModels?.length ?? 0}`);
@@ -352,9 +363,11 @@ async function runWithCopilotSDK({
      * @param {string} type
      * @param {any} data
      * @param {string | undefined} [timestamp]
+     * @param {Record<string, any>} [native]
      */
-    function writeEvent(type, data, timestamp) {
-      const entry = { type, timestamp: timestamp ?? new Date().toISOString(), data };
+    function writeEvent(type, data, timestamp, native = {}) {
+      const metadata = Object.fromEntries(["id", "parentId", "agentId", "ephemeral"].filter(key => Object.hasOwn(native, key)).map(key => [key, native[key]]));
+      const entry = { type, timestamp: timestamp ?? new Date().toISOString(), ...metadata, data };
       const jsonl = JSON.stringify(entry) + "\n";
       stream.write(jsonl);
       process.stderr.write(jsonl);
@@ -362,6 +375,10 @@ async function runWithCopilotSDK({
 
     // Subscribe to all session events and serialise the ones we care about.
     session.on(event => {
+      // Workflow lifecycle signals are ephemeral; without this copy they never reach the artifact.
+      if (COPILOT_WORKFLOW_EVENT_TYPES.has(event.type)) {
+        writeEvent(event.type, event.data, event.timestamp, event);
+      }
       // Skip transient events that are not persisted by the server.
       if (event.ephemeral) return;
 
@@ -390,7 +407,7 @@ async function runWithCopilotSDK({
             ...(input === undefined ? {} : { input }),
             ...(command ? { command } : {}),
           };
-          writeEvent("tool.execution_start", eventData, event.timestamp);
+          writeEvent("tool.execution_start", eventData, event.timestamp, event);
           break;
         }
 
@@ -407,7 +424,7 @@ async function runWithCopilotSDK({
           const result = event.data?.result ?? undefined;
           // max-tool-denials intentionally tracks permission denials only.
           // Tool execution failures are still logged, but do not increment the guardrail counter.
-          writeEvent("tool.execution_complete", { toolName, mcpServerName, ...(toolCallId ? { toolCallId } : {}), success, result }, event.timestamp);
+          writeEvent("tool.execution_complete", { toolName, mcpServerName, ...(toolCallId ? { toolCallId } : {}), success, result }, event.timestamp, event);
           break;
         }
 
@@ -418,7 +435,7 @@ async function runWithCopilotSDK({
             output += content;
             assistantTurnCount++;
           }
-          writeEvent("assistant.message", { content }, event.timestamp);
+          writeEvent("assistant.message", { content }, event.timestamp, event);
           break;
         }
 
@@ -443,36 +460,8 @@ async function runWithCopilotSDK({
           writeEvent("session.task_complete", { success: event.data?.success, summary: event.data?.summary }, event.timestamp);
           break;
 
-        case "subagent.started":
-          writeEvent(
-            "subagent.started",
-            {
-              agentName: event.data?.agentName,
-              agentDisplayName: event.data?.agentDisplayName,
-              toolCallId: event.data?.toolCallId,
-            },
-            event.timestamp
-          );
-          break;
-
-        case "subagent.completed":
-          writeEvent("subagent.completed", { agentName: event.data?.agentName, toolCallId: event.data?.toolCallId }, event.timestamp);
-          break;
-
-        case "subagent.failed":
-          writeEvent(
-            "subagent.failed",
-            {
-              agentName: event.data?.agentName,
-              toolCallId: event.data?.toolCallId,
-              error: event.data?.error,
-            },
-            event.timestamp
-          );
-          break;
-
         default:
-          // Other event types are not consumed by unified_timeline.cjs; skip them.
+          // Only the explicitly mapped SDK events are serialized by this adapter.
           break;
       }
 

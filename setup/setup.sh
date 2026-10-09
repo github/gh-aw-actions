@@ -164,7 +164,8 @@ fi
 FILE_COUNT_IN_DIR=$(ls -1 "${JS_SOURCE_DIR}" 2>/dev/null | wc -l)
 debug_log "Found ${FILE_COUNT_IN_DIR} files in ${JS_SOURCE_DIR}"
 
-# Copy all .cjs files from js/ to destination (excluding test files)
+# Copy all .cjs files from js/ to destination (excluding test files), including
+# shared runtime dependencies used by the Copilot harness and SDK driver.
 FILE_COUNT=0
 for file in "${JS_SOURCE_DIR}"/*.cjs; do
   if [ -f "$file" ]; then
@@ -294,16 +295,22 @@ echo "Successfully copied ${MCP_SCRIPTS_COUNT} mcp-scripts files to ${MCP_SCRIPT
 SAFE_OUTPUTS_DEST="${GH_AW_ROOT}/safeoutputs"
 debug_log "Copying safe-outputs files to ${SAFE_OUTPUTS_DEST}"
 create_dir "${SAFE_OUTPUTS_DEST}"
+create_dir "${SAFE_OUTPUTS_DEST}/work-queue"
 
 SAFE_OUTPUTS_FILES=(
   "safe_outputs_mcp_server.cjs"
   "safe_outputs_mcp_server_http.cjs"
   "safe_outputs_mcp_arguments.cjs"
+  "optional_field_normalizer.cjs"
   "safe_outputs_bootstrap.cjs"
   "safe_outputs_tools_loader.cjs"
   "safe_outputs_config.cjs"
   "safe_outputs_config_redact.cjs"
   "safe_outputs_handlers.cjs"
+  "ledger_append.cjs"
+  "ledger_transactions.cjs"
+  "ledger_builtin.cjs"
+  "ledger_store.cjs"
   "symlink_guard.cjs"
   "intent_probe.cjs"
   "allowed_extensions_helpers.cjs"
@@ -327,6 +334,7 @@ SAFE_OUTPUTS_FILES=(
   "messages_footer.cjs"
   "compact_numbers.cjs"
   "model_aliases.cjs"
+  "model_attribution.cjs"
   "messages_header.cjs"
   "messages_run_status.cjs"
   "messages_staged.cjs"
@@ -381,6 +389,47 @@ SAFE_OUTPUTS_FILES=(
   "temporary_id.cjs"
   "invocation_context_helpers.cjs"
   "data_schema_normalizer.cjs"
+  "aw_context.cjs"
+  "redact_secrets.cjs"
+  "experiment_helpers.cjs"
+  "safe_output_helpers.cjs"
+  "add_mask_redaction.cjs"
+  "pi_session_redaction.cjs"
+  "staged_preview.cjs"
+  "finish_work_queue_claim.cjs"
+  "work_queue_binding.cjs"
+  "work_queue_checked_transport.cjs"
+  "work_queue_claim_adapters.cjs"
+  "work_queue_claim_scope.cjs"
+  "work_queue_codec.cjs"
+  "work_queue_control_receipts.cjs"
+  "work_queue_declared_verification.cjs"
+  "work_queue_delivery.cjs"
+  "work_queue_dependency_resolver.cjs"
+  "work_queue_dispatch.cjs"
+  "work_queue_dispatch_credential.cjs"
+  "work_queue_effect_client.cjs"
+  "work_queue_effect_resource.cjs"
+  "work_queue_git_tree_adapter.cjs"
+  "work_queue_graph.cjs"
+  "work_queue_graphql_adapter.cjs"
+  "work_queue_indexes.cjs"
+  "work_queue_intents.cjs"
+  "work_queue_issue_contract.cjs"
+  "work_queue_limits.cjs"
+  "work_queue_logging.cjs"
+  "work_queue_mcp_server.cjs"
+  "work_queue_native.cjs"
+  "work_queue_policy.cjs"
+  "work_queue_provisioning.cjs"
+  "work_queue_reconciler.cjs"
+  "work_queue_replay.cjs"
+  "work_queue_resource_scope.cjs"
+  "work_queue_rest_adapter.cjs"
+  "work_queue_scheduler.cjs"
+  "work_queue_store.cjs"
+  "work_queue_summary_renderer.cjs"
+  "work_queue_yaml.cjs"
 )
 
 SAFE_OUTPUTS_COUNT=0

@@ -24,6 +24,7 @@ const HANDLER_TYPE = "add_labels";
 const { validateLabels } = require("./safe_output_validator.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
+const { resolveTarget } = require("./safe_output_helpers.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
@@ -35,7 +36,7 @@ const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 const { normalizeIssueIntentLabelInputs, buildIssueIntentLabelUpdates } = require("./issue_intents.cjs");
 const { fetchAllRepoLabels } = require("./github_api_helpers.cjs");
-const { SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
+const { ERR_CONFIG, SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
 const { deterministicLabelColor } = require("./create_labels.cjs");
 
 /**
@@ -241,6 +242,11 @@ const main = createCountGatedHandler({
   handlerType: HANDLER_TYPE,
   setup: async (config, maxCount, isStaged) => {
     const { allowed: allowedLabels = [], blocked: blockedPatterns = [] } = config;
+    const configuredMaxLabels = config.max_labels ?? MAX_LABELS;
+    const maxLabels = typeof configuredMaxLabels === "number" ? configuredMaxLabels : typeof configuredMaxLabels === "string" ? Number(configuredMaxLabels) : Number.NaN;
+    if (!Number.isSafeInteger(maxLabels) || maxLabels < 1) {
+      throw new Error(`${ERR_CONFIG}: Invalid max-labels value: ${configuredMaxLabels}. Must be a positive integer`);
+    }
     const target = config.target || "triggering";
     const issueIntentEnabled = config.issue_intent !== false;
     const issueIntentStrict = config.issue_intent === true; // strict mode: plain-string labels rejected, metadata required
@@ -250,7 +256,7 @@ const main = createCountGatedHandler({
     const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
     const githubClient = await createAuthenticatedGitHubClient(config);
 
-    core.info(`Add labels configuration: max=${maxCount}`);
+    core.info(`Add labels configuration: max=${maxCount}, max-labels=${maxLabels}`);
     if (allowedLabels.length > 0) core.info(`Allowed labels: ${allowedLabels.join(", ")}`);
     if (blockedPatterns.length > 0) core.info(`Blocked patterns: ${blockedPatterns.join(", ")}`);
     if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
@@ -278,19 +284,32 @@ const main = createCountGatedHandler({
       const { repo: itemRepo, repoParts } = repoResult;
       core.info(`Target repository: ${itemRepo}`);
 
-      const effectiveContext = resolveInvocationContext(context);
-      const triggeringItemNumber = effectiveContext.eventPayload?.issue?.number ?? effectiveContext.eventPayload?.pull_request?.number;
       let itemNumber;
+      let contextType;
 
       if (target === "*") {
+        const effectiveContext = resolveInvocationContext(context);
+        const triggeringItemNumber = effectiveContext.eventPayload?.issue?.number ?? effectiveContext.eventPayload?.pull_request?.number;
         // Accept common aliases: issue_number, pr_number, and pull_number are normalised to item_number
         const targetResult = resolveSafeOutputIssueTarget({ message, resolvedTemporaryIds, repoParts, handlerType: HANDLER_TYPE });
         if (!targetResult.success) return targetResult;
         itemNumber = targetResult.number ?? triggeringItemNumber;
+        contextType = effectiveContext.eventPayload?.pull_request ? "pull request" : "issue";
       } else if (target === "triggering") {
-        itemNumber = triggeringItemNumber;
+        const targetResult = resolveTarget({ targetConfig: target, item: message, context, itemType: HANDLER_TYPE, supportsPR: true });
+        if (!targetResult.success) {
+          if (targetResult.shouldFail === false) {
+            core.warning(targetResult.error);
+            return { success: false, skipped: true, reason: targetResult.error, error: targetResult.error };
+          }
+          return targetResult;
+        }
+        itemNumber = targetResult.number;
+        contextType = targetResult.contextType;
       } else {
+        const effectiveContext = resolveInvocationContext(context);
         itemNumber = Number(target);
+        contextType = effectiveContext.eventPayload?.pull_request ? "pull request" : "issue";
       }
 
       itemNumber = Number(itemNumber);
@@ -300,7 +319,6 @@ const main = createCountGatedHandler({
         return { success: false, error };
       }
 
-      const contextType = effectiveContext.eventPayload?.pull_request ? "pull request" : "issue";
       const requestedLabels = message.labels ?? [];
       core.info(`Requested labels: ${JSON.stringify(requestedLabels)}`);
       /** @type {Map<string, {name: string, rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean}>} */
@@ -407,15 +425,15 @@ const main = createCountGatedHandler({
         };
       }
 
-      // Enforce max limits on labels before validation
-      const limitResult = tryEnforceArrayLimit(requestedLabelNames, MAX_LABELS, "labels");
+      // Enforce the per-call limit before validation so no requested labels are silently dropped.
+      const limitResult = tryEnforceArrayLimit(requestedLabelNames, maxLabels, "labels");
       if (!limitResult.success) {
         core.warning(`Label limit exceeded: ${limitResult.error}`);
         return { success: false, error: limitResult.error };
       }
 
       // Use validation helper to sanitize and validate labels
-      const labelsResult = validateLabels(requestedLabelNames, allowedLabels, maxCount, blockedPatterns);
+      const labelsResult = validateLabels(requestedLabelNames, allowedLabels, maxLabels, blockedPatterns);
 
       if (!labelsResult.valid) {
         // If no valid labels, log info and return gracefully

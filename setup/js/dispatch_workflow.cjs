@@ -14,7 +14,9 @@ const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { resolveTargetRepoConfig, parseRepoSlug, validateTargetRepo } = require("./repo_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
-const { buildAwContext } = require("./aw_context.cjs");
+const { buildAwContext, resolveWorkQueueRuntime } = require("./aw_context.cjs");
+const { currentClaimHandle } = require("./work_queue_claim_scope.cjs");
+const { createDispatchCredentialValidator } = require("./work_queue_dispatch_credential.cjs");
 const { loadTemporaryIdMapFromResolved, resolveIssueNumber, replaceTemporaryIdReferences } = require("./temporary_id.cjs");
 
 /**
@@ -27,7 +29,8 @@ async function main(config = {}) {
   const allowedWorkflows = config.workflows || [];
   const maxCount = config.max || 1;
   const workflowFiles = config.workflow_files || {}; // Map of workflow name to file extension
-  const awContextWorkflows = new Set(config.aw_context_workflows || []); // Workflows that accept aw_context input
+  const awContextWorkflows = new Set(config.aw_context_workflows || []); // Workflows that accept compiler-managed aw_context
+  const workQueueWorkflows = new Set(config.work_queue_workflows || []); // Queue-enabled workers that accept compiler-managed claims
   const githubClient = await createAuthenticatedGitHubClient(config);
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const allowedRefPatterns = parseAllowedRefPatterns(config.allowed_refs);
@@ -82,6 +85,7 @@ async function main(config = {}) {
 
   // Track how many items we've processed for max limit
   let processedCount = 0;
+  let queueDispatches = 0;
   let lastDispatchTime = 0;
   const isStaged = isStagedMode(config);
 
@@ -165,8 +169,39 @@ async function main(config = {}) {
    * @returns {Promise<Object>} Result with success/error status
    */
   return async function handleDispatchWorkflow(message, resolvedTemporaryIds) {
+    if (message.type === "work_queue_dispatch_next") {
+      if (!config.work_queue_enabled || isCrossRepoDispatch) return { success: false, error: "work_queue_dispatch_next requires a same-repository queue dispatcher" };
+      try {
+        const { dispatchQueueIntent } = require("./work_queue_dispatch.cjs");
+        if (!isStaged && config.work_queue_dispatch_credential === undefined) throw new Error("work_queue_dispatch_credential_binding_required");
+        const validateDispatchCredential = isStaged ? undefined : createDispatchCredentialValidator(githubClient, config.work_queue_dispatch_credential, config["github-token"]);
+        const result = await dispatchQueueIntent({
+          message,
+          config,
+          queueClient: github,
+          dispatchClient: githubClient,
+          validateDispatchCredential,
+          context,
+          core,
+          remainingDispatches: maxCount - processedCount - queueDispatches,
+          staged: isStaged,
+        });
+        queueDispatches += result.dispatches ?? 0;
+        return result;
+      } catch {
+        return { success: false, error: "Work queue dispatch failed closed; inspect its durable request and launch state" };
+      }
+    }
+    if (config.work_queue_enabled || process.env.GH_AW_WORK_QUEUE_ENABLED === "true" || currentClaimHandle()) {
+      const observer = process.env.GH_AW_WORK_QUEUE_ROLE === "observer" && !currentClaimHandle() && resolveWorkQueueRuntime(context.payload).role === "observer";
+      if (!observer) return { success: false, error: "Queue-scoped code cannot delegate an ordinary workflow dispatch; stage publisher-selected work_queue_dispatch_next" };
+    }
+    const protectedQueue = config.work_queue_enabled || process.env.GH_AW_WORK_QUEUE_ENABLED === "true" || currentClaimHandle() || (typeof message.workflow_name === "string" && workQueueWorkflows.has(message.workflow_name.trim()));
+    if (protectedQueue && message.inputs && ["work_queue", "work_claim", "work_queue_claim", "work_queue_assignment"].some(key => Object.hasOwn(message.inputs, key))) {
+      return { success: false, error: "Agent-supplied queue assignments and Work selectors are unsupported; stage work_queue_dispatch_next" };
+    }
     // Check if we've hit the max limit
-    if (processedCount >= maxCount) {
+    if (processedCount + queueDispatches >= maxCount) {
       core.warning(`Skipping dispatch_workflow: max count of ${maxCount} reached`);
       return {
         success: false,
@@ -184,6 +219,9 @@ async function main(config = {}) {
         success: false,
         error: "Workflow name is empty",
       };
+    }
+    if (workQueueWorkflows.has(workflowName)) {
+      return { success: false, error: "Queue workers require a publisher-selected immutable assignment; stage work_queue_dispatch_next" };
     }
 
     // Validate workflow is in allowed list
@@ -239,6 +277,10 @@ async function main(config = {}) {
         };
       }
 
+      if (!protectedQueue && message.inputs?.work_queue !== undefined) {
+        throw new Error("Work queue dispatch requires tools.work-queue, a same-repository worker with aw_context, and tools.work-queue enabled on the worker");
+      }
+
       // Prepare inputs - convert all values to strings as required by workflow_dispatch
       // and resolve any #temporary_id references before dispatching
       /** @type {Record<string, string>} */
@@ -248,6 +290,7 @@ async function main(config = {}) {
         const temporaryIdMap = loadTemporaryIdMapFromResolved(resolvedTemporaryIds);
 
         for (const [key, value] of Object.entries(message.inputs)) {
+          if (key === "aw_context" || key === "work_queue" || key === "work_queue_claim" || (protectedQueue && key === "work_queue_assignment")) continue;
           // Convert value to string
           let strValue;
           if (value === null || value === undefined) {
@@ -284,8 +327,7 @@ async function main(config = {}) {
         }
       }
 
-      // Inject aw_context if the target workflow declares it as an input.
-      // Only workflows listed in aw_context_workflows (populated at compile time) support this.
+      // Inject caller context into any compiler-managed workflow_dispatch target.
       if (awContextWorkflows.has(workflowName)) {
         inputs["aw_context"] = JSON.stringify(buildAwContext());
       }
@@ -335,7 +377,7 @@ async function main(config = {}) {
         /** @type {any} */
         const err = dispatchError;
         const status = err && typeof err === "object" ? err.status : undefined;
-        const dispatchErrMessage = typeof err?.response?.data?.message === "string" ? err.response.data.message : String(dispatchError);
+        const dispatchErrMessage = err?.response?.data?.message !== undefined ? String(err.response.data.message) : String(dispatchError);
 
         const isValidationStatus = status === 400 || status === 422;
         const mentionsReturnRunDetails = typeof dispatchErrMessage === "string" && dispatchErrMessage.toLowerCase().includes("return_run_details");
@@ -353,7 +395,6 @@ async function main(config = {}) {
           throw err;
         }
       }
-
       const runId = response && response.data ? response.data.workflow_run_id : undefined;
       if (runId) {
         core.info(`✓ Successfully dispatched workflow: ${workflowFile} (run ID: ${runId})`);

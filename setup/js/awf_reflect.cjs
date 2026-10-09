@@ -18,12 +18,12 @@
 require("./shim.cjs");
 
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const net = require("net");
 const tls = require("tls");
 const { withRetry, sleep } = require("./error_recovery.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { AWF_REFLECT_OUTPUT_PATH } = require("./awf_reflect_paths.cjs");
 
 function parseReflectTimeoutMs(value) {
   const rawValue = String(value || "").trim();
@@ -38,8 +38,6 @@ function parseReflectTimeoutMs(value) {
 // The api-proxy sidecar exposes /reflect on its management port (port 10000) inside the AWF
 // Docker network. From the agent container, the proxy is reachable via the "api-proxy" hostname.
 const AWF_API_PROXY_REFLECT_URL = "http://api-proxy:10000/reflect";
-// Persist outside the read-only gh-aw infrastructure mount.
-const AWF_REFLECT_OUTPUT_PATH = path.join(process.env.RUNNER_TEMP || os.tmpdir(), "awf-reflect.json");
 // Milliseconds to wait for the /reflect endpoint before giving up.
 const AWF_REFLECT_TIMEOUT_MS = parseReflectTimeoutMs(process.env.GH_AW_REFLECT_TIMEOUT_MS);
 // Milliseconds to wait for each models_url fallback fetch (shorter than the main reflect timeout).
@@ -83,6 +81,13 @@ const REFLECT_PROVIDER_ANTHROPIC = "anthropic";
 /**
  * @typedef {{
  *   endpoints?: ReflectEndpoint[],
+ *   routing?: {
+ *     status?: string,
+ *     failure_code?: string,
+ *     mode?: string,
+ *     selection?: { id?: string },
+ *     router?: { version?: string },
+ *   },
  * }} ReflectData
  */
 
@@ -375,7 +380,7 @@ async function enrichReflectModels(reflectData, timeoutMs, logger) {
  *   reflectUrl: string,
  *   outputPath: string,
  *   bytesWritten?: number,
- *   reflectData?: object,
+ *   reflectData?: ReflectData,
  *   reason?: "disabled"|"unexpected_status"|"timeout"|"request_failed",
  *   status?: number,
  *   error?: string,
@@ -596,6 +601,7 @@ function isOpenAIModelName(model) {
 
 /**
  * Look up a model entry in the models.json catalog, case-insensitively.
+ * Exact model IDs take precedence over the base-model fallback for `-utility` variants.
  *
  * @param {any} modelsJson
  * @param {string} modelName
@@ -604,6 +610,7 @@ function isOpenAIModelName(model) {
  */
 function getCatalogModelEntry(modelsJson, modelName, providerName) {
   const model = String(modelName || "")
+    .split("?")[0]
     .toLowerCase()
     .trim();
   const provider = String(providerName || "")
@@ -624,17 +631,26 @@ function getCatalogModelEntry(modelsJson, modelName, providerName) {
             .trim() === provider
       )
     : Object.entries(providers);
+  const modelEntriesByProvider = [];
   for (const [, providerData] of providerEntries) {
     const models = providerData && typeof providerData === "object" ? providerData.models : null;
     if (!models || typeof models !== "object" || Array.isArray(models)) continue;
+    const modelEntriesByName = new Map();
     for (const [catalogModel, catalogEntry] of Object.entries(models)) {
-      if (
-        String(catalogModel || "")
-          .toLowerCase()
-          .trim() === model
-      ) {
-        return catalogEntry && typeof catalogEntry === "object" && !Array.isArray(catalogEntry) ? catalogEntry : null;
-      }
+      const normalizedCatalogModel = String(catalogModel || "")
+        .toLowerCase()
+        .trim();
+      if (!modelEntriesByName.has(normalizedCatalogModel)) modelEntriesByName.set(normalizedCatalogModel, catalogEntry);
+    }
+    modelEntriesByProvider.push(modelEntriesByName);
+  }
+  const lookupModelNames = [model];
+  if (model.endsWith("-utility")) lookupModelNames.push(model.slice(0, -"-utility".length));
+  for (const lookupModelName of lookupModelNames) {
+    for (const modelEntriesByName of modelEntriesByProvider) {
+      if (!modelEntriesByName.has(lookupModelName)) continue;
+      const catalogEntry = modelEntriesByName.get(lookupModelName);
+      return catalogEntry && typeof catalogEntry === "object" && !Array.isArray(catalogEntry) ? catalogEntry : null;
     }
   }
   return null;
@@ -702,7 +718,8 @@ function inferProviderTypeForModel(endpointProvider, modelName, catalogEntryOrMo
  * Resolution order:
  *   1. For Anthropic provider types: undefined (wireApi ignored by SDK).
  *   2. `models.json` explicit `wire_api`/`wireApi`.
- *   3. Heuristic default for OpenAI/Azure-compatible models: "completions".
+ *   3. Heuristic default for GPT-5+ models: "responses".
+ *   4. Default for other OpenAI/Azure-compatible models: "completions".
  *
  * @param {"openai" | "azure" | "anthropic"} providerType
  * @param {string} modelName
@@ -727,6 +744,9 @@ function inferWireApiForModel(providerType, modelName, catalogEntryOrModelsJson)
     .trim();
   if (normalizedWireApi === "responses" || normalizedWireApi === "completions") {
     return /** @type {"responses" | "completions"} */ normalizedWireApi;
+  }
+  if (/^gpt-(?:[5-9]|\d{2,})(?:[.-]|$)/i.test(model.split("?")[0])) {
+    return "responses";
   }
   return "completions";
 }
@@ -906,9 +926,12 @@ function resolveOpenAICompatibleEndpointFromReflect(options) {
  *
  * The primary model is the first model that matches `options.model` (if set),
  * otherwise the first model across all providers.
+ * A valid `options.wireApi` overrides inference for the primary provider only,
+ * except for Anthropic providers, which do not use an OpenAI wire API.
  *
  * @param {{
  *   model?: string,
+ *   wireApi?: string,
  *   reflectData: ReflectData | null | undefined,
  *   modelsJson?: object | null,
  *   logger?: (msg: string) => void,
@@ -1015,6 +1038,16 @@ function resolveMultiProviderFromReflect(options) {
   if (!primaryModel) {
     logger("sdk-mode(multi): no models found in awf-reflect endpoints; cannot build multi-provider config");
     return null;
+  }
+
+  const primaryProviderName = models.find(m => m.id === primaryModel)?.provider;
+  const primaryProvider = providers.find(p => p.name === primaryProviderName);
+  const wireApi = String(options?.wireApi || "")
+    .toLowerCase()
+    .trim();
+  if (primaryProvider && primaryProvider.type !== "anthropic" && (wireApi === "responses" || wireApi === "completions")) {
+    primaryProvider.wireApi = wireApi;
+    logger(`sdk-mode(multi): primary provider="${primaryProvider.name}" wireApi="${wireApi}" selected from configured wire API`);
   }
 
   logger(`sdk-mode(multi): resolved ${providers.length} providers, ${models.length} models (primary model: ${primaryModel})`);

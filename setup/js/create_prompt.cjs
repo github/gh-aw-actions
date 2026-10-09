@@ -5,17 +5,21 @@ const fs = require("fs");
 const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_CONFIG, ERR_PARSE, ERR_SYSTEM } = require("./error_codes.cjs");
+const { readInboundWorkQueueAssignment } = require("./aw_context.cjs");
+const LEDGER_REPLAY_PROMPT = "/tmp/gh-aw/ledgers/replay-prompt.txt";
 
 /**
  * @typedef {Object} PromptRenderItem
  * @property {string} [content_env]
  * @property {string} [file]
  * @property {string} [condition_env]
+ * @property {boolean} [ledger_replay]
  */
 
 /**
  * @typedef {Object} PromptRenderConfig
  * @property {PromptRenderItem[]} items
+ * @property {number} [system_item_count]
  */
 
 /**
@@ -32,6 +36,9 @@ function parseConfig(value) {
   }
   if (!parsed || !Array.isArray(parsed.items)) {
     throw new Error(`${ERR_CONFIG}: GH_AW_PROMPT_CONFIG must contain an items array`);
+  }
+  if (parsed.system_item_count !== undefined && (!Number.isInteger(parsed.system_item_count) || parsed.system_item_count < 0 || parsed.system_item_count > parsed.items.length)) {
+    throw new Error(`${ERR_CONFIG}: GH_AW_PROMPT_CONFIG has an invalid system_item_count`);
   }
   return parsed;
 }
@@ -99,9 +106,10 @@ function writePromptFile(promptPath, content) {
  * @param {PromptRenderConfig} config
  * @param {NodeJS.ProcessEnv} env
  * @param {string} promptsDir
+ * @param {string} [replayPromptPath]
  * @returns {string}
  */
-function renderPrompt(config, env, promptsDir) {
+function renderPrompt(config, env, promptsDir, replayPromptPath = LEDGER_REPLAY_PROMPT) {
   let result = "";
 
   for (const item of config.items) {
@@ -109,6 +117,12 @@ function renderPrompt(config, env, promptsDir) {
       throw new Error(`${ERR_CONFIG}: Prompt render item must be an object`);
     }
     if (item.condition_env && env[item.condition_env] !== "true") {
+      continue;
+    }
+    if (item.ledger_replay === true && item.content_env === undefined && item.file === undefined) {
+      const stat = fs.lstatSync(replayPromptPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) throw new Error(`${ERR_CONFIG}: Invalid ledger replay prompt`);
+      result += fs.readFileSync(replayPromptPath, "utf8");
       continue;
     }
 
@@ -142,6 +156,22 @@ function renderPrompt(config, env, promptsDir) {
   return result;
 }
 
+function renderWorkClaim(payload) {
+  const assignment = readInboundWorkQueueAssignment(payload);
+  if (!assignment) {
+    return "";
+  }
+
+  return assignment.claims
+    .map(member => {
+      const work = JSON.stringify({ id: member.work_id, payload: member.work, result_refs: member.result_refs }).replace(/</g, "\\u003c");
+      const claim = JSON.stringify({ dispatch_id: assignment.dispatch_id, id: member.claim_id, work_id: member.work_id, claim_handle: member.handle }).replace(/</g, "\\u003c");
+      const handle = JSON.stringify(member.handle).replace(/</g, "\\u003c");
+      return `<work-claim>\n${work}\n${claim}\nWhen the work is complete, call work_queue_claim_finish with outcome "completed" and claim_handle ${handle} to record the finish intent. If you cannot complete the work, call it with outcome "cancelled" and the same claim_handle. Always include this claim_handle on safe outputs and queue-control calls. The claim is only complete after trusted reconciliation verifies it; recording intent alone does not authorize safe outputs.\n</work-claim>\n`;
+    })
+    .join("");
+}
+
 /**
  * @param {typeof import('@actions/core')} core - GitHub Actions core library
  * @returns {Promise<void>}
@@ -164,7 +194,10 @@ async function main(core) {
     const config = parseConfig(configValue);
     const promptsDir = path.join(runnerTemp, "gh-aw", "prompts");
     const promptOutputDir = path.join(runnerTemp, "gh-aw", "aw-prompts");
-    const content = renderPrompt(config, process.env, promptsDir);
+    const systemItemCount = config.system_item_count ?? 0;
+    const systemContent = renderPrompt({ items: config.items.slice(0, systemItemCount) }, process.env, promptsDir);
+    const userContent = renderWorkClaim(typeof context === "undefined" ? null : context.payload) + renderPrompt({ items: config.items.slice(systemItemCount) }, process.env, promptsDir);
+    const content = systemContent + userContent;
 
     fs.mkdirSync(promptOutputDir, { recursive: true, mode: 0o700 });
     const unresolvedOutputDir = path.resolve(promptOutputDir);
@@ -173,6 +206,8 @@ async function main(core) {
     const resolvedOutputDir = fs.realpathSync(promptOutputDir);
     assertPathWithin(fs.realpathSync(runnerTemp), resolvedOutputDir);
     const resolvedPromptPath = path.resolve(resolvedOutputDir, path.relative(unresolvedOutputDir, unresolvedPromptPath));
+    writePromptFile(path.join(resolvedOutputDir, "system.txt"), systemContent);
+    writePromptFile(path.join(resolvedOutputDir, "user.txt"), userContent);
     writePromptFile(resolvedPromptPath, content);
     core.info(`Created prompt at ${resolvedPromptPath} (${Buffer.byteLength(content, "utf8")} bytes)`);
   } catch (error) {

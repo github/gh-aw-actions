@@ -25,14 +25,68 @@ const { parseAllowedExtensionsEnv } = require("./allowed_extensions_helpers.cjs"
 const { getStagedPatchDiffSizeBytes } = require("./git_patch_utils.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
 const { parseDeduplicateByTitle, normalizeTitleForDedup, findDuplicateByTitle } = require("./issue_title_dedup.cjs");
-const { validateCreatePullRequestIntent, validatePushToPullRequestBranchIntent, validateCreateIssueIntent, validateAddCommentIntent } = require("./intent_probe.cjs");
+const { isProbingNoopMessage, validateCreatePullRequestIntent, validatePushToPullRequestBranchIntent, validateCreateIssueIntent, validateAddCommentIntent } = require("./intent_probe.cjs");
 const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 const { lstatGuard } = require("./symlink_guard.cjs");
 const { validateValueAgainstSchema } = require("./mcp_scripts_validation.cjs");
 const { resolveDataSchema } = require("./data_schema_normalizer.cjs");
+const { normalizeBlankOptionalFields } = require("./optional_field_normalizer.cjs");
 const { clearValidationMarker, formatJSONFiles, runCustomMemoryValidation, writeValidationMarker } = require("./memory_custom_validation.cjs");
-const { filterIneligibleMemoryFiles } = require("./memory_file_eligibility.cjs");
+const { compileFileGlobPatterns, isMemoryFileEligible } = require("./memory_file_eligibility.cjs");
+const { normalizeRuntimeMessage, readClaimScopeContext, withClaimExecution, currentClaimHandle, claimArtifactPath } = require("./work_queue_claim_scope.cjs");
+
+function createEligibleMemoryValidationView(memoryDir, isEligibleFile) {
+  let validationDir;
+  try {
+    validationDir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-repo-memory-validation-"));
+  } catch (error) {
+    throw new Error(`${ERR_SYSTEM}: Failed to create repo-memory validation directory: ${getErrorMessage(error)}`, { cause: error });
+  }
+
+  /**
+   * @param {string} targetPath
+   */
+  function removeValidationDirectory(targetPath) {
+    try {
+      fs.rmSync(targetPath, { recursive: true, force: true });
+    } catch (error) {
+      throw new Error(`${ERR_SYSTEM}: Failed to remove repo-memory validation directory: ${getErrorMessage(error)}`, { cause: error });
+    }
+  }
+
+  try {
+    /**
+     * @param {string} sourceDir
+     * @param {string} relativePath
+     */
+    function copyEligibleFiles(sourceDir, relativePath) {
+      for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+        const sourcePath = path.join(sourceDir, entry.name);
+        const relativeFilePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
+        if (entry.isDirectory()) {
+          if (entry.name !== ".git") {
+            copyEligibleFiles(sourcePath, relativeFilePath);
+          }
+        } else if (entry.isFile() && isEligibleFile(relativeFilePath)) {
+          const targetPath = path.join(validationDir, relativeFilePath);
+          fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+          fs.copyFileSync(sourcePath, targetPath);
+        }
+      }
+    }
+
+    copyEligibleFiles(memoryDir, "");
+    return validationDir;
+  } catch (error) {
+    try {
+      removeValidationDirectory(validationDir);
+    } catch (cleanupError) {
+      throw new Error(`${ERR_SYSTEM}: Failed to create repo-memory validation view: ${getErrorMessage(error)}; cleanup also failed: ${getErrorMessage(cleanupError)}`, { cause: error });
+    }
+    throw error;
+  }
+}
 
 /** PR event names used for target:triggering context validation across all safe-output handlers. */
 const PR_EVENT_NAMES = new Set(["pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment"]);
@@ -103,6 +157,7 @@ function readJSONFile(filePath) {
 const safeOutputsTools = readJSONFile(path.join(__dirname, "safe_outputs_tools.json"));
 
 const safeOutputsToolMap = new Map(safeOutputsTools.map(tool => [tool.name.replace(/-/g, "_"), tool]));
+const { validateOperation } = require("./ledger_builtin.cjs");
 
 /**
  * @param {string} error
@@ -386,6 +441,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    */
   const operationCounts = new Map();
   const uploadedAssetPaths = new Set();
+  const scopedKey = value => JSON.stringify([currentClaimHandle() || null, value]);
 
   /**
    * Return the explicitly user-configured max for a safe-output type, or null if not set / unlimited.
@@ -419,7 +475,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
   function enforcePerTypeMax(type) {
     const maxAllowed = getExplicitMax(type);
     if (maxAllowed === null) return; // no explicit limit configured
-    const current = operationCounts.get(type) || 0;
+    const current = operationCounts.get(scopedKey(type)) || 0;
     if (current >= maxAllowed) {
       throw {
         code: -32602,
@@ -447,11 +503,24 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * Per Safe Outputs Specification MCE4: invocation-time half of dual enforcement.
    * @param {Record<string, any>} entry
    */
+  /**
+   * Probing entries are schema probes (e.g. `noop` with message "test") rather than a
+   * genuine signal. They are ignored entirely: not recorded, not counted against the
+   * type budget, so a probe never crowds out or short-circuits the real signal.
+   * @param {Record<string, any>} entry
+   * @returns {boolean}
+   */
+  const isIgnoredProbingEntry = entry => entry?.type === "noop" && isProbingNoopMessage(entry?.message);
+
   const appendSafeOutputCounted = entry => {
+    if (isIgnoredProbingEntry(entry)) {
+      server.debug(`Ignoring probing noop call (not recorded, does not consume the noop budget): ${JSON.stringify(entry?.message)}`);
+      return;
+    }
     const type = entry?.type;
     if (type) enforcePerTypeMax(type);
     appendSafeOutput(entry);
-    if (type) operationCounts.set(type, (operationCounts.get(type) || 0) + 1);
+    if (type) operationCounts.set(scopedKey(type), (operationCounts.get(scopedKey(type)) || 0) + 1);
   };
 
   /**
@@ -581,6 +650,32 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     };
   };
 
+  const ledgerBuiltinHandler = (ledgerType, operation) => args => {
+    const ledgers = config.ledger_append?.ledgers || [];
+    const candidates = ledgers.filter(ledger => ledger.type === ledgerType);
+    const target = args?.ledger === undefined && candidates.length === 1 ? candidates[0] : candidates.find(ledger => ledger.name === args?.ledger);
+    if (!target) return buildIntentErrorResponse("Specify a configured ledger of the correct built-in type.");
+    const { ledger: _ledger, temp_id, ...fields } = args || {};
+    const claimHandle = currentClaimHandle();
+    if (claimHandle) {
+      for (const field of ["claim_handle", "claim_id", "work_id"]) delete fields[field];
+    }
+    if (Object.hasOwn(fields, "operation")) return buildIntentErrorResponse("Invalid built-in ledger operation arguments.");
+    const record = { operation, ...fields };
+    try {
+      validateOperation(record, target);
+    } catch {
+      return buildIntentErrorResponse("Invalid built-in ledger operation arguments.");
+    }
+    return defaultHandler("ledger_append")({ ledger: target.name, ...(temp_id !== undefined && { temp_id }), ...(claimHandle ? { claim_handle: claimHandle } : {}), ...record });
+  };
+  const ledgerAgentAppendHandler = args => {
+    const ledgers = config.ledger_append?.ledgers || [];
+    const target = ledgers.find(ledger => ledger.name === args?.ledger) || (args?.ledger === undefined && ledgers.length === 1 ? ledgers[0] : null);
+    if (target?.type === "notes") return buildIntentErrorResponse("Use ledger_note_add or ledger_note_vote for notes ledgers.");
+    return defaultHandler("ledger_append")(args);
+  };
+
   const createIssueConfig = config.create_issue || {};
   let deduplicateByTitle = { enabled: false, maxDistance: 0 };
   try {
@@ -616,7 +711,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     if (!isInWorkspace && !isInTmp) {
       throw new Error(`${ERR_CONFIG}: File path must be within workspace directory (${workspaceDir}) or /tmp directory. ` + `Provided path: ${filePath} (resolved to: ${absolutePath})`);
     }
-    if (uploadedAssetPaths.has(absolutePath)) {
+    if (uploadedAssetPaths.has(scopedKey(absolutePath))) {
       throw new Error(`${ERR_VALIDATION}: Duplicate upload_asset source path is not allowed: ${filePath}`);
     }
 
@@ -662,7 +757,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // Create assets directory
     // Use RUNNER_TEMP so the staged files land on the host filesystem (shared with
     // the artifact-upload step), matching the same pattern used by upload_artifact.
-    const assetsDir = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "assets");
+    const assetsRoot = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "assets");
+    const assetsDir = currentClaimHandle() ? claimArtifactPath(assetsRoot, currentClaimHandle()) : assetsRoot;
     if (!fs.existsSync(assetsDir)) {
       try {
         fs.mkdirSync(assetsDir, { recursive: true });
@@ -695,21 +791,22 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
 
     // Generate target filename as sha + extension (lowercased)
-    const targetFileName = (sha + fileExt).toLowerCase();
+    const targetFileName = currentClaimHandle() ? `claims/${path.basename(claimArtifactPath("", currentClaimHandle()))}/${sha}${fileExt}` : (sha + fileExt).toLowerCase();
 
     const githubServer = process.env.GITHUB_SERVER_URL || "https://github.com";
     const repo = process.env.GITHUB_REPOSITORY || "owner/repo";
+    const assetBranch = currentClaimHandle() ? `${normalizedBranchName}/claims/${path.basename(claimArtifactPath("", currentClaimHandle()))}` : normalizedBranchName;
     let url;
     try {
       const serverHostname = new URL(githubServer).hostname;
       if (serverHostname === "github.com") {
-        url = `https://github.com/${repo}/blob/${normalizedBranchName}/${targetFileName}?raw=true`;
+        url = `https://github.com/${repo}/blob/${assetBranch}/${targetFileName}?raw=true`;
       } else {
         // GitHub Enterprise Server - raw content is served from the same host with /raw/ path
-        url = `${githubServer}/${repo}/raw/${normalizedBranchName}/${targetFileName}`;
+        url = `${githubServer}/${repo}/raw/${assetBranch}/${targetFileName}`;
       }
     } catch {
-      url = `${githubServer}/${repo}/raw/${normalizedBranchName}/${targetFileName}`;
+      url = `${githubServer}/${repo}/raw/${assetBranch}/${targetFileName}`;
     }
 
     // Create entry for safe outputs
@@ -724,7 +821,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     };
 
     appendSafeOutputCounted(entry);
-    uploadedAssetPaths.add(absolutePath);
+    uploadedAssetPaths.add(scopedKey(absolutePath));
 
     return {
       content: [
@@ -831,10 +928,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
               text: JSON.stringify({
                 result: "error",
                 error: checkoutResult.error,
-                details:
-                  `Repository '${repoSlug}' was not found as a git checkout in the workspace. ` +
-                  `For multi-repo workflows, use actions/checkout with a 'path' parameter to checkout ` +
-                  `each repo to a subdirectory (e.g., 'repos/repo-a/').`,
+                details: checkoutResult.error,
               }),
             },
           ],
@@ -1278,7 +1372,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
               type: "text",
               text: JSON.stringify({
                 result: "error",
-                error: `Repository '${itemRepo}' not found in workspace. Check out the target repo with actions/checkout and set its 'path' input so the checkout can be located. If checking out multiple repositories, ensure each actions/checkout step uses the appropriate 'path' input.`,
+                error: checkoutResult.error,
               }),
             },
           ],
@@ -1807,22 +1901,16 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
-    // Allowed-extensions and file-glob are persistence filters: ineligible files must be
-    // removed here too, before formatting/scanning/staging/custom-validation, so this
-    // preflight sees the same effective file set as the later filter/upload/push steps
-    // and never hard-fails on a file that would have been silently dropped downstream.
-    if (allowedExtensions.length > 0 || fileGlobFilter) {
-      const { removed } = filterIneligibleMemoryFiles(memoryDir, allowedExtensions, fileGlobFilter, core);
-      if (removed.length > 0) {
-        core.info(`push_repo_memory: ignored ${removed.length} ineligible file(s) before validation`);
-      }
-    }
+    // Persistence filters apply to validation and staging, but validation must
+    // not delete files from the agent's working directory.
+    const { compiledPatterns } = compileFileGlobPatterns(fileGlobFilter);
+    const isEligibleFile = relativePath => isMemoryFileEligible(relativePath, allowedExtensions, compiledPatterns).eligible;
 
     clearValidationMarker("repo", memoryId);
 
     if (memoryConf.format_json === true) {
       try {
-        const formattedFiles = formatJSONFiles(memoryDir, maxFileSize);
+        const formattedFiles = formatJSONFiles(memoryDir, maxFileSize, isEligibleFile);
         if (formattedFiles.length > 0) {
           core.info(`Formatted ${formattedFiles.length} repo-memory JSON file(s) before validation: ${formattedFiles.join(", ")}`);
         }
@@ -1869,6 +1957,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         if (entry.isDirectory()) {
           scanDir(fullPath, relPath);
         } else if (entry.isFile()) {
+          if (!isEligibleFile(relPath)) {
+            continue;
+          }
           let stats;
           try {
             stats = fs.statSync(fullPath);
@@ -1941,8 +2032,14 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     let patchSizeBytes;
     try {
       ensureSafeDirectoryTrust(memoryDir, server);
-      execGitSync(["add", "--sparse", "."], { cwd: memoryDir, stdio: "pipe" });
-      patchSizeBytes = getStagedPatchDiffSizeBytes({ execGitSyncFn: execGitSync, cwd: memoryDir });
+      const stagedFiles = execGitSync(["diff", "--cached", "--no-renames", "--name-only", "-z"], { cwd: memoryDir, stdio: "pipe" }).split("\0").filter(Boolean).filter(isEligibleFile);
+      const trackedFiles = execGitSync(["ls-files", "-z"], { cwd: memoryDir, stdio: "pipe" }).split("\0").filter(Boolean).filter(isEligibleFile);
+      const filesToStage = [...new Set([...files.map(file => file.relativePath), ...trackedFiles])];
+      if (filesToStage.length > 0) {
+        execGitSync(["add", "--sparse", "--all", "--", ...filesToStage.map(file => `:(literal)${file}`)], { cwd: memoryDir, stdio: "pipe" });
+      }
+      const filesToMeasure = [...new Set([...stagedFiles, ...filesToStage])].map(file => `:(literal)${file}`);
+      patchSizeBytes = getStagedPatchDiffSizeBytes({ execGitSyncFn: execGitSync, cwd: memoryDir, pathspecs: filesToMeasure });
     } catch (/** @type {any} */ error) {
       return {
         content: [
@@ -1983,13 +2080,22 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     /** @type {ReturnType<typeof runCustomMemoryValidation> | null} */
     let customValidation = null;
     if (validationConfig) {
-      customValidation = runCustomMemoryValidation({
-        script: validationScript,
-        memoryDir,
-        memoryId,
-        kind: "repo",
-        timeoutSeconds: validationTimeoutSeconds,
-      });
+      const validationDir = createEligibleMemoryValidationView(memoryDir, isEligibleFile);
+      try {
+        customValidation = runCustomMemoryValidation({
+          script: validationScript,
+          memoryDir: validationDir,
+          memoryId,
+          kind: "repo",
+          timeoutSeconds: validationTimeoutSeconds,
+        });
+      } finally {
+        try {
+          fs.rmSync(validationDir, { recursive: true, force: true });
+        } catch (error) {
+          throw new Error(`${ERR_SYSTEM}: Failed to clean up repo-memory validation directory: ${getErrorMessage(error)}`, { cause: error });
+        }
+      }
       if (!customValidation.ok) {
         const reason = customValidation.timedOut ? `timed out after ${validationTimeoutSeconds || 30} second(s)` : `exited with code ${customValidation.exitCode}`;
         return {
@@ -2094,7 +2200,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
     if (deduplicateByTitle.enabled) {
       const normalizedTitle = normalizeTitleForDedup(resolvedTitle);
-      const seenTitles = seenIssueTitlesByRepo.get(resolvedRepo) || [];
+      const seenTitles = seenIssueTitlesByRepo.get(scopedKey(resolvedRepo)) || [];
       const duplicate = findDuplicateByTitle(normalizedTitle, seenTitles, deduplicateByTitle.maxDistance);
       if (duplicate) {
         const droppedEntry = {
@@ -2121,7 +2227,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         };
       }
       seenTitles.push({ title: resolvedTitle, normalizedTitle });
-      seenIssueTitlesByRepo.set(resolvedRepo, seenTitles);
+      seenIssueTitlesByRepo.set(scopedKey(resolvedRepo), seenTitles);
     }
 
     const largeContentResponse = maybeHandleLargeContent(entry);
@@ -2296,13 +2402,16 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       );
     }
 
-    // Reject target:triggering early when no explicit item number and no issue/PR/discussion context.
+    const entry = { ...(args || {}), type: "add_comment" };
+    const commentIdValidationResult = validateAllowedAddCommentId(entry, addCommentConfig);
+    if (commentIdValidationResult.error) {
+      return commentIdValidationResult.error;
+    }
+
+    // Reject target:triggering early when no issue/PR/discussion target can be resolved.
     // Per Safe Outputs Specification MCE1: provides actionable feedback before writing to NDJSON.
-    // Mirrors update_issue validation; explicit item_number bypasses this check because the
-    // downstream handler resolves explicit numbers before falling back to triggering context.
     const effectiveAddCommentTarget = addCommentConfig.target || "triggering";
-    const hasExplicitItemNumber = args?.item_number != null || args?.issue_number != null || args?.["pr-number"] != null;
-    if (effectiveAddCommentTarget === "triggering" && !hasExplicitItemNumber) {
+    if (effectiveAddCommentTarget === "triggering") {
       /** @type {any} */
       let invocationContext = null;
       try {
@@ -2321,23 +2430,24 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         const isIssueContext = effectiveEventName === "issues" || (effectiveEventName === "issue_comment" && !isIssueCommentOnPR);
         const isPRContext = PR_EVENT_NAMES.has(effectiveEventName) || isIssueCommentOnPR;
         const isDiscussionContext = effectiveEventName === "discussion" || effectiveEventName === "discussion_comment";
-        if (!isIssueContext && !isPRContext && !isDiscussionContext) {
+        const triggeringNumber = isDiscussionContext
+          ? effectivePayload?.discussion?.number
+          : isPRContext
+            ? effectivePayload?.pull_request?.number || (isIssueCommentOnPR ? effectivePayload?.issue?.number : null)
+            : isIssueContext
+              ? effectivePayload?.issue?.number
+              : null;
+        if (!triggeringNumber) {
           return buildIntentErrorResponse(
-            `add_comment requires an issue, pull request, or discussion context but the workflow is running on a "${effectiveEventName}" event. ` +
+            `add_comment cannot resolve an issue, pull request, or discussion target from the "${effectiveEventName}" event payload. ` +
               `The add-comment handler uses target: triggering which only applies when an issue, pull request, or discussion triggered the workflow. ` +
               `To report results from this workflow, use create_discussion or create_issue instead. ` +
-              `If you need to comment on a specific item, provide an explicit item_number.`
+              `If you need to comment on a specific item, configure safe-outputs.add-comment.target to "*" and provide an explicit item_number.`
           );
         }
       }
     }
 
-    // Build the entry with a temporary_id
-    const entry = { ...(args || {}), type: "add_comment" };
-    const commentIdValidationResult = validateAllowedAddCommentId(entry, addCommentConfig);
-    if (commentIdValidationResult.error) {
-      return commentIdValidationResult.error;
-    }
     if (commentIdValidationResult.commentId === undefined) {
       // entry was spread from args, so a blank/whitespace comment_id (rather than an
       // absent one) could still be sitting on entry; strip it so downstream code never
@@ -2389,7 +2499,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * Incremented by createPullRequestReviewCommentHandler, read by submitPullRequestReviewHandler
    * to guard against empty review submissions at the MCP server phase.
    */
-  let inlineReviewCommentCount = 0;
+  const inlineReviewCommentCounts = new Map();
 
   /**
    * Handler for create_pull_request_review_comment tool (MCP server phase).
@@ -2404,7 +2514,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // (e.g. due to large-content rejection or an append write error) the counter
     // must not advance so the empty-review guard remains accurate.
     if (!result?.isError) {
-      inlineReviewCommentCount++;
+      const key = scopedKey("review");
+      inlineReviewCommentCounts.set(key, (inlineReviewCommentCounts.get(key) || 0) + 1);
     }
     return result;
   };
@@ -2442,7 +2553,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
-    if (!body && inlineReviewCommentCount === 0) {
+    if (!body && !inlineReviewCommentCounts.get(scopedKey("review"))) {
       throw {
         code: -32602,
         message:
@@ -2454,7 +2565,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
     // Reset the counter after a successful review submission so that subsequent
     // reviews in the same MCP session start with a clean slate.
-    inlineReviewCommentCount = 0;
+    inlineReviewCommentCounts.delete(scopedKey("review"));
 
     return defaultHandler("submit_pull_request_review")(args);
   };
@@ -2640,7 +2751,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     if (typeof entry.path === "string") {
       // Enforce allowed canonical source roots: staging dir and GITHUB_WORKSPACE.
       // RUNNER_TEMP is intentionally excluded — only the specific staging subdirectory is allowed.
-      const stagingDir = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-artifacts");
+      const stagingRoot = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-artifacts");
+      const stagingDir = currentClaimHandle() ? claimArtifactPath(stagingRoot, currentClaimHandle()) : stagingRoot;
 
       let filePath = entry.path;
       if (!path.isAbsolute(filePath)) {
@@ -2779,7 +2891,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    */
   const uploadCodeCoverageHandler = args => {
     const entry = { ...(args || {}), type: "upload_code_coverage" };
-    const stagingDir = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-code-coverage");
+    const stagingRoot = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-code-coverage");
+    const stagingDir = currentClaimHandle() ? claimArtifactPath(stagingRoot, currentClaimHandle()) : stagingRoot;
     const coverageRoot = process.env.GITHUB_WORKSPACE ? path.join(process.env.GITHUB_WORKSPACE, "coverage") : "";
 
     if (typeof entry.file === "string") {
@@ -2909,6 +3022,15 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * instead of a downstream Process Safe Outputs failure.
    */
   const updateIssueHandler = args => {
+    const normalizedArgs = normalizeBlankOptionalFields(args, safeOutputsToolMap.get("update_issue").inputSchema.properties);
+    const updateFields = ["status", "title", "body", "labels", "assignees", "milestone"];
+    if (!updateFields.some(field => normalizedArgs[field] !== undefined && normalizedArgs[field] !== false && (normalizedArgs[field] !== null || field === "milestone"))) {
+      throw {
+        code: -32602,
+        message: `${ERR_VALIDATION}: update_issue requires at least one of: ${updateFields.join(", ")} fields`,
+      };
+    }
+
     const updateIssueConfig = getSafeOutputsToolConfig(config, "update_issue");
     const effectiveTarget = updateIssueConfig.target || "triggering";
 
@@ -2941,7 +3063,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       }
     }
 
-    return defaultHandler("update_issue")(args || {});
+    return defaultHandler("update_issue")(normalizedArgs);
   };
 
   const jiraCreateIssueHandler = args => {
@@ -3260,8 +3382,10 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       `To close a specific discussion, supply discussion_number explicitly.`,
   });
 
-  return {
+  const handlers = {
     defaultHandler,
+    ledgerBuiltinHandler,
+    ledgerAgentAppendHandler,
     uploadAssetHandler,
     uploadArtifactHandler,
     uploadCodeCoverageHandler,
@@ -3297,6 +3421,25 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     updateDiscussionHandler,
     closeDiscussionHandler,
   };
+  const scopedHandler =
+    (handler, type) =>
+    (...args) => {
+      const executionHandle = currentClaimHandle();
+      const scope = executionHandle ? null : readClaimScopeContext();
+      if (!scope && !executionHandle) return handler(...args);
+      const message = normalizeRuntimeMessage(type ? { ...(args[0] || {}), type } : args[0] || {});
+      if (type && !Object.hasOwn(args[0] || {}, "type")) delete message.type;
+      if (executionHandle) return handler(message, ...args.slice(1));
+      return withClaimExecution({ ...scope, claim_handle: message.claim_handle }, () => handler(message, ...args.slice(1)));
+    };
+  return Object.fromEntries(
+    Object.entries(handlers).map(([name, handler]) => [
+      name,
+      ["defaultHandler", "ledgerBuiltinHandler"].includes(name)
+        ? (...args) => scopedHandler(Reflect.apply(handler, undefined, args), name === "defaultHandler" ? args[0] : "ledger_append")
+        : scopedHandler(handler, name === "ledgerAgentAppendHandler" ? "ledger_append" : undefined),
+    ])
+  );
 }
 
 module.exports = {

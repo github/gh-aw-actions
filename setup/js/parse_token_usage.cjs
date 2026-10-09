@@ -7,35 +7,231 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_PARSE } = require("./error_codes.cjs");
 const { parseTokenUsageJsonl, generateTokenUsageSummary, formatAICForOutput } = require("./parse_mcp_gateway_log.cjs");
 const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
+const { mapAWFRoutingEffort, resolveAWFModelRoutingSelection, getAWFModelRoutingPolicy } = require("./awf_model_routing.cjs");
+const { recordModelRouting, resolveEffectiveModel, validateModelIdentifier } = require("./model_attribution.cjs");
 
+const DEFAULT_GH_AW_DIR = "/tmp/gh-aw";
 /**
  * Parses the firewall proxy token-usage.jsonl and appends a collapsible markdown
  * table to $GITHUB_STEP_SUMMARY via core.summary.addDetails.
  *
- * Also writes aggregated token totals to /tmp/gh-aw/agent_usage.json so the data
- * is bundled in the agent artifact and accessible to third-party tools.
+ * Also writes aggregated token totals to the gh-aw directory so the data is
+ * bundled in the agent artifact and accessible to third-party tools.
  */
 
-const TOKEN_USAGE_AUDIT_PATH = "/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl";
-const TOKEN_USAGE_PATH = "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl";
+const TOKEN_USAGE_AUDIT_PATH = path.join(DEFAULT_GH_AW_DIR, "sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl");
+const TOKEN_USAGE_PATH = path.join(DEFAULT_GH_AW_DIR, "sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl");
 // AWF v0.27.7+ may write token-usage.jsonl under --audit-dir as well as --proxy-logs-dir.
 // Include this path so the agent job captures token data regardless of which dir AWF chose.
-const TOKEN_USAGE_AWF_AUDIT_PATH = "/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl";
+const TOKEN_USAGE_AWF_AUDIT_PATH = path.join(DEFAULT_GH_AW_DIR, "sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl");
 const TOKEN_USAGE_PATHS = [TOKEN_USAGE_AUDIT_PATH, TOKEN_USAGE_AWF_AUDIT_PATH, TOKEN_USAGE_PATH];
-const AGENT_USAGE_PATH = "/tmp/gh-aw/agent_usage.json";
-const AGENT_USAGE_JSONL_PATH = "/tmp/gh-aw/agent_usage.jsonl";
-const COPILOT_SESSION_STATE_DIR = "/tmp/gh-aw/sandbox/agent/logs/copilot-session-state";
+const AGENT_USAGE_PATH = path.join(DEFAULT_GH_AW_DIR, "agent_usage.json");
+const AGENT_USAGE_JSONL_PATH = path.join(DEFAULT_GH_AW_DIR, "agent_usage.jsonl");
+const COPILOT_SESSION_STATE_DIR = path.join(DEFAULT_GH_AW_DIR, "sandbox/agent/logs/copilot-session-state");
 const DEFAULT_SUMMARY_TITLE = "Token Usage";
+function getGhAwPath(relativePath) {
+  const root = process.env.GH_AW_TMP_DIR;
+  return path.join(root && root.trim() ? root.trim() : DEFAULT_GH_AW_DIR, relativePath);
+}
+
+function getTokenUsagePaths() {
+  return [getGhAwPath("sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl"), getGhAwPath("sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl"), getGhAwPath("sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl")];
+}
 
 function getUsageOutputPath(envName, defaultPath) {
   const configured = process.env[envName];
   return configured && configured.trim() ? configured.trim() : defaultPath;
 }
 
+/** @returns {any|null} */
+function readJSONIfExists(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** @returns {any|null} */
+function readModelRoutingRecord(ghAwDir) {
+  const paths = ["sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl", "sandbox/firewall/audit/api-proxy-logs/model-routing.jsonl", "sandbox/firewall-audit-logs/api-proxy-logs/model-routing.jsonl"];
+  /** @type {any|null} */
+  let result = null;
+  const requestRecords = [];
+  for (const relativePath of paths) {
+    let lines;
+    try {
+      lines = fs.readFileSync(path.join(ghAwDir, relativePath), "utf8").split("\n");
+    } catch {
+      continue;
+    }
+    for (const line of lines) {
+      try {
+        const record = JSON.parse(line);
+        if (typeof record?._schema !== "string" || !record._schema.startsWith("model-routing/")) continue;
+        if (record.stage === "selection" || record.stage === "failure") result = record;
+        else if (record.stage === "request") requestRecords.push(record);
+      } catch {
+        // Skip incomplete proxy records.
+      }
+    }
+  }
+  return result || requestRecords.length ? { record: result, requestRecords } : null;
+}
+
+function getModelRoutingRequestModel(record) {
+  for (const key of ["requested_model", "wire_model", "selected_model", "model"]) {
+    const model = validateModelIdentifier(record?.[key]);
+    if (model) return model;
+  }
+  return "";
+}
+
+function hasCorroboratedModelRoutingRequests(requestRecords, wireModel, endpoint) {
+  const requests = requestRecords.filter(record => getModelRoutingRequestModel(record) === wireModel);
+  return requests.length > 0 && requests.every(record => record.routed === "as_selected" && record.upstream_endpoint === endpoint && Array.isArray(record.deviations) && record.deviations.every(deviation => deviation === "endpoint"));
+}
+
+function getModelRoutingSelectionFailureCode(error) {
+  return /none compatible|not supported by this engine|does not advertise endpoint/.test(error) ? "unsupported_endpoint" : "invalid_selection";
+}
+
+/** @returns {any|null} */
+function resolveModelRoutingOutcome(env = process.env, ghAwDir = env.GH_AW_TMP_DIR || DEFAULT_GH_AW_DIR) {
+  if (env.GH_AW_MODEL_ROUTING_ENABLED !== "true") return null;
+  const proxyRecords = readModelRoutingRecord(ghAwDir);
+  const record = proxyRecords?.record;
+  const requestRecords = proxyRecords?.requestRecords || [];
+  const reflectData = readJSONIfExists(path.join(ghAwDir, "agent", "awf-reflect.json"));
+  const advisory = readJSONIfExists(path.join(ghAwDir, "agent", "awf-routing-outcome.json"));
+  let routing;
+  if (record?.stage === "failure") {
+    routing = { status: "failed", failure_code: record.code, detail: record.detail };
+  } else if (record?.stage === "selection") {
+    const wireModel = validateModelIdentifier(record.wire_model || record.selected_model);
+    routing = {
+      status: wireModel ? "selected" : "rejected",
+      provider: record.selected_provider || record.provider,
+      model: validateModelIdentifier(record.selected_model) || wireModel,
+      wire_model: wireModel,
+      effort: record.selected_effort == null || record.selected_effort === "" ? null : record.selected_effort,
+      endpoint: record.endpoint,
+      mode: record.mode,
+      selected_id: record.selected_id,
+      router_version: record.router?.version,
+      failure_code: wireModel ? "" : "invalid_selection",
+    };
+    const policy = getAWFModelRoutingPolicy(String(env.GH_AW_ENGINE_ID || ""));
+    const selectedAdvisory = advisory?.status === "selected" && (advisory.endpoint !== undefined || advisory.selected_endpoint !== undefined);
+    const advisoryEndpointOverride = selectedAdvisory && ((typeof advisory.endpoint === "string" && advisory.endpoint !== routing.endpoint) || advisory.selected_endpoint !== routing.endpoint);
+    const endpointOverride = !policy.endpoints.includes(routing.endpoint) || advisoryEndpointOverride;
+    if (advisory?.status === "selected" && advisory.wire_model && advisory.wire_model !== wireModel) {
+      routing = { ...routing, status: "rejected", failure_code: "harness_selection_mismatch", detail: "Harness routing outcome did not match the proxy selection" };
+    } else if (["failed", "rejected", "pending", "unavailable"].includes(advisory?.status)) {
+      routing = { ...routing, status: advisory.status, failure_code: advisory.failure_code || routing.failure_code, detail: advisory.detail || routing.detail };
+    } else if (endpointOverride) {
+      const requestedEndpoint = selectedAdvisory && typeof advisory.endpoint === "string" ? advisory.endpoint : routing.endpoint;
+      const checked = resolveAWFModelRoutingSelection(
+        { ...reflectData, routing: { status: "selected", selection: { ...routing, endpoint: requestedEndpoint, selected_endpoint: routing.endpoint } } },
+        true,
+        policy.endpoints,
+        policy.allowEndpointOverride
+      );
+      if (checked.error || !checked.selection) {
+        const detail = checked.error || "AWF /reflect did not return a compatible model-routing selection";
+        routing = { ...routing, status: "rejected", failure_code: getModelRoutingSelectionFailureCode(detail), detail };
+      } else {
+        const effectiveEndpoint = selectedAdvisory ? advisory.endpoint : checked.selection.endpoint;
+        const selectedModelMatches = !selectedAdvisory || advisory.wire_model === wireModel;
+        const selectedEndpointMatches = !selectedAdvisory || advisory.selected_endpoint === routing.endpoint;
+        const endpointMatches = policy.endpoints.includes(effectiveEndpoint) && checked.selection.endpoint === effectiveEndpoint;
+        const requestsCorroborate = hasCorroboratedModelRoutingRequests(requestRecords, wireModel, effectiveEndpoint);
+        if (!selectedModelMatches || !selectedEndpointMatches || !endpointMatches || !requestsCorroborate) {
+          routing = {
+            ...routing,
+            status: "rejected",
+            failure_code: "uncorroborated_endpoint",
+            detail: "AWF model routing endpoint override was not corroborated by matching proxy request records",
+          };
+        } else {
+          routing = { ...routing, endpoint: effectiveEndpoint, selected_endpoint: routing.endpoint };
+        }
+      }
+    } else if (reflectData?.endpoints) {
+      const checked = resolveAWFModelRoutingSelection({ ...reflectData, routing: { status: "selected", selection: routing } }, true, policy.endpoints, policy.allowEndpointOverride);
+      if (checked.error || !checked.selection) {
+        const detail = checked.error || "AWF /reflect did not return a compatible model-routing selection";
+        routing = { ...routing, status: "rejected", failure_code: getModelRoutingSelectionFailureCode(detail), detail };
+      } else {
+        routing = { ...routing, endpoint: checked.selection.endpoint, selected_endpoint: routing.endpoint };
+      }
+    }
+  } else {
+    const reflectRouting = reflectData?.routing;
+    if (reflectRouting?.status === "selected") {
+      routing = {
+        status: "rejected",
+        failure_code: "uncorroborated_selection",
+        detail: "AWF /reflect selection has no corroborating proxy model-routing record",
+      };
+    } else {
+      routing = reflectRouting
+        ? {
+            status: reflectRouting.status || "pending",
+            failure_code: reflectRouting.failure_code,
+            detail: reflectRouting.detail,
+          }
+        : { status: "unavailable" };
+    }
+  }
+
+  if (record?.stage !== "selection" && advisory && ["failed", "rejected", "pending", "unavailable"].includes(advisory.status)) {
+    routing = { ...routing, status: advisory.status, failure_code: advisory.failure_code || routing.failure_code, detail: advisory.detail || routing.detail };
+  } else if (record?.stage !== "selection" && advisory?.status === "selected" && advisory.wire_model && advisory.wire_model !== routing.wire_model) {
+    routing = { ...routing, status: "rejected", failure_code: "harness_selection_mismatch", detail: "Harness routing outcome did not match the proxy selection" };
+  }
+
+  if (routing.status === "selected") {
+    const engine = String(env.GH_AW_ENGINE_ID || "").toLowerCase();
+    const mapped = mapAWFRoutingEffort(engine, routing.effort == null ? null : String(routing.effort).toLowerCase());
+    if (mapped.error) {
+      routing = { ...routing, status: "rejected", failure_code: "unsupported_effort", detail: mapped.error, effort: null };
+    } else if (mapped.effort && mapped.effort !== routing.effort) {
+      routing.applied_effort = mapped.effort;
+    }
+  }
+  return routing;
+}
+
+/** @returns {{routing: any, effective: any}|null} */
+function recordModelRoutingFromArtifacts(env = process.env, ghAwDir = env.GH_AW_TMP_DIR || DEFAULT_GH_AW_DIR) {
+  const routing = resolveModelRoutingOutcome(env, ghAwDir);
+  if (!routing) return null;
+  const infoPath = path.join(ghAwDir, "aw_info.json");
+  const modelRouting = recordModelRouting(routing, env, infoPath);
+  const effective = resolveEffectiveModel(infoPath, "agent", env);
+  core.setOutput("model", effective.model);
+  core.setOutput("model_effort", effective.effort);
+  core.setOutput("model_routing_status", routing.status);
+  return { routing: modelRouting, effective };
+}
+
+function persistAgentAwInfoCopy(ghAwDir = process.env.GH_AW_TMP_DIR || DEFAULT_GH_AW_DIR) {
+  const infoPath = path.join(ghAwDir, "aw_info.json");
+  const artifactInfoPath = path.join(ghAwDir, "agent", "aw_info.json");
+  if (!fs.existsSync(infoPath)) return;
+  try {
+    fs.mkdirSync(path.dirname(artifactInfoPath), { recursive: true });
+    fs.copyFileSync(infoPath, artifactInfoPath);
+  } catch (error) {
+    core.warning(`Could not add routed aw_info.json to the agent artifact: ${getErrorMessage(error)}`);
+  }
+}
+
 function writeEmptyUsageEvidence() {
   if (process.env.GH_AW_WRITE_EMPTY_USAGE !== "true") return;
-  const usagePath = getUsageOutputPath("GH_AW_AGENT_USAGE_PATH", AGENT_USAGE_PATH);
-  const usageJSONLPath = getUsageOutputPath("GH_AW_AGENT_USAGE_JSONL_PATH", AGENT_USAGE_JSONL_PATH);
+  const usagePath = getUsageOutputPath("GH_AW_AGENT_USAGE_PATH", getGhAwPath("agent_usage.json"));
+  const usageJSONLPath = getUsageOutputPath("GH_AW_AGENT_USAGE_JSONL_PATH", getGhAwPath("agent_usage.jsonl"));
   fs.mkdirSync(path.dirname(usagePath), { recursive: true });
   fs.mkdirSync(path.dirname(usageJSONLPath), { recursive: true });
   fs.writeFileSync(usagePath, '{"input_tokens":0,"output_tokens":0,"ai_credits":0}\n');
@@ -131,7 +327,7 @@ function getSummaryTitle() {
  * @param {string} sessionStateDir
  * @returns {{aiCredits: number, premiumRequests: number} | null}
  */
-function findCopilotUsageCheckpoint(sessionStateDir = COPILOT_SESSION_STATE_DIR) {
+function findCopilotUsageCheckpoint(sessionStateDir = getGhAwPath("sandbox/agent/logs/copilot-session-state")) {
   if (!fs.existsSync(sessionStateDir)) return null;
 
   /** @type {string[]} */
@@ -196,8 +392,8 @@ async function reportCopilotUsageCheckpoint(checkpoint) {
     premium_requests: checkpoint.premiumRequests,
   };
   try {
-    fs.writeFileSync(getUsageOutputPath("GH_AW_AGENT_USAGE_PATH", AGENT_USAGE_PATH), JSON.stringify(agentUsage) + "\n");
-    fs.writeFileSync(getUsageOutputPath("GH_AW_AGENT_USAGE_JSONL_PATH", AGENT_USAGE_JSONL_PATH), JSON.stringify({ provider: "copilot", ai_credits: checkpoint.aiCredits, premium_requests: checkpoint.premiumRequests }) + "\n");
+    fs.writeFileSync(getUsageOutputPath("GH_AW_AGENT_USAGE_PATH", getGhAwPath("agent_usage.json")), JSON.stringify(agentUsage) + "\n");
+    fs.writeFileSync(getUsageOutputPath("GH_AW_AGENT_USAGE_JSONL_PATH", getGhAwPath("agent_usage.jsonl")), JSON.stringify({ provider: "copilot", ai_credits: checkpoint.aiCredits, premium_requests: checkpoint.premiumRequests }) + "\n");
   } catch (error) {
     throw new Error(`${ERR_PARSE}: Failed to write Copilot usage files: ${getErrorMessage(error)}`, { cause: error });
   }
@@ -303,9 +499,12 @@ async function appendStepSummarySection(title, markdown, workingSet = null) {
 /**
  * Main function to parse token usage and write the step summary.
  */
-async function main(copilotSessionStateDir = COPILOT_SESSION_STATE_DIR) {
+async function main(copilotSessionStateDir = getGhAwPath("sandbox/agent/logs/copilot-session-state")) {
+  /** @type {{routing: any, effective: any}|null} */
+  let routedAttribution = null;
   try {
-    const tokenUsagePaths = getReadableTokenUsagePaths(TOKEN_USAGE_PATHS);
+    routedAttribution = recordModelRoutingFromArtifacts();
+    const tokenUsagePaths = getReadableTokenUsagePaths(getTokenUsagePaths());
     if (tokenUsagePaths.length === 0) {
       const checkpoint = findCopilotUsageCheckpoint(copilotSessionStateDir);
       if (checkpoint) {
@@ -356,6 +555,11 @@ async function main(copilotSessionStateDir = COPILOT_SESSION_STATE_DIR) {
         primaryModel = model;
       }
     }
+    const { getFallbackModel, recordFallbackModelFromUsage } = require("./model_attribution.cjs");
+    const fallbackModel = recordFallbackModelFromUsage(content, process.env, undefined, message => core.warning(message));
+    primaryModel = fallbackModel || getFallbackModel(undefined, process.env.GH_AW_PHASE || "agent") || primaryModel;
+    const effectiveAttribution = resolveEffectiveModel(undefined, process.env.GH_AW_PHASE || "agent", { ...process.env, GH_AW_PRIMARY_MODEL: primaryModel });
+    if (process.env.GH_AW_PHASE !== "detection") primaryModel = effectiveAttribution.model || primaryModel;
 
     const agentUsage = {
       input_tokens: summary.totalInputTokens,
@@ -365,14 +569,16 @@ async function main(copilotSessionStateDir = COPILOT_SESSION_STATE_DIR) {
       ambient_context: Math.round(summary.ambientContextTokens || 0),
       ai_credits: summary.aiCreditsSource === "awf_reported" ? Number(summary.totalAIC.toFixed(6)) : Number((summary.totalAIC || 0).toFixed(3)),
       ...(primaryModel ? { primary_model: primaryModel } : {}),
+      ...(routedAttribution ? { model_routing: routedAttribution.routing } : {}),
     };
-    fs.writeFileSync(getUsageOutputPath("GH_AW_AGENT_USAGE_PATH", AGENT_USAGE_PATH), JSON.stringify(agentUsage) + "\n");
+    fs.writeFileSync(getUsageOutputPath("GH_AW_AGENT_USAGE_PATH", getGhAwPath("agent_usage.json")), JSON.stringify(agentUsage) + "\n");
 
     if (primaryModel) {
       core.exportVariable("GH_AW_PRIMARY_MODEL", primaryModel);
       core.setOutput("primary_model", primaryModel);
       core.info(`Primary model: ${primaryModel}`);
     }
+    if (routedAttribution) core.setOutput("model", effectiveAttribution.model || "");
     if (summary.aiCreditsSource === "awf_reported" || summary.totalAIC > 0) {
       const aic = formatAICForOutput(summary.totalAIC, summary.aiCreditsSource);
       core.exportVariable("GH_AW_AIC", aic);
@@ -387,6 +593,8 @@ async function main(copilotSessionStateDir = COPILOT_SESSION_STATE_DIR) {
     }
   } catch (error) {
     core.setFailed(`${ERR_PARSE}: ${getErrorMessage(error)}`);
+  } finally {
+    if (routedAttribution) persistAgentAwInfoCopy();
   }
 }
 
@@ -414,7 +622,12 @@ if (typeof module !== "undefined" && module.exports) {
     findCopilotUsageCheckpoint,
     reportCopilotUsageCheckpoint,
     getUsageOutputPath,
+    getTokenUsagePaths,
     writeEmptyUsageEvidence,
+    readModelRoutingRecord,
+    resolveModelRoutingOutcome,
+    recordModelRoutingFromArtifacts,
+    persistAgentAwInfoCopy,
   };
 }
 

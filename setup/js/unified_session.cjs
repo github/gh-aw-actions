@@ -1,0 +1,566 @@
+// @ts-check
+
+const fs = require("fs");
+const path = require("path");
+const { isSessionEvent } = require("./agent_session.cjs");
+const { hasCopilotConversation, normalizeCopilotSession } = require("./copilot_session.cjs");
+const { collectAddMaskedValues, writeSessionArtifact, removeFailedSessionArtifacts } = require("./session_artifact.cjs");
+const { getErrorMessage } = require("./error_helpers.cjs");
+const { normalizeUnifiedSessionEvent } = require("./unified_session_payload.cjs");
+const { ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
+const { collectAgentExecution, parseAgentExitCode, validateAgentExitCode, isAgentExecutionEvent } = require("./agent_execution.cjs");
+const { normalizeEngineLogEntries } = require("./engine_log_parser.cjs");
+
+const SESSION_FILE_FORMAT_VERSION = 1;
+
+/** @typedef {import("./types/agent_session").SessionEvent} SessionEvent */
+/** @typedef {{component: string, phase: string, path: string, events: SessionEvent[], timestampUnit?: "seconds" | "milliseconds"}} SessionSource */
+
+/** @param {unknown} value @returns {boolean} */
+const isNativePath = value => typeof value === "string" && /^sandbox\/agent\/logs\/copilot-session-state\/[A-Za-z0-9_-]+\/events\.jsonl$/.test(value);
+
+/**
+ * Timestamp units come from the source schema, never from the value's magnitude.
+ * Native timestamps stay unchanged; this value is only an ordering key.
+ * @param {any} record
+ * @param {"seconds" | "milliseconds"} [unit]
+ * @returns {number | undefined}
+ */
+function sessionTimestamp(record, unit = "milliseconds") {
+  const value = record.timestamp ?? record.ts ?? record.time ?? record.created_at ?? record.message?.timestamp;
+  if (typeof value === "number") {
+    const ms = unit === "seconds" ? value * 1000 : value;
+    return Number.isFinite(ms) && Math.abs(ms) <= 8640000000000000 ? ms : undefined;
+  }
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * Source-local positions disambiguate repeated native IDs and expanded records.
+ * Equal timestamps and untimed observations retain deterministic source order.
+ * @param {SessionSource[]} sources
+ * @returns {import("./types/unified_session").UnifiedSession}
+ */
+function mergeSessionSources(sources) {
+  const events = sources.flatMap(source =>
+    source.events.map((event, index) => {
+      const timestampMs = sessionTimestamp(event, source.timestampUnit);
+      const normalized = normalizeUnifiedSessionEvent(event, source.phase);
+      const native = event.provenance;
+      const sourceIndex =
+        source.component === "agent" &&
+        isNativePath(source.path) &&
+        native &&
+        typeof native === "object" &&
+        "path" in native &&
+        native.path === source.path &&
+        (!("phase" in native) || native.phase === source.phase) &&
+        "index" in native &&
+        typeof native.index === "number" &&
+        Number.isSafeInteger(native.index) &&
+        native.index >= 0
+          ? native.index
+          : index;
+      if (event.type === "detection.result" && source.path !== "usage/detection/detection_result.json") {
+        delete normalized.data.reason;
+      }
+      return {
+        ...normalized,
+        provenance: {
+          component: source.component,
+          phase: source.phase,
+          path: source.path,
+          index: sourceIndex,
+          ...(timestampMs !== undefined ? { timestampMs } : {}),
+          ...(Object.hasOwn(event, "provenance") ? { native: structuredClone(event.provenance) } : {}),
+        },
+      };
+    })
+  );
+  events.sort((left, right) => {
+    const leftTime = left.provenance.timestampMs ?? Infinity;
+    const rightTime = right.provenance.timestampMs ?? Infinity;
+    return leftTime === rightTime ? 0 : leftTime < rightTime ? -1 : 1;
+  });
+  return events;
+}
+
+/** @param {"mcp" | "firewall"} component @param {any} record @returns {SessionEvent} */
+function normalizeRuntimeEvent(component, record) {
+  /** @type {`${string}.${string}`} */
+  let type = `${component}.event`;
+  const kind = record.event ?? record.type ?? record.event_name ?? record.eventName;
+  if (component === "mcp") {
+    /** @type {Record<string, `${string}.${string}`>} */
+    const kinds = {
+      REQUEST: "mcp.rpc.request",
+      rpc_request: "mcp.rpc.request",
+      RESPONSE: "mcp.rpc.response",
+      rpc_response: "mcp.rpc.response",
+      DIFC_FILTERED: "mcp.difc.filtered",
+      difc_filtered: "mcp.difc.filtered",
+      GUARD_POLICY_BLOCKED: "mcp.guard.blocked",
+      tool_call: "mcp.tool_call",
+      rpc_call: "mcp.tool_call",
+    };
+    if (Object.hasOwn(kinds, kind)) type = kinds[kind];
+  } else if (component === "firewall") {
+    if (kind === "http_access" || record.decision !== undefined) type = "firewall.http_access";
+    else if (kind === "token_usage") type = "firewall.token_usage";
+    else if (kind === "model_routing") type = "firewall.model_routing";
+    else if (["token_steering", "timeout_steering"].includes(kind)) type = "firewall.steering";
+  }
+  return {
+    type,
+    data: structuredClone(record),
+    ...(record.timestamp !== undefined ? { timestamp: record.timestamp } : {}),
+    ...(record.ts !== undefined ? { ts: record.ts } : {}),
+    ...(record.time !== undefined ? { time: record.time } : {}),
+  };
+}
+
+/**
+ * @param {string} content
+ * @param {string} engine
+ * @returns {SessionEvent[]}
+ */
+function parseEngineSession(content, engine) {
+  const parsers = {
+    agy: ["parse_agy_log.cjs", "parseAgyLog"],
+    claude: ["parse_claude_log.cjs", "parseClaudeLog"],
+    copilot: ["parse_copilot_log.cjs", "parseCopilotLog"],
+    codex: ["parse_codex_log.cjs", "parseCodexLog"],
+    gemini: ["parse_gemini_log.cjs", "parseGeminiLog"],
+    pi: ["parse_pi_log.cjs", "parsePiLog"],
+    kiro: ["parse_kiro_log.cjs", "parseKiroLog"],
+    "deepseek-harness": ["parse_deepseek_log.cjs", "parseDeepSeekLog"],
+    "pydantic-ai": ["parse_pydantic_log.cjs", "parsePydanticLog"],
+    opencode: ["parse_opencode_log.cjs", "parseOpenCodeLog"],
+    goose: ["parse_goose_log.cjs", "parseGooseLog"],
+    custom: ["parse_custom_log.cjs", "parseCustomLog"],
+  };
+  const [moduleName, functionName] = Object.hasOwn(parsers, engine) ? parsers[engine] : parsers.custom;
+  const parsed = Object.hasOwn(parsers, engine) ? require(`./${moduleName}`)[functionName](content) : require(`./${moduleName}`)[functionName](content, engine);
+  const events = parsed.logEntries ?? [];
+  const observations = events.filter(isAgentExecutionEvent).map(event => event.data);
+  if (observations.length) return events;
+  const execution = collectAgentExecution({ content, events, observations });
+  return [...events.filter(event => event.type !== "agent.execution"), ...(execution ? [execution] : [])];
+}
+
+/**
+ * Collect only known runtime directories; never follow artifact symlinks.
+ * Replicated firewall files use logs > audit > legacy precedence, including empty files.
+ * @param {{rootDir?: string, engine?: string, warn?: (message: string) => void, dailyAIC?: NodeJS.ProcessEnv}} [options]
+ * @returns {{events: import("./types/unified_session").UnifiedSession, maskedValues: string[]}}
+ */
+function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message => console.warn(message), dailyAIC = process.env } = {}) {
+  /** @type {SessionSource[]} */
+  const sources = [];
+  const masks = new Set();
+  const incompleteSources = new Set();
+  /** @type {SessionEvent[]} */
+  const warnings = [];
+  const report = (file, code, line) => {
+    const relative = path.relative(rootDir, file);
+    warn(`Unified session: ${code} in ${relative}${line === undefined ? "" : `:${line}`}`);
+    warnings.push({ type: "session.collection_warning", data: { path: relative, code, ...(line !== undefined ? { line } : {}) } });
+  };
+  const exists = file => {
+    if (!fs.existsSync(file)) return false;
+    let current = rootDir;
+    for (const part of path.relative(rootDir, file).split(path.sep)) {
+      current = path.join(current, part);
+      if (fs.lstatSync(current).isSymbolicLink()) {
+        report(current, "symlink_not_read", undefined);
+        return false;
+      }
+    }
+    return fs.lstatSync(file).isFile();
+  };
+  const read = file => {
+    try {
+      const content = fs.readFileSync(file, "utf8");
+      for (const mask of collectAddMaskedValues(content)) masks.add(mask);
+      return content;
+    } catch (error) {
+      throw new Error(`${ERR_SYSTEM}: Failed to read unified session source ${path.relative(rootDir, file)}: ${getErrorMessage(error)}`, { cause: error });
+    }
+  };
+  const records = file => {
+    const content = read(file);
+    if (file.endsWith(".json")) {
+      try {
+        const value = JSON.parse(content);
+        return Array.isArray(value) ? value : [value];
+      } catch {
+        report(file, "malformed_json", undefined);
+        return [];
+      }
+    }
+    const values = [];
+    for (const [index, raw] of content.split(/\r?\n/).entries()) {
+      if (!raw.trim()) continue;
+      try {
+        values.push(JSON.parse(raw));
+      } catch {
+        incompleteSources.add(file);
+        report(file, "malformed_jsonl", index + 1);
+      }
+    }
+    return values;
+  };
+  /**
+   * @param {string} file
+   * @param {string} component
+   * @param {string} phase
+   * @param {`${string}.${string}` | undefined} type
+   * @param {"seconds" | "milliseconds"} [timestampUnit]
+   */
+  const add = (file, component, phase, type, timestampUnit = "milliseconds") => {
+    if (!exists(file)) return 0;
+    const events = [];
+    const input = records(file);
+    const normalized = component === "agent" ? normalizeEngineLogEntries(input, engine ?? "custom") : [];
+    const hasLegacyContent = normalized.some(event => ["assistant.message", "assistant.reasoning", "assistant.refusal", "user.message", "tool.execution_start", "tool.execution_complete"].includes(event.type));
+    for (const record of input) {
+      if (!record || typeof record !== "object" || Array.isArray(record)) {
+        incompleteSources.add(file);
+        report(file, "non_object_record", undefined);
+        continue;
+      }
+      if (component === "agent") {
+        if (isSessionEvent(record)) events.push(record);
+        else if (!hasLegacyContent || normalizeEngineLogEntries([record], engine ?? "custom").length === 0) {
+          incompleteSources.add(file);
+          report(file, "non_canonical_agent_event", undefined);
+        }
+      } else if (type) {
+        events.push({ type, data: record, ...(record.timestamp !== undefined ? { timestamp: record.timestamp } : {}), ...(record.created_at !== undefined ? { created_at: record.created_at } : {}) });
+      } else if (component === "mcp" || component === "firewall") events.push(normalizeRuntimeEvent(component, record));
+      else throw new Error(`${ERR_VALIDATION}: Missing event mapping for ${component}`);
+    }
+    if (component === "agent" && hasLegacyContent) {
+      const canonicalKeys = new Set(events.map(event => JSON.stringify([event.type, event.id, event.timestamp, event.data.content, event.data.toolCallId, event.data.input, event.data.output])));
+      const canonicalRecords = new Set(input.filter(isSessionEvent).map(record => JSON.stringify(record)));
+      events.length = 0;
+      for (const event of normalized) {
+        const key = JSON.stringify([event.type, event.id, event.timestamp, event.data.content, event.data.toolCallId, event.data.input, event.data.output]);
+        if (canonicalRecords.has(JSON.stringify(event)) || !canonicalKeys.has(key)) events.push(event);
+      }
+    }
+    sources.push({ component, phase, path: path.relative(rootDir, file), events, timestampUnit });
+    return events.filter(event => event.type !== "agent.execution").length;
+  };
+  const walk = (directory, depth = 0) => {
+    if (!fs.existsSync(directory)) return [];
+    let current = rootDir;
+    for (const part of path.relative(rootDir, directory).split(path.sep)) {
+      current = path.join(current, part);
+      if (fs.lstatSync(current).isSymbolicLink()) {
+        report(current, "symlink_not_read", undefined);
+        return [];
+      }
+    }
+    if (depth > 8) {
+      report(directory, "directory_depth_limit", undefined);
+      return [];
+    }
+    const files = [];
+    let entries;
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      throw new Error(`${ERR_SYSTEM}: Failed to enumerate unified session sources ${path.relative(rootDir, directory)}: ${getErrorMessage(error)}`, { cause: error });
+    }
+    for (const entry of entries.sort((a, b) => (a.name === b.name ? 0 : a.name < b.name ? -1 : 1))) {
+      const file = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) report(file, "symlink_not_read", undefined);
+      else if (entry.isDirectory()) files.push(...walk(file, depth + 1));
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(file);
+    }
+    return files;
+  };
+  const choose = candidates => candidates.map(file => path.join(rootDir, file)).find(exists);
+  const metadata = choose(["aw_info.json", "usage/aw_info.json"]);
+  if (metadata) {
+    add(metadata, "workflow", "activation", "workflow.info");
+    const observedEngine = sources.at(-1)?.events[0]?.data.engine_id;
+    if (engine === undefined && typeof observedEngine === "string") engine = observedEngine;
+  }
+  /** @type {Array<[string, `${string}.${string}`]>} */
+  const prompts = [
+    ["system.txt", "prompt.system"],
+    ["user.txt", "prompt.user"],
+  ];
+  for (const [fileName, type] of prompts) {
+    const file = path.join(rootDir, "aw-prompts", fileName);
+    if (exists(file)) sources.push({ component: "prompt", phase: "activation", path: path.relative(rootDir, file), events: [{ type, data: { content: read(file) } }] });
+  }
+  const stdio = path.join(rootDir, "agent-stdio.log");
+  // Masks can be registered in stdio even when native session events are preferred.
+  const stdioContent = exists(stdio) ? read(stdio) : "";
+  const canonical = path.join(rootDir, "agent-session.jsonl");
+  const native = walk(path.join(rootDir, "sandbox/agent/logs/copilot-session-state")).filter(file => path.basename(file) === "events.jsonl");
+  let agentEvents = add(canonical, "agent", "agent", undefined);
+  const canonicalSource = sources.find(source => source.component === "agent" && source.path === "agent-session.jsonl");
+  const sessionId = event => (["session.start", "session.init"].includes(event?.type) && typeof event.data?.sessionId === "string" && event.data.sessionId ? event.data.sessionId : undefined);
+  /** @param {SessionEvent} event @returns {Record<string, unknown>} */
+  const nativeProvenance = event => (event.provenance && typeof event.provenance === "object" && !Array.isArray(event.provenance) ? Object.fromEntries(Object.entries(event.provenance)) : {});
+  const canonicalCopilot = engine === "copilot" || canonicalSource?.events.some(event => event.data.sourceEngine === "copilot" || isNativePath(nativeProvenance(event).path));
+  const representedIds = new Set(canonicalCopilot ? canonicalSource?.events.map(sessionId).filter(Boolean) : []);
+  /** @type {Map<string, {file: string, records: any[], start?: number}>} */
+  const snapshots = new Map();
+  const nativePaths = new Map();
+  if (!agentEvents || (canonicalCopilot && (representedIds.size || canonicalSource?.events.some(event => isNativePath(nativeProvenance(event).path))))) {
+    for (const file of native) {
+      const input = records(file);
+      const start = input.find(event => event?.type === "session.start" && sessionId(event));
+      const id = sessionId(start);
+      if (!id) continue;
+      nativePaths.set(path.relative(rootDir, file), id);
+      const previous = snapshots.get(id);
+      if (!previous || input.length > previous.records.length) {
+        snapshots.set(id, { file, records: input, start: sessionTimestamp({ timestamp: start.data.startTime ?? start.timestamp }) });
+      }
+    }
+  }
+  const canonicalPaths = new Map();
+  const canonicalStarts = new Map();
+  if (canonicalCopilot) {
+    let activeId;
+    for (const event of canonicalSource?.events ?? []) {
+      const id = sessionId(event);
+      if (id) {
+        activeId = id;
+        const start = sessionTimestamp({ timestamp: event.data.startTime ?? event.timestamp });
+        if (start !== undefined) canonicalStarts.set(id, start);
+      }
+      const nativePath = nativeProvenance(event).path;
+      if (isNativePath(nativePath)) {
+        const observedId = nativePaths.get(nativePath) ?? activeId;
+        if (observedId) {
+          canonicalPaths.set(observedId, nativePath);
+          representedIds.add(observedId);
+        }
+      }
+    }
+  }
+  /** @type {Map<SessionSource, {id: string, start?: number}>} */
+  const copilotSources = new Map();
+  if (canonicalSource && canonicalCopilot) {
+    const groups = new Map();
+    let activeId;
+    for (const event of canonicalSource.events) {
+      const id = sessionId(event);
+      if (id) activeId = id;
+      const nativePath = nativeProvenance(event).path;
+      const observedId = nativePaths.get(nativePath) ?? activeId;
+      const snapshot = snapshots.get(observedId);
+      const sourcePath = isNativePath(nativePath) ? nativePath : (canonicalPaths.get(observedId) ?? (snapshot ? path.relative(rootDir, snapshot.file) : canonicalSource.path));
+      const groupKey = JSON.stringify([sourcePath, observedId]);
+      let group = groups.get(groupKey);
+      if (!group) {
+        group = { ...canonicalSource, path: sourcePath, events: [] };
+        groups.set(groupKey, group);
+        if (isNativePath(sourcePath) || typeof observedId === "string") copilotSources.set(group, { id: observedId ?? sourcePath, start: canonicalStarts.get(observedId) ?? snapshot?.start });
+      }
+      group.events.push(isNativePath(sourcePath) ? { ...event, provenance: { ...nativeProvenance(event), path: sourcePath, persistedPath: canonicalSource.path } } : event);
+    }
+    for (const group of groups.values()) {
+      if (copilotSources.has(group)) group.events = require("./copilot_session.cjs").normalizeCopilotSession(group.events);
+    }
+    sources.splice(sources.indexOf(canonicalSource), 1, ...groups.values());
+  }
+  // A canonical final attempt must not hide distinct earlier native sessions.
+  // Represented IDs remain authoritative, even when raw copies are fuller.
+  for (const [id, snapshot] of snapshots) {
+    if (representedIds.has(id)) continue;
+    const events = normalizeCopilotSession(snapshot.records);
+    const source = { component: "agent", phase: "agent", path: path.relative(rootDir, snapshot.file), events };
+    sources.push(source);
+    if (incompleteSources.has(snapshot.file) || !hasCopilotConversation(events)) {
+      if (!incompleteSources.has(snapshot.file)) report(snapshot.file, "native_session_unusable", undefined);
+      source.events = [];
+      continue;
+    }
+    copilotSources.set(source, { id, start: snapshot.start });
+    agentEvents += events.filter(event => event.type !== "agent.execution").length;
+  }
+  if (copilotSources.size) {
+    const ordered = [...copilotSources].sort(([, left], [, right]) => (left.start ?? Infinity) - (right.start ?? Infinity));
+    const positions = sources.map((source, index) => (copilotSources.has(source) ? index : -1)).filter(index => index >= 0);
+    for (const [index, [source]] of ordered.entries()) sources[positions[index]] = source;
+  } else if (!agentEvents) {
+    for (const file of native) {
+      if ([...snapshots.values()].some(snapshot => snapshot.file === file)) continue;
+      add(file, "agent", "agent", undefined);
+      const source = sources.at(-1);
+      if (source?.path === path.relative(rootDir, file)) {
+        source.events = normalizeCopilotSession(source.events);
+        if (!incompleteSources.has(file) && hasCopilotConversation(source.events)) {
+          agentEvents += source.events.length;
+        } else {
+          if (!incompleteSources.has(file)) report(file, "native_session_unusable", undefined);
+          source.events = [];
+        }
+      }
+    }
+  }
+  if (!agentEvents) {
+    const file = choose(["pi-streaming.jsonl", "agent-stdio.log"]);
+    if (file) {
+      const content = read(file);
+      const events = parseEngineSession(content, engine ?? (file.endsWith("pi-streaming.jsonl") ? "pi" : "custom"));
+      if (!events.length && content.trim()) report(file, "unrecognized_engine_log", undefined);
+      sources.push({ component: "agent", phase: "agent", path: path.relative(rootDir, file), events });
+    }
+  }
+  for (const [prefix, phase] of [
+    ["", "agent"],
+    ["threat-detection/", "detection"],
+  ]) {
+    for (const file of walk(path.join(rootDir, prefix, "mcp-logs"))) add(file, "mcp", phase, undefined);
+    const seen = new Set();
+    for (const layout of ["sandbox/firewall/logs", "sandbox/firewall/audit", "sandbox/firewall-audit-logs", "firewall-logs", "firewall-audit-logs"]) {
+      const directory = path.join(rootDir, prefix, layout);
+      for (const file of walk(directory)) {
+        const relative = path.relative(directory, file);
+        if (seen.has(relative)) continue;
+        seen.add(relative);
+        const unit = relative === "audit.jsonl" ? "seconds" : "milliseconds";
+        add(file, "firewall", phase, undefined, unit);
+      }
+    }
+  }
+  /** @type {Array<[string[], string, string, `${string}.${string}`]>} */
+  const observations = [
+    [["safeoutputs.jsonl"], "safe_output", "agent", "safe_output.request"],
+    [["safe-output-items.jsonl"], "safe_output", "safe_outputs", "safe_output.result"],
+    [["safe-output-errors.json"], "safe_output", "safe_outputs", "safe_output.error"],
+    [["experiments/state.jsonl", "usage/experiment/state.jsonl"], "experiment", "activation", "experiment.state"],
+    [["experiments/state.json", "usage/experiment/state.json"], "experiment", "activation", "experiment.state"],
+    [["experiments/assignments.json", "usage/experiment/assignments.json"], "experiment", "activation", "experiment.assignment"],
+    [["agent/graders/grader_manifest.json", "usage/graders/grader_manifest.json"], "grader", "agent", "grader.manifest"],
+    [["agent/graders/grader_results.json", "usage/graders/grader_results.json"], "grader", "agent", "grader.result"],
+    [["evals/evals.jsonl", "usage/evals.jsonl"], "eval", "evals", "eval.result"],
+    [["agent_usage.jsonl", "usage/agent_usage.jsonl"], "usage", "agent", "usage.report"],
+    [["github_rate_limits.jsonl", "usage/github_rate_limits.jsonl"], "github_api", "workflow", "github_api.rate_limit"],
+    [["threat-detection/detection_usage.jsonl", "detection_usage.jsonl", "usage/detection_usage.jsonl"], "usage", "detection", "usage.report"],
+    [["evals/evals_token_usage.jsonl", "usage/evals/token_usage.jsonl"], "usage", "evals", "usage.report"],
+    [["agent_execution.json", "usage/agent/execution.json"], "execution", "agent", "execution.result"],
+    [["threat-detection/execution.json", "usage/detection/execution.json"], "execution", "detection", "execution.result"],
+    [["evals/evals/execution.json", "evals/execution.json", "usage/evals/execution.json"], "execution", "evals", "execution.result"],
+    // The sanitized conclusion result includes job outcomes as well as structured or inline verdicts.
+    [["usage/detection/detection_result.json", "threat-detection/detection_result.json"], "detection", "detection", "detection.result"],
+  ];
+  for (const [candidates, component, phase, type] of observations) {
+    const file = choose(candidates);
+    if (file) add(file, component, phase, type);
+  }
+  const executionFile = path.join(rootDir, "agent-errors.jsonl");
+  add(executionFile, "agent", "agent", undefined);
+  const agentSources = sources.filter(source => source.component === "agent");
+  const finalCopilotSource = agentSources.filter(source => copilotSources.has(source)).at(-1);
+  const executionAgentSources = finalCopilotSource ? agentSources.filter(source => !copilotSources.has(source) || source === finalCopilotSource) : agentSources;
+  const diagnosticSources = [...executionAgentSources.filter(source => source.path === "agent-errors.jsonl"), ...executionAgentSources.filter(source => source.path !== "agent-errors.jsonl")];
+  const executionObservations = diagnosticSources.flatMap(source => source.events.filter(isAgentExecutionEvent).map(event => event.data));
+  const exitFile = path.join(rootDir, "agent_execution_exit_code.txt");
+  const executionSource = sources.find(source => source.component === "execution" && source.phase === "agent");
+  const executionEvidence = executionSource?.events[0]?.data;
+  const observedExit = executionEvidence?.exitCode ?? executionEvidence?.exit_code;
+  const nativeExit = diagnosticSources
+    .map(source =>
+      source.events
+        .filter(isAgentExecutionEvent)
+        .reverse()
+        .find(event => event.data.exitCode != null || event.data.exit_code != null)
+    )
+    .find(Boolean)?.data;
+  const exitCode = observedExit ?? nativeExit?.exitCode ?? nativeExit?.exit_code;
+  const execution = collectAgentExecution({
+    content: stdioContent,
+    events: executionAgentSources.flatMap(source => source.events),
+    observations: executionObservations,
+    ...(exists(exitFile) ? { exitCode: parseAgentExitCode(read(exitFile)) } : exitCode !== undefined ? { exitCode: validateAgentExitCode(exitCode) } : {}),
+  });
+  for (const source of agentSources) source.events = source.events.filter(event => event.type !== "agent.execution");
+  if (execution) {
+    const primary = executionObservations.length
+      ? (agentSources.find(source => source.path === "agent-errors.jsonl")?.path ?? finalCopilotSource?.path ?? agentSources[0]?.path)
+      : stdioContent
+        ? "agent-stdio.log"
+        : (finalCopilotSource?.path ?? agentSources[0]?.path);
+    sources.push({ component: "execution", phase: "agent", path: primary ?? executionSource?.path ?? path.relative(rootDir, exitFile), events: [execution] });
+  }
+  const status = dailyAIC.GH_AW_DAILY_AI_CREDITS_GUARDRAIL_STATUS;
+  if (typeof status === "string" && ["disabled", "skipped", "under_budget", "exceeded", "structural_error", "transient_error"].includes(status) && !sources.some(source => source.events.some(event => event.type === "guardrail.daily_aic"))) {
+    /** @type {Record<string, string | number | boolean>} */
+    const data = { status };
+    if (dailyAIC.GH_AW_DAILY_AI_CREDITS_EXCEEDED === "true" || dailyAIC.GH_AW_DAILY_AI_CREDITS_EXCEEDED === "false") {
+      data.exceeded = dailyAIC.GH_AW_DAILY_AI_CREDITS_EXCEEDED === "true";
+    }
+    for (const [field, name] of [
+      ["total", "GH_AW_DAILY_AI_CREDITS_TOTAL"],
+      ["estimated", "GH_AW_DAILY_AI_CREDITS_ESTIMATED"],
+      ["threshold", "GH_AW_DAILY_AI_CREDITS_THRESHOLD"],
+    ]) {
+      const raw = dailyAIC[name];
+      if (raw !== undefined && raw !== "" && Number.isFinite(Number(raw)) && Number(raw) >= 0) data[field] = Number(raw);
+    }
+    sources.push({ component: "guardrail", phase: "activation", path: "usage/aw_session.jsonl", events: [{ type: "guardrail.daily_aic", data }] });
+  }
+  /** @type {SessionEvent} */
+  const summary = {
+    type: "session.collection",
+    data: {
+      sources: sources.map(({ events, ...source }) => ({ ...source, events: events.length })),
+      warnings: warnings.length,
+      untimedEvents: sources.reduce((total, source) => total + source.events.filter(event => sessionTimestamp(event, source.timestampUnit) === undefined).length, 0),
+      absentComponents: ["agent", "mcp", "firewall", "safe_output", "experiment", "grader", "eval"].filter(component => !sources.some(source => source.component === component)),
+    },
+  };
+  /** @type {import("./types/agent_session").SessionFileFormatEvent} */
+  const format = { type: "session.format", data: { version: SESSION_FILE_FORMAT_VERSION } };
+  sources.push({ component: "collector", phase: "conclusion", path: "usage/aw_session.jsonl", events: [format, ...warnings, summary] });
+  const events = mergeSessionSources(sources);
+  const formatIndex = events.findIndex(event => event.type === "session.format" && event.provenance.component === "collector" && event.provenance.index === 0);
+  // File metadata leads the stream without inventing a timestamp for it.
+  const [header] = events.splice(formatIndex, 1);
+  return { events: [header, ...events], maskedValues: [...masks] };
+}
+
+/**
+ * @param {{rootDir?: string, engine?: string, outputPath?: string, warn?: (message: string) => void}} [options]
+ * @returns {SessionEvent[]}
+ */
+function writeUnifiedSession(options = {}) {
+  const outputPath = options.outputPath ?? path.join(options.rootDir ?? "/tmp/gh-aw", "usage/aw_session.jsonl");
+  try {
+    const { events, maskedValues } = collectUnifiedSession(options);
+    writeSessionArtifact(outputPath, events, maskedValues);
+    return events;
+  } catch (error) {
+    removeFailedSessionArtifacts([outputPath], error);
+    throw error;
+  }
+}
+
+/** @param {{rootDir?: string, engine?: string, outputPath?: string}} [options] @returns {Promise<void>} */
+async function main(options = {}) {
+  writeUnifiedSession(options);
+  const { publishUnifiedSessionSummary } = require("./unified_session_render.cjs");
+  await publishUnifiedSessionSummary(options.outputPath ?? path.join(options.rootDir ?? "/tmp/gh-aw", "usage/aw_session.jsonl"));
+}
+
+if (require.main === module) {
+  require("./shim.cjs");
+  main().catch(error => {
+    console.error(`Failed to collect unified session: ${getErrorMessage(error)}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { SESSION_FILE_FORMAT_VERSION, sessionTimestamp, mergeSessionSources, normalizeRuntimeEvent, parseEngineSession, collectUnifiedSession, writeUnifiedSession, main };

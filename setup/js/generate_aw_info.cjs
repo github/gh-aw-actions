@@ -10,6 +10,7 @@ const validateLockdownRequirements = require("./validate_lockdown_requirements.c
 const { writeMergedModelsJSON } = require("./merge_frontmatter_models.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_CONFIG, ERR_SYSTEM } = require("./error_codes.cjs");
+const { normalizeLegacyWorkQueueContext, normalizeWorkQueueContext, resolveWorkQueueRuntime } = require("./aw_context.cjs");
 
 /**
  * Generate aw_info.json with workflow run metadata.
@@ -87,6 +88,7 @@ async function main(core, ctx, githubClient) {
     event_name: ctx.eventName,
     target_repo: process.env.GH_AW_INFO_TARGET_REPO || "",
     staged: process.env.GH_AW_INFO_STAGED === "true",
+    dry_run: process.env.GH_AW_INFO_DRY_RUN === "true",
     allowed_domains: allowedDomains,
     firewall_enabled: process.env.GH_AW_INFO_FIREWALL_ENABLED === "true",
     awf_version: process.env.GH_AW_INFO_AWF_VERSION || "",
@@ -97,6 +99,9 @@ async function main(core, ctx, githubClient) {
     },
     created_at: new Date().toISOString(),
   };
+  if (awInfo.dry_run) {
+    core.warning("Dry-run disables compiler-managed GitHub mutations only. Custom scripts/jobs, agent shell commands, external MCP servers, and custom credentials are not verified read-only.");
+  }
 
   if (process.env.GH_AW_INFO_FETCH_RUN_CREATED_AT === "true") {
     try {
@@ -162,33 +167,54 @@ async function main(core, ctx, githubClient) {
     awInfo.skills = skills;
     core.info(`Configured frontmatter skills (${skills.length}): ${skills.join(", ")}`);
   }
+  if (process.env.GH_AW_INFO_SUB_AGENT_MODELS) {
+    const models = JSON.parse(process.env.GH_AW_INFO_SUB_AGENT_MODELS);
+    if (!Array.isArray(models)) throw new Error("GH_AW_INFO_SUB_AGENT_MODELS must be an array");
+    awInfo.sub_agent_models = models;
+  }
 
   // Include aw_context when the workflow was triggered by a caller that relayed
   // orchestration context via workflow inputs or repository_dispatch client payload.
   // Validates JSON format and structure before populating the context key in aw_info.json.
+  const queueRuntime = process.env.GH_AW_WORK_QUEUE_ENABLED === "true" ? resolveWorkQueueRuntime(ctx.payload) : null;
   const awContextRaw = ctx.payload?.inputs?.aw_context ?? ctx.payload?.client_payload?.aw_context;
+  let expressionAwContext = "{}";
   if (awContextRaw != null) {
     try {
-      const parsed = typeof awContextRaw === "string" ? JSON.parse(awContextRaw) : awContextRaw;
+      let parsed = typeof awContextRaw === "string" ? JSON.parse(awContextRaw) : awContextRaw;
 
       // Validate: must be a plain non-null object (not an array or primitive)
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
         core.warning(`aw_context must be a JSON object, got: ${typeof parsed}`);
       } else {
-        // Validate: no nested objects (all values must be primitives)
-        const nestedKeys = Object.entries(parsed)
-          .filter(([, v]) => v !== null && typeof v === "object")
-          .map(([k]) => k);
-        if (nestedKeys.length > 0) {
-          core.warning(`aw_context contains nested objects for keys: ${nestedKeys.join(", ")}. Ignoring aw_context.`);
-        } else {
-          // Validate: required fields must be present
-          const requiredFields = ["run_id", "repo", "workflow_id"];
-          const missingFields = requiredFields.filter(f => !(f in parsed));
-          if (missingFields.length > 0) {
-            core.warning(`aw_context is missing required fields: ${missingFields.join(", ")}. Ignoring aw_context.`);
+        try {
+          if (queueRuntime) {
+            parsed = normalizeWorkQueueContext(parsed);
+            if (queueRuntime.assignment && !Object.hasOwn(parsed, "work_queue_assignment")) parsed = { ...parsed, work_queue_assignment: queueRuntime.assignment };
           } else {
-            awInfo.context = parsed;
+            parsed = normalizeLegacyWorkQueueContext(parsed, ctx.payload?.inputs?.work_queue_claim ?? ctx.payload?.client_payload?.work_queue_claim);
+          }
+        } catch (error) {
+          core.warning(`${getErrorMessage(error)}. Ignoring aw_context.`);
+          parsed = null;
+        }
+        if (parsed !== null) {
+          // Only the schema-checked queue assignment may contain nested data.
+          const nestedKeys = Object.entries(parsed)
+            .filter(([k, v]) => k !== (queueRuntime ? "work_queue_assignment" : "work_queue") && v !== null && typeof v === "object")
+            .map(([k]) => k);
+          if (nestedKeys.length > 0) {
+            core.warning(`aw_context contains nested objects for keys: ${nestedKeys.join(", ")}. Ignoring aw_context.`);
+          } else {
+            expressionAwContext = JSON.stringify(parsed);
+            // Validate: required fields must be present
+            const requiredFields = ["run_id", "repo", "workflow_id"];
+            const missingFields = requiredFields.filter(f => !(f in parsed));
+            if (missingFields.length > 0) {
+              core.warning(`aw_context is missing required fields: ${missingFields.join(", ")}. Ignoring aw_context.`);
+            } else {
+              awInfo.context = parsed;
+            }
           }
         }
       }
@@ -196,6 +222,7 @@ async function main(core, ctx, githubClient) {
       core.warning(`Failed to parse aw_context input as JSON: ${String(awContextRaw)}`);
     }
   }
+  core.setOutput("aw_context", expressionAwContext);
 
   // Write to /tmp/gh-aw directory to avoid inclusion in PR
   try {

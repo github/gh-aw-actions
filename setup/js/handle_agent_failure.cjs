@@ -3,6 +3,7 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
+const { redactAndBoundDiagnostics } = require("./diagnostic_sanitization.cjs");
 const { getDetectionCautionAlert, getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateXMLMarker } = require("./messages.cjs");
 const { renderTemplate, renderTemplateFromFile, getPromptPath, renderFilesList } = require("./messages_core.cjs");
 const { getCurrentBranch } = require("./get_current_branch.cjs");
@@ -25,9 +26,12 @@ const { formatAICCredits } = require("./daily_aic_workflow_helpers.cjs");
 const { formatAIC } = require("./model_costs.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp_gateway_log.cjs");
-const { readDedupedTokenUsage, TOKEN_USAGE_PATHS } = require("./parse_token_usage.cjs");
+const { readDedupedTokenUsage, getTokenUsagePaths } = require("./parse_token_usage.cjs");
 const { extractShellCommandFromToolData } = require("./tool_call_details.cjs");
 const { resolveFailureIssueRepo } = require("./repo_helpers.cjs");
+const { GITHUB_API_VERSION } = require("./constants.cjs");
+const { EMPTY_OUTPUT_CAUSES, EMPTY_OUTPUT_FAILURE_CAUSES } = require("./empty_output_outcome.cjs");
+const { isAgentExecutionEvent } = require("./agent_execution.cjs");
 const fs = require("fs");
 const https = require("https");
 const os = require("os");
@@ -51,7 +55,6 @@ const FAILURE_ISSUE_WINDOW_MS = FAILURE_ISSUE_DEDUP_WINDOW_HOURS * 60 * 60 * 100
 const DEFAULT_OTEL_JSONL_PATH = "/tmp/gh-aw/otel.jsonl";
 /** Path to the failure categories file written by handle_agent_failure and read by the OTLP conclusion span. */
 const FAILURE_CATEGORIES_PATH = "/tmp/gh-aw/failure_categories.json";
-const GITHUB_API_VERSION = "2022-11-28";
 const COPILOT_SESSION_STATE_DIR = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state");
 const RECENT_TOOL_CALLS_WITH_COMMAND_PREVIEW = new Set(["bash", "shell"]);
 const ELLIPSIS = "...";
@@ -73,6 +76,24 @@ const COPILOT_ORG_BILLING_ERROR_RE = new RegExp(
   "i"
 );
 const ALLOWED_FILES_ERROR_RE = /^(?<summary>.*outside the allowed-files list) \((?<files>.+?)\)\. (?<remediation>Add the files to the allowed-files configuration field or remove them from the (?:patch|bundle)\.)$/;
+/**
+ * Copilot CLI error emitted at engine startup when `engine.agent` (the `--agent` flag) does
+ * not match any agent the CLI discovered, for example when a `plugins:` entry is pinned to a
+ * source-only ref that never materializes loadable agent files. Captures the requested agent
+ * identifier and the (possibly empty) comma-separated list of agents Copilot reports as
+ * available, e.g. `No such agent: foo:bar, available: `.
+ */
+const COPILOT_AGENT_NOT_FOUND_RE = /No such agent:\s*([^\n,]+),\s*available:\s*([^\n]*)/i;
+const COPILOT_AGENT_NOT_FOUND_AGENT_MAX_LENGTH = 200;
+const PLUGIN_DIAGNOSTICS_MAX_LENGTH = 8000;
+/**
+ * Fallback path for plugin installation diagnostics when GH_AW_AGENT_OUTPUT is unset
+ * (mirrors pluginDiagnosticsLogPath = logsFolder + "plugin-diagnostics.log" in
+ * pkg/workflow/plugin_installation.go / copilot_engine.go). readPluginDiagnosticsLog()
+ * uses this declared path for production runs because GH_AW_AGENT_OUTPUT points to
+ * /tmp/gh-aw/agent_output.json in downstream failure jobs, not the Copilot logs directory.
+ */
+const PLUGIN_DIAGNOSTICS_LOG_PATH = "/tmp/gh-aw/sandbox/agent/logs/plugin-diagnostics.log";
 
 /**
  * Parse action failure issue expiration from environment.
@@ -265,6 +286,7 @@ function parseHTMLCommentMetadata(body, markerKey) {
 function buildFailureMatchCategories(options) {
   const categories = [];
 
+  if (options.transportWedge) categories.push("transport_wedge");
   if (options.isTimedOut) categories.push("timed_out");
   if (options.hasAssignmentErrors) categories.push("assignment_errors");
   if (options.hasAssignCopilotFailures) categories.push("assign_copilot_failures");
@@ -275,14 +297,15 @@ function buildFailureMatchCategories(options) {
   if (options.hasPushRepoMemoryFailure) categories.push("push_repo_memory_failure");
   if (options.hasMissingSafeOutputs) categories.push("missing_safe_outputs");
   if (options.hasReportIncomplete) categories.push("report_incomplete");
+  if (Object.prototype.hasOwnProperty.call(EMPTY_OUTPUT_CAUSES, options.emptyOutputCause)) categories.push(options.emptyOutputCause);
   if (options.hasMissingTool) categories.push("missing_tool");
   if (options.hasToolDenialsExceeded) categories.push("tool_denials_exceeded");
   if (options.hasMissingData) categories.push("missing_data");
   if (options.hasCacheMissMisconfiguration) categories.push("cache_miss_misconfiguration");
   if (options.secretVerificationFailed) categories.push("secret_verification_failed");
-  if (options.hasDockerSbxSecretsFailed) categories.push("docker_sbx_secrets_missing");
   if (options.inferenceAccessError) categories.push("inference_access_error");
   if (options.copilotOrgBillingError) categories.push("copilot_org_billing_error");
+  if (options.copilotAgentNotFound) categories.push("copilot_agent_not_found");
   if (options.mcpPolicyError) categories.push("mcp_policy_error");
   if (options.modelNotSupportedError) categories.push("model_not_supported_error");
   if (options.http400ResponseError) categories.push("http_400_response_error");
@@ -310,11 +333,32 @@ function buildFailureMatchCategories(options) {
   return categories.sort();
 }
 
+function hasMCPTransportWedge(sessionContent) {
+  if (!sessionContent.includes('"transport_wedge"')) return false;
+  return sessionContent.split(/\r?\n/).some(line => {
+    try {
+      const event = JSON.parse(line);
+      return isAgentExecutionEvent(event) && event.data.categories.includes("transport_wedge");
+    } catch {
+      return false;
+    }
+  });
+}
+
+function getAgentStdioLogPath(agentOutputFile = process.env.GH_AW_AGENT_OUTPUT) {
+  return agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
+}
+
+function getAgentSessionPath(agentOutputFile = process.env.GH_AW_AGENT_OUTPUT) {
+  return agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-session.jsonl") : "/tmp/gh-aw/agent-session.jsonl";
+}
+
 /**
  * Build a precise failure issue title for known failure classes.
  * Falls back to the generic failure title when no specific class matches.
  * @param {Object} options
  * @param {string} options.workflowName
+ * @param {boolean} [options.transportWedge]
  * @param {boolean} options.isTimedOut
  * @param {boolean} options.hasMissingSafeOutputs
  * @param {boolean} options.hasReportIncomplete
@@ -334,11 +378,13 @@ function buildFailureMatchCategories(options) {
  * @param {boolean} options.hasAssignmentErrors
  * @param {boolean} options.http400ResponseError
  * @param {boolean} options.unknownModelAICredits
- * @param {boolean} [options.hasDockerSbxSecretsFailed]
  * @param {boolean} [options.copilotOrgBillingError]
+ * @param {string} [options.copilotAgentNotFound] - Requested agent identifier if a "No such agent" failure was detected
  * @param {boolean} [options.missingModelPricingError]
  * @param {string} [options.missingModelPricingModelName]
  * @param {boolean} [options.shellExpansionGuardRejected]
+ * @param {string} [options.emptyOutputCause]
+ * @param {string} [options.terminalOutputFailureCause]
  * @returns {string}
  */
 function buildFailureIssueTitle(options) {
@@ -365,11 +411,20 @@ function buildFailureIssueTitle(options) {
   if (options.hasOAuthTokenCheckFailed) return `[aw] ${workflowName} has OAuth token misconfiguration`;
   if (options.hasStaleLockFileFailed) return `[aw] ${workflowName} has stale lock file`;
   if (options.shellExpansionGuardRejected) return `[aw] ${workflowName} hit shell expansion guard rejection`;
-  if (options.hasDockerSbxSecretsFailed) return `[aw] ${workflowName} is missing docker-sbx Docker Hub secrets`;
   if (options.copilotOrgBillingError) return `[aw] ${workflowName} hit Copilot organization billing error`;
+  if (options.copilotAgentNotFound) {
+    const agentName = sanitizeContent(options.copilotAgentNotFound, COPILOT_AGENT_NOT_FOUND_AGENT_MAX_LENGTH).replace(/\s+/g, " ").trim();
+    return `[aw] ${workflowName} could not find configured Copilot agent "${agentName}"`;
+  }
+  if (options.transportWedge) return `[aw] ${workflowName} stalled on an MCP tool call`;
   if (options.isTimedOut) return `[aw] ${workflowName} timed out`;
   if (options.hasToolDenialsExceeded) return `[aw] ${workflowName} exceeded tool denial limit`;
   if (options.hasCacheMissMisconfiguration) return `[aw] ${workflowName} has cache-memory miss misconfiguration`;
+  const terminalOutputFailureTitle =
+    typeof options.terminalOutputFailureCause === "string" && Object.hasOwn(EMPTY_OUTPUT_FAILURE_CAUSES, options.terminalOutputFailureCause) ? EMPTY_OUTPUT_FAILURE_CAUSES[options.terminalOutputFailureCause] : "";
+  if (terminalOutputFailureTitle) return `[aw] ${workflowName} ${terminalOutputFailureTitle}`;
+  const emptyOutputCauseTitle = typeof options.emptyOutputCause === "string" && Object.prototype.hasOwnProperty.call(EMPTY_OUTPUT_CAUSES, options.emptyOutputCause) ? EMPTY_OUTPUT_CAUSES[options.emptyOutputCause] : "";
+  if (emptyOutputCauseTitle) return `[aw] ${workflowName} ${emptyOutputCauseTitle}`;
   if (options.hasReportIncomplete) return `[aw] ${workflowName} reported incomplete result`;
   if (options.hasMissingSafeOutputs) return `[aw] ${workflowName} produced no safe outputs`;
   if (options.hasMissingTool) return `[aw] ${workflowName} is missing required tool`;
@@ -385,12 +440,16 @@ function buildFailureIssueTitle(options) {
  * @param {string} options.branch - Triggering branch
  * @param {number|undefined} options.pullRequestNumber - Triggering pull request number
  * @param {string[]} options.failureCategories - Sorted failure categories
+ * @param {string} [options.failureCause] - Classified terminal-output failure cause
  * @returns {string} HTML comment marker
  */
 function generateFailureMatchMarker(options) {
   const { workflowId, branch, pullRequestNumber, failureCategories } = options;
   const parts = ["gh-aw-failure-issue: true", `workflow_id: ${workflowId}`, `branch: ${branch || ""}`, `failure_categories: ${failureCategories.join("|")}`];
 
+  if (typeof options.failureCause === "string" && Object.hasOwn(EMPTY_OUTPUT_FAILURE_CAUSES, options.failureCause)) {
+    parts.push(`failure_cause: ${options.failureCause}`);
+  }
   if (pullRequestNumber) {
     parts.push(`pull_request: ${pullRequestNumber}`);
   }
@@ -404,6 +463,7 @@ function generateFailureMatchMarker(options) {
  * @param {Object} options - Match criteria
  * @param {string} options.workflowId - Workflow identifier
  * @param {string[]} options.failureCategories - Sorted failure categories
+ * @param {string} [options.failureCause] - Classified terminal-output failure cause
  * @returns {boolean} True when the issue body matches and is not expired
  */
 function isReusableFailureIssue(body, options) {
@@ -428,6 +488,10 @@ function isReusableFailureIssue(body, options) {
 
   if ((failureMarker.workflow_id || "") !== options.workflowId) {
     return false;
+  }
+
+  if (typeof options.failureCause === "string") {
+    return failureMarker.failure_cause === options.failureCause;
   }
 
   return (failureMarker.failure_categories || "") === options.failureCategories.join("|");
@@ -469,14 +533,16 @@ function escapeGitHubSearchPhrase(value) {
  * @param {string} options.repo - Repository name
  * @param {string} options.workflowId - Workflow identifier
  * @param {string[]} options.failureCategories - Sorted failure categories
+ * @param {string} [options.failureCause] - Classified terminal-output failure cause
  * @returns {Promise<{number: number, html_url: string} | null>} Matching issue or null
  */
 async function findExistingFailureIssue(options) {
-  const { owner, repo, workflowId, failureCategories } = options;
+  const { owner, repo, workflowId, failureCategories, failureCause } = options;
   const windowStartMs = Date.now() - FAILURE_ISSUE_WINDOW_MS;
   const since = new Date(windowStartMs).toISOString().slice(0, 19) + "Z";
   const escapedWorkflowId = escapeGitHubSearchPhrase(workflowId);
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows created:>=${since} ` + `"gh-aw-agentic-workflow:" "workflow_id: ${escapedWorkflowId}" in:body`;
+  const failureCauseQuery = typeof failureCause === "string" ? ` "failure_cause: ${failureCause}"` : "";
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows created:>=${since} ` + `"gh-aw-agentic-workflow:" "workflow_id: ${escapedWorkflowId}"${failureCauseQuery} in:body`;
   const perPage = 100;
   for (let page = 1; ; page += 1) {
     const searchResult = await github.rest.search.issuesAndPullRequests({
@@ -503,6 +569,7 @@ async function findExistingFailureIssue(options) {
         isReusableFailureIssue(body, {
           workflowId,
           failureCategories,
+          failureCause,
         })
       ) {
         return {
@@ -1675,15 +1742,73 @@ function buildReportIncompleteContext(items) {
 
   core.info(`Found ${messages.length} report_incomplete signal(s)`);
 
-  let context = buildWarningAlertLine("Task Could Not Be Completed", "The agent reported that the task could not be performed due to an infrastructure or tool failure.") + "\n**Reasons:**\n";
-  for (const msg of messages) {
-    context += `- ${msg.reason}\n`;
-    if (msg.details) {
-      context += `  \n  ${msg.details}\n`;
-    }
-  }
+  let context = buildWarningAlertLine("Task Could Not Be Completed", "The agent reported that the task could not be performed due to an infrastructure or tool failure.");
+  context += renderErrorDetails(messages.map(msg => [msg.reason, msg.details].filter(Boolean).join("\n")).join("\n\n"));
   context +=
     "\nThis is a structured incompletion signal (`report_incomplete`), not a real task outcome. Any other safe outputs emitted alongside this signal (e.g., comments) describe the failure state, not a completed review or action.\n\n";
+
+  return context;
+}
+
+/**
+ * Find the failed step in the agent job for generic failure reports.
+ * @returns {Promise<string>} The failed step name, or an empty string when unavailable
+ */
+async function getFailedAgentStep() {
+  try {
+    const { owner, repo } = context.repo;
+    const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+      owner,
+      repo,
+      run_id: context.runId,
+      per_page: 100,
+    });
+    const agentJob = jobs.find(job => job.name === "agent" && job.conclusion === "failure");
+    if (!agentJob) {
+      core.debug("No failed agent job found when looking up the failed agent step");
+      return "";
+    }
+    const failedStep = agentJob?.steps
+      ?.slice()
+      .reverse()
+      .find(step => step.conclusion === "failure" && typeof step.name === "string");
+    if (!failedStep) {
+      core.debug("No failed step found in the agent job");
+      return "";
+    }
+    return sanitizeContent(failedStep.name, 200);
+  } catch (error) {
+    const status = error && typeof error === "object" && "status" in error ? error.status : undefined;
+    if (status === 403) {
+      core.warning("Could not identify the failed agent step; ensure the conclusion job grants actions: read.");
+    } else {
+      core.warning("Could not identify the failed agent step because the workflow run jobs API request failed.");
+    }
+    return "";
+  }
+}
+
+/**
+ * Add step-level context to generic agent and infrastructure failures.
+ * @param {{failureCategories: string[], failingStep: string, engineFailureContext: string, items?: Array<any>}} options
+ * @returns {string}
+ */
+function buildFailureDiagnosticsContext({ failureCategories, failingStep, engineFailureContext, items = [] }) {
+  const infrastructureMessages = items.filter(item => item?.type === "report_incomplete" && item.reason === "infrastructure_error");
+  const isGenericFailure = failureCategories.includes("agent_failure") || infrastructureMessages.length > 0;
+  if (!isGenericFailure) {
+    return "";
+  }
+
+  let context = "\n### Failure Diagnostics\n\n";
+  if (failingStep) {
+    context += `**Failing step:** ${failingStep}\n\n`;
+  }
+
+  const hasInfrastructureDetails = infrastructureMessages.some(item => typeof item.details === "string" && item.details.trim());
+  if (!engineFailureContext.trim() && !hasInfrastructureDetails) {
+    context += "No cause was captured from the agent report or engine logs.\n\n";
+  }
 
   return context;
 }
@@ -1714,10 +1839,11 @@ function buildTimeoutContext(isTimedOut, timeoutMinutes) {
  * @param {boolean} isTimedOut
  * @param {boolean} hasMissingModelPricingError
  * @param {boolean} hasShellExpansionGuardRejected
+ * @param {boolean} hasTerminalOutputFailure
  * @returns {boolean}
  */
-function shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, hasMissingModelPricingError = false, hasShellExpansionGuardRejected = false) {
-  return agentConclusion === "failure" && !hasToolDenialsExceeded && !isTimedOut && !hasMissingModelPricingError && !hasShellExpansionGuardRejected;
+function shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, hasMissingModelPricingError = false, hasShellExpansionGuardRejected = false, hasTerminalOutputFailure = false) {
+  return agentConclusion === "failure" && !hasToolDenialsExceeded && !isTimedOut && !hasMissingModelPricingError && !hasShellExpansionGuardRejected && !hasTerminalOutputFailure;
 }
 
 /**
@@ -1774,6 +1900,76 @@ function buildCopilotOrgBillingErrorContext(hasCopilotOrgBillingError) {
   }
 
   return "\n" + renderPromptTemplate("copilot_org_billing_error.md");
+}
+
+/**
+ * Build remediation for a Copilot CLI "No such agent" startup failure, including a rendering
+ * of the agent identifier that was requested, the agents Copilot reported as available, and
+ * the filesystem diagnostics recorded at plugin-install time (if any).
+ * @param {CopilotAgentNotFoundDetection|null} detection
+ * @returns {string}
+ */
+function buildCopilotAgentNotFoundContext(detection) {
+  if (!detection) {
+    return "";
+  }
+
+  const requestedAgent = sanitizeContent(detection.requestedAgent, COPILOT_AGENT_NOT_FOUND_AGENT_MAX_LENGTH);
+  const availableAgents =
+    detection.availableAgents.length > 0
+      ? detection.availableAgents.map(agent => renderSafeInlineCodeSpan(sanitizeContent(agent, COPILOT_AGENT_NOT_FOUND_AGENT_MAX_LENGTH))).join(", ")
+      : "_(none — Copilot CLI discovered no loadable agents)_";
+  const diagnosticsLog = readPluginDiagnosticsLog();
+  const pluginDiagnostics = diagnosticsLog ? renderPluginDiagnosticsDetails(diagnosticsLog) : "";
+
+  return (
+    "\n" +
+    renderPromptTemplate("copilot_agent_not_found.md", {
+      requested_agent: renderSafeInlineCodeSpan(requestedAgent),
+      available_agents: availableAgents,
+      plugin_diagnostics: pluginDiagnostics,
+    })
+  );
+}
+
+/**
+ * Render a value as an inline Markdown code span using a delimiter longer than any backtick run
+ * present in the value.
+ * @param {string} value
+ * @returns {string}
+ */
+function renderSafeInlineCodeSpan(value) {
+  const text = value.replace(/\s+/g, " ").trim();
+  let longestBacktickRun = 0;
+  for (const run of text.match(/`+/g) || []) {
+    longestBacktickRun = Math.max(longestBacktickRun, run.length);
+  }
+  const fence = "`".repeat(longestBacktickRun + 1);
+  const padding = text.startsWith("`") || text.endsWith("`") ? " " : "";
+  return `${fence}${padding}${text}${padding}${fence}`;
+}
+
+/**
+ * Render sanitized plugin diagnostics inside a code fence that cannot be closed by the log.
+ * @param {string} diagnosticsLog
+ * @returns {string}
+ */
+function renderPluginDiagnosticsDetails(diagnosticsLog) {
+  const sanitizedDiagnostics = sanitizeContent(diagnosticsLog, { maxLength: PLUGIN_DIAGNOSTICS_MAX_LENGTH });
+  const fence = safeMarkdownCodeFence([sanitizedDiagnostics]);
+  return `\n\n<details>\n<summary>Plugin installation diagnostics</summary>\n\n${fence}\n${sanitizedDiagnostics}\n${fence}\n\n</details>\n`;
+}
+
+/**
+ * Render error diagnostics as literal text with progressive disclosure.
+ * @param {string} diagnostics
+ * @param {string[]} [maskedValues]
+ * @returns {string}
+ */
+function renderErrorDetails(diagnostics, maskedValues = []) {
+  const sanitized = redactAndBoundDiagnostics(diagnostics, { maskedValues });
+  const fence = safeMarkdownCodeFence([sanitized]);
+  return `\n\n<details>\n<summary>Error details:</summary>\n\n${fence}text\n${sanitized}\n${fence}\n\n</details>\n\n`;
 }
 
 /**
@@ -2149,7 +2345,7 @@ function buildEngineMaxCacheMissesExceededContext(engineLabel) {
  */
 function readTokenUsageMarkdown() {
   try {
-    const readablePaths = TOKEN_USAGE_PATHS.filter(p => {
+    const readablePaths = getTokenUsagePaths().filter(p => {
       try {
         return fs.existsSync(p) && fs.statSync(p).size > 0;
       } catch {
@@ -2320,7 +2516,7 @@ function buildStaleLockFileFailedContext(hasStaleLockFileFailed) {
  * @param {string} threshold - Configured daily workflow threshold
  * @returns {string} Formatted context string, or empty string if no failure
  */
-function buildDailyAICExceededContext(hasDailyAICExceeded, totalAIC, threshold) {
+function buildDailyAICExceededContext(hasDailyAICExceeded, totalAIC, threshold, estimatedAIC = "") {
   if (!hasDailyAICExceeded) {
     return "";
   }
@@ -2328,11 +2524,22 @@ function buildDailyAICExceededContext(hasDailyAICExceeded, totalAIC, threshold) 
   const templatePath = getPromptPath("daily_workflow_aic_exceeded.md");
   const formattedTotalAIC = formatAICCredits(totalAIC);
   const formattedThreshold = formatAICCredits(threshold);
+  const total = Number(totalAIC);
+  const estimated = Number(estimatedAIC);
+  const hasBreakdown = estimatedAIC !== "" && Number.isFinite(total) && Number.isFinite(estimated) && estimated >= 0 && estimated <= total;
+  const estimateGuidance = !hasBreakdown
+    ? "The accounting breakdown is unavailable for this run. The agent will resume when the guardrail total falls below the threshold."
+    : estimated > 0
+      ? "Estimated credits represent conservative per-run maximums where accounting is unavailable, not confirmed consumption. Subsequent scans retry unresolved accounting and replace estimates if recorded usage becomes available. Otherwise, these estimates stop counting when the affected runs leave the rolling 24-hour window."
+      : "The agent will resume automatically once the rolling 24-hour total falls below the threshold. No action is required if the current limit is appropriate for your usage.";
   return (
     "\n" +
     renderTemplateFromFile(templatePath, {
       total_aic: formattedTotalAIC || "unknown",
+      recorded_aic: hasBreakdown ? formatAICCredits(total - estimated) || "0" : "unknown",
+      estimated_aic: hasBreakdown ? formatAICCredits(estimated) || "0" : "unknown",
       threshold: formattedThreshold || "unknown",
+      estimate_guidance: estimateGuidance,
     })
   );
 }
@@ -2717,18 +2924,6 @@ function buildSecretVerificationContext(secretVerificationResult, engineSecretFa
 }
 
 /**
- * Build a docker-sbx setup context from the dedicated runtime guidance template.
- * @param {string} dockerSbxSecretsResult
- * @returns {string}
- */
-function buildDockerSbxSecretsContext(dockerSbxSecretsResult) {
-  if (dockerSbxSecretsResult !== "failed") {
-    return "";
-  }
-  return renderPromptTemplate("docker_sbx_secrets_missing.md");
-}
-
-/**
  * Check whether agent-stdio.log contains a terminal_reason: "completed" result entry,
  * indicating the agent finished its task successfully despite a non-zero job exit code.
  * Log lines may be prefixed with a timestamp (e.g. "2026-04-27T21:45:00.080Z  {JSON}").
@@ -2779,6 +2974,59 @@ function detectCopilotOrgBillingErrorFromLog(stdioLogPathOverride) {
     return COPILOT_ORG_BILLING_MODE_RE.test(logContent) && COPILOT_ORG_BILLING_ERROR_RE.test(logContent);
   } catch {
     return false;
+  }
+}
+
+/**
+ * @typedef {Object} CopilotAgentNotFoundDetection
+ * @property {string} requestedAgent - The agent identifier passed via `engine.agent`/`--agent`
+ * @property {string[]} availableAgents - Agents the Copilot CLI reported as available (may be empty)
+ */
+
+/**
+ * Detect the Copilot CLI's "No such agent" startup failure, which occurs when `engine.agent`
+ * does not match any agent the CLI discovered (for example when a `plugins:` entry is pinned
+ * to a ref that does not materialize loadable agent files).
+ * @param {string} [stdioLogPathOverride] - Explicit agent-stdio.log path; only used by tests, production callers rely on GH_AW_AGENT_OUTPUT
+ * @returns {CopilotAgentNotFoundDetection|null}
+ */
+function detectCopilotAgentNotFoundFromLog(stdioLogPathOverride) {
+  if (process.env.GH_AW_ENGINE_ID !== "copilot") {
+    return null;
+  }
+
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const stdioLogPath = stdioLogPathOverride || (agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log");
+  try {
+    const logContent = fs.readFileSync(stdioLogPath, "utf8");
+    const match = logContent.match(COPILOT_AGENT_NOT_FOUND_RE);
+    if (!match) {
+      return null;
+    }
+    const requestedAgent = match[1].trim();
+    const availableRaw = match[2].trim();
+    const availableAgents = availableRaw
+      .split(",")
+      .map(agent => agent.trim())
+      .filter(Boolean);
+    return { requestedAgent, availableAgents };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the filesystem diagnostics recorded during plugin installation
+ * (see pluginDiagnosticsLogPath in pkg/workflow/plugin_installation.go), if present.
+ * GH_AW_PLUGIN_DIAGNOSTICS_FILE is an explicit override used by tests.
+ * @returns {string} Diagnostics log content, or "" when unavailable
+ */
+function readPluginDiagnosticsLog() {
+  const diagnosticsPath = process.env.GH_AW_PLUGIN_DIAGNOSTICS_FILE || PLUGIN_DIAGNOSTICS_LOG_PATH;
+  try {
+    return fs.readFileSync(diagnosticsPath, "utf8").trim();
+  } catch {
+    return "";
   }
 }
 
@@ -2852,8 +3100,7 @@ function detectEngineRateLimit429Failure() {
 /**
  * Extract terminal error messages from agent-stdio.log to surface engine failures.
  * First tries to match known error patterns (ERROR:, Error:, Fatal:, panic:, Reconnecting...).
- * Falls back to the last non-empty lines of the log when no patterns match, so that
- * even timeout or unexpected-termination failures include the final agent output.
+ * Never copies arbitrary log tails into reports, since they can contain secrets.
  * The log file is available in the conclusion job after the agent artifact is downloaded.
  * @returns {string} Formatted context string, or empty string if no engine failure found
  */
@@ -2864,6 +3111,7 @@ function buildEngineFailureContext(options = {}) {
   // Derive agent-stdio.log path from the agent output file path (same directory)
   const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
   const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
+  const exitCodePath = path.join(path.dirname(stdioLogPath), "agent_execution_exit_code.txt");
 
   // Include engine ID in failure messages when available (e.g. "copilot", "claude", "codex")
   const engineId = process.env.GH_AW_ENGINE_ID || "";
@@ -2871,6 +3119,8 @@ function buildEngineFailureContext(options = {}) {
   const hasStructuredMaxCacheMissesSignal = maxCacheMissesExceededFromDetection || parseMaxCacheMissesExceededFromEventLog();
 
   try {
+    const exitCodeText = fs.existsSync(exitCodePath) ? fs.readFileSync(exitCodePath, "utf8").trim() : "";
+    const exitDetails = /^[1-9]\d{0,2}$/.test(exitCodeText) && Number(exitCodeText) <= 255 ? renderErrorDetails(`Driver exit code: ${exitCodeText}`) : "";
     if (!fs.existsSync(stdioLogPath)) {
       if (shellExpansionGuardRejectedFromDetection) {
         core.info("agent-stdio.log not found, but shell expansion guard rejection was detected — using dedicated context message");
@@ -2880,8 +3130,8 @@ function buildEngineFailureContext(options = {}) {
         core.info("agent-stdio.log not found, but structured max cache misses signal was detected — using dedicated context message");
         return buildEngineMaxCacheMissesExceededContext(engineLabel);
       }
-      core.info(`agent-stdio.log not found at ${stdioLogPath}, skipping engine failure context`);
-      return "";
+      core.info(`agent-stdio.log not found at ${stdioLogPath}`);
+      return exitDetails ? buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n" + exitDetails : "";
     }
 
     const logContent = fs.readFileSync(stdioLogPath, "utf8");
@@ -2894,7 +3144,7 @@ function buildEngineFailureContext(options = {}) {
         core.info("agent-stdio.log is empty, but structured max cache misses signal was detected — using dedicated context message");
         return buildEngineMaxCacheMissesExceededContext(engineLabel);
       }
-      return "";
+      return exitDetails ? buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n" + exitDetails : "";
     }
 
     const lines = logContent.split("\n");
@@ -3063,25 +3313,17 @@ function buildEngineFailureContext(options = {}) {
             : "**Diagnosis:** The DIFC proxy (`awmg-cli-proxy`) failed to respond (`diagnosis=unknown`). The probe exhausted its retry budget before the service became reachable.\n\n";
           context += dnsDiagnosis;
         }
-        context += "\n<details>\n<summary>Error details</summary>\n\n";
-        for (const message of errorMessages) {
-          context += `- ${applyAddMaskRedaction(message, maskedValues)}\n`;
-        }
-        context += `\n</details>\n\nSee [Diagnosing AWF Failures](https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md) for troubleshooting guidance.\n\n`;
+        context += renderErrorDetails([...errorMessages].join("\n"), maskedValues);
+        context += `See [Diagnosing AWF Failures](https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md) for troubleshooting guidance.\n\n`;
         return context;
       }
 
-      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n**Error details:**\n";
-      for (const message of errorMessages) {
-        context += `- ${applyAddMaskRedaction(message, maskedValues)}\n`;
-      }
-      context += "\n";
-      return context;
+      const diagnostics = [...(exitDetails ? [`Driver exit code: ${exitCodeText}`] : []), ...errorMessages].join("\n");
+      return buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + renderErrorDetails(diagnostics, maskedValues);
     }
 
     // AWF infrastructure lines written by the firewall/container wrapper — not produced by
-    // the engine itself. They must be filtered out of the fallback tail so the failure
-    // context surfaces actual agent output rather than container lifecycle noise
+    // the engine itself. Filter them out when checking whether the engine produced output
     // (e.g. "Container awf-squid  Removed", "[WARN] Command completed with exit code: 1",
     // "Process exiting with code: 1"). Shared constant from log_parser_shared.cjs keeps the
     // pattern in sync with parse_copilot_log.cjs.
@@ -3091,7 +3333,7 @@ function buildEngineFailureContext(options = {}) {
     //   [WARN] --pids-limit/container.pidsLimit is not supported by this microVM runtime …
     //      The Docker agent cgroup cannot be passed through, so pids.max/pids.current are unavailable.
     // Those continuations belong to the infrastructure line above them, so they must be
-    // filtered out as well — otherwise they can be reported as the "last agent output".
+    // filtered out as well to avoid misclassifying a startup failure.
     const infraContinuationLines = new Set();
     {
       let previousWasInfra = false;
@@ -3112,17 +3354,15 @@ function buildEngineFailureContext(options = {}) {
       }
     }
 
-    // Fallback: no known error patterns found — include the last non-empty lines so that
-    // failures caused by timeouts or unexpected terminations still surface useful context.
-    const TAIL_LINES = 10;
+    // Classify startup failures without publishing arbitrary engine output.
     const nonEmptyLines = lines.map((line, index) => ({ line, index })).filter(entry => entry.line.trim());
     if (nonEmptyLines.length === 0) {
       return "";
     }
 
-    // Exclude AWF infrastructure lines so the fallback displays only actual engine output.
+    // Exclude AWF infrastructure lines when checking for actual engine output.
     // `::add-mask::` command lines are runner directives, not agent output: drop them so the
-    // rendered tail neither leaks the masked value nor wastes a tail slot.
+    // directives do not count as engine output.
     const agentLines = nonEmptyLines
       .filter(entry => !INFRA_LINE_RE.test(entry.line) && !infraContinuationLines.has(entry.index) && !isAddMaskCommandLine(entry.line) && !isRecoveredNoDeferredMarkerLine(entry.index))
       .map(entry => entry.line);
@@ -3151,18 +3391,13 @@ function buildEngineFailureContext(options = {}) {
         process.env.GH_AW_ENGINE_ID === "copilot"
           ? "If this failure recurs, check the GitHub Copilot status page and review the firewall audit logs.\n\n"
           : "If this failure recurs, check the provider status page (if available) and review the firewall audit logs.\n\n";
-      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n";
+      let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n" + exitDetails;
       context += "The engine exited immediately without producing any output. This often indicates a transient infrastructure issue (e.g., service unavailable, API rate limiting). " + recurringFailureGuidance;
       return context;
     }
 
-    const tailLines = agentLines.slice(-TAIL_LINES);
-    core.info(`No specific error patterns found; including last ${tailLines.length} line(s) of agent-stdio.log as fallback`);
-
-    let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated unexpectedly.`) + "\n**Last agent output:**\n\`\`\`\n";
-    context += applyAddMaskRedaction(tailLines.join("\n"), maskedValues);
-    context += "\n```\n\n";
-    return context;
+    core.info("No specific error patterns found; omitting raw agent output from the failure report");
+    return buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated unexpectedly.`) + "\n" + exitDetails + "Review the workflow run logs for diagnostics. Raw agent output is omitted because it may contain secrets.\n\n";
   } catch (error) {
     core.info(`Failed to read agent-stdio.log for engine failure context: ${getErrorMessage(error)}`);
     return "";
@@ -3536,6 +3771,7 @@ async function detectAndHandleFailureCascade(owner, repo, triggeringIssueNumber)
         repo,
         issue_number: existing.number,
         body: rollupBody,
+        headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
       });
       core.info(`✓ Updated cascade rollup issue #${existing.number}: ${existing.html_url}`);
     } else {
@@ -3574,6 +3810,57 @@ async function detectAndHandleFailureCascade(owner, repo, triggeringIssueNumber)
  * This script is called from the conclusion job when the agent job has failed
  * or when the agent succeeded but produced no safe outputs
  */
+async function isInvalidatedPRMergeCheckout() {
+  const prNumber = context.payload?.pull_request?.number;
+  if (process.env.GH_AW_DEFAULT_CHECKOUT_USES_TRIGGER_REF !== "true" || context.eventName !== "pull_request" || typeof prNumber !== "number" || !Number.isSafeInteger(prNumber) || context.ref !== `refs/pull/${prNumber}/merge`) {
+    core.debug("PR merge-ref invalidation check skipped: requires a pull_request merge ref and compiler-confirmed default checkout");
+    return false;
+  }
+
+  try {
+    core.debug(`Checking PR #${prNumber} for merge-ref checkout invalidation`);
+    const { owner, repo } = context.repo;
+    const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+    if (pr.state !== "closed" || !pr.closed_at) {
+      core.debug("PR merge-ref invalidation not confirmed: PR is not closed with a closure timestamp");
+      return false;
+    }
+    const closedAt = Date.parse(pr.closed_at);
+    if (!Number.isFinite(closedAt)) {
+      core.debug("PR merge-ref invalidation not confirmed: invalid PR closure timestamp");
+      return false;
+    }
+    const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, { owner, repo, run_id: context.runId, per_page: 100 });
+    const invalidated = jobs.some(
+      job =>
+        job.name === "agent" &&
+        job.conclusion === "failure" &&
+        job.steps?.some(step => {
+          if (step.name !== "Checkout repository (gh-aw default)" || step.conclusion !== "failure" || !step.completed_at) {
+            return false;
+          }
+          const completedAt = Date.parse(step.completed_at);
+          if (Number.isFinite(completedAt)) {
+            core.debug(`PR merge-ref checkout timing: closed_at=${new Date(closedAt).toISOString()}, checkout_completed_at=${new Date(completedAt).toISOString()}`);
+          } else {
+            core.debug("PR merge-ref invalidation not confirmed: invalid checkout completion timestamp");
+          }
+          return Number.isFinite(completedAt) && closedAt <= completedAt;
+        })
+    );
+    core.debug(`PR merge-ref invalidation ${invalidated ? "confirmed" : "not confirmed"}: ${invalidated ? "closure preceded failed default checkout completion" : "no failed default checkout completed at or after PR closure"}`);
+    return invalidated;
+  } catch (error) {
+    const message = getErrorMessage(error);
+    if (error?.status === 403 || /Resource not accessible/i.test(message)) {
+      core.warning(`Could not check PR merge-ref invalidation; ensure the conclusion job grants actions: read and pull-requests: read: ${message}`);
+    } else {
+      core.warning(`Could not check PR merge-ref invalidation: ${message}`);
+    }
+    return false;
+  }
+}
+
 async function main() {
   try {
     // Get workflow context
@@ -3584,7 +3871,6 @@ async function main() {
     const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE || "";
     const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL || "";
     const secretVerificationResult = process.env.GH_AW_SECRET_VERIFICATION_RESULT || "";
-    const dockerSbxSecretsResult = process.env.GH_AW_DOCKER_SBX_SECRETS_RESULT || "";
     const engineSecretFailureMessage = process.env.GH_AW_ENGINE_SECRET_FAILURE_MESSAGE || "";
     const assignmentErrors = process.env.GH_AW_ASSIGNMENT_ERRORS || "";
     const assignmentErrorCount = process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0";
@@ -3601,7 +3887,8 @@ async function main() {
     const { aiCredits, maxAICredits, aiCreditsRateLimitError: detectedAICreditsRateLimitError, maxAICreditsExceeded } = resolveAICreditsFailureState();
     const aiCreditsRateLimitError = agentConclusion === "failure" && detectedAICreditsRateLimitError;
     const inferenceAccessError = process.env.GH_AW_INFERENCE_ACCESS_ERROR === "true";
-    const copilotOrgBillingError = detectCopilotOrgBillingErrorFromLog();
+    const copilotOrgBillingError = !maxAICreditsExceeded && detectCopilotOrgBillingErrorFromLog();
+    const copilotAgentNotFound = detectCopilotAgentNotFoundFromLog();
     const mcpPolicyError = process.env.GH_AW_MCP_POLICY_ERROR === "true";
     const agenticEngineTimeout = process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT === "true";
     const modelNotSupportedError = process.env.GH_AW_MODEL_NOT_SUPPORTED_ERROR === "true";
@@ -3684,6 +3971,7 @@ async function main() {
     const dailyAICContinueOnError = process.env.GH_AW_DAILY_AI_CREDITS_CONTINUE_ON_ERROR === "true";
     const dailyAICGuardrailErrorIsFailure = hasDailyAICGuardrailError && !dailyAICContinueOnError;
     const dailyAICTotal = process.env.GH_AW_DAILY_AI_CREDITS_TOTAL || "";
+    const dailyAICEstimated = process.env.GH_AW_DAILY_AI_CREDITS_ESTIMATED || "";
     const dailyAICThreshold = process.env.GH_AW_DAILY_AI_CREDITS_THRESHOLD || "";
     // Cache-memory availability flag — set when cache-memory is configured for the workflow.
     // Used to detect cache-miss misconfigurations reported by the agent.
@@ -3785,7 +4073,16 @@ async function main() {
     // was done (e.g., post-processing step or AI model server returning a spurious error).
     let hasCompletedDespiteJobFailure = false;
     const { loadAgentOutput } = require("./load_agent_output.cjs");
-    const agentOutputResult = loadAgentOutput();
+    let agentOutputResult;
+    try {
+      agentOutputResult = loadAgentOutput();
+    } catch (error) {
+      if (process.env.GH_AW_WORK_QUEUE_ENABLED !== "true") throw error;
+      // Invalid queue output is not authority. Infrastructure failure reporting
+      // still needs to inspect the native triggering event and failed job.
+      core.warning(`Unable to read queue-scoped agent output for failure diagnostics: ${getErrorMessage(error)}`);
+      agentOutputResult = { success: false, items: [] };
+    }
     const taskCompleteRegistrationIssueOnlyReportIncomplete =
       agentOutputResult.success &&
       agentOutputResult.items &&
@@ -3911,15 +4208,12 @@ async function main() {
     // OR a cache-miss was detected after cache restore succeeded (configuration problem)
     // OR the agent reported missing tools or missing data (treated as agent failures by default)
     // OR the secret validation step failed (engine secret missing)
-    // OR docker-sbx is configured but its required Docker Hub secrets are missing.
     // BUT skip if we only have noop outputs (that's a successful no-action scenario)
     const hasSecretVerificationFailed = secretVerificationResult === "failed";
-    const hasDockerSbxSecretsFailed = dockerSbxSecretsResult === "failed";
     if (
       agentConclusion !== "failure" &&
       !isTimedOut &&
       !hasSecretVerificationFailed &&
-      !hasDockerSbxSecretsFailed &&
       !hasAssignmentErrors &&
       !hasAssignCopilotFailures &&
       !hasSkillInstallFailures &&
@@ -3942,7 +4236,7 @@ async function main() {
       !hasToolDenialsExceeded
     ) {
       core.info(
-        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/oauth-token-check/stale-lock-file/daily-workflow-aic/daily-workflow-aic-accounting/ai-credits/max-ai-credits-exceeded/report-incomplete/cache-miss/missing-tool/missing-data/tool-denials-exceeded/secret-verification/docker-sbx-secret errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
+        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/oauth-token-check/stale-lock-file/daily-workflow-aic/daily-workflow-aic-accounting/ai-credits/max-ai-credits-exceeded/report-incomplete/cache-miss/missing-tool/missing-data/tool-denials-exceeded/secret-verification errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
       );
       return;
     }
@@ -3973,6 +4267,10 @@ async function main() {
     // If checkout_pr_success is "false", skip creating an issue as this is expected behavior
     if (agentConclusion === "failure" && checkoutPRSuccess === "false") {
       core.info("Skipping failure handling - failure was due to PR checkout (likely PR merged)");
+      return;
+    }
+    if (agentConclusion === "failure" && (await isInvalidatedPRMergeCheckout())) {
+      core.info("Skipping failure issue creation: PR merge ref was invalidated by closure during checkout");
       return;
     }
 
@@ -4026,26 +4324,24 @@ async function main() {
     });
     const actionFailureIssueExpiresHours = getActionFailureIssueExpiresHours();
 
-    // Check if parent issue creation is enabled (defaults to false)
-    const groupReports = process.env.GH_AW_GROUP_REPORTS === "true";
-
-    // Ensure parent issue exists first (only if enabled)
-    let parentIssue;
-    if (groupReports) {
-      try {
-        parentIssue = await ensureParentIssue(null, owner, repo, actionFailureIssueExpiresHours);
-      } catch (error) {
-        core.warning(`Could not create parent issue, proceeding without parent: ${getErrorMessage(error)}`);
-        // Continue without parent issue
-      }
-    } else {
-      core.info("Parent issue creation is disabled (group-reports: false)");
-    }
-
     // Sanitize workflow name for title
     const sanitizedWorkflowName = sanitizeContent(workflowName, { maxLength: 100 });
+    let transportWedge = false;
+    if (agentConclusion === "failure") {
+      try {
+        transportWedge = hasMCPTransportWedge(fs.readFileSync(getAgentSessionPath(), "utf8"));
+      } catch {
+        core.debug("Unified agent session unavailable for MCP watchdog classification");
+      }
+    }
+    // Only the collector-written root metadata is trusted; report_incomplete.reason is agent-controlled.
+    const emptyOutputCause = agentOutputResult.success ? agentOutputResult.collectorEmptyOutputCause : undefined;
+    const terminalOutputFailureCause = agentOutputResult.success ? agentOutputResult.collectorFailureCause : undefined;
     const issueTitle = buildFailureIssueTitle({
       workflowName: sanitizedWorkflowName,
+      transportWedge,
+      emptyOutputCause,
+      terminalOutputFailureCause,
       isTimedOut,
       hasMissingSafeOutputs,
       hasReportIncomplete,
@@ -4068,11 +4364,13 @@ async function main() {
       unknownModelAICredits,
       missingModelPricingError,
       missingModelPricingModelName,
-      hasDockerSbxSecretsFailed,
       copilotOrgBillingError,
+      copilotAgentNotFound: copilotAgentNotFound?.requestedAgent,
     });
     const failureCategories = buildFailureMatchCategories({
       agentConclusion,
+      transportWedge,
+      emptyOutputCause,
       isTimedOut,
       hasAssignmentErrors,
       hasAssignCopilotFailures,
@@ -4088,9 +4386,9 @@ async function main() {
       hasMissingData,
       hasCacheMissMisconfiguration,
       secretVerificationFailed: hasSecretVerificationFailed,
-      hasDockerSbxSecretsFailed,
       inferenceAccessError,
       copilotOrgBillingError,
+      copilotAgentNotFound: Boolean(copilotAgentNotFound),
       mcpPolicyError,
       modelNotSupportedError,
       http400ResponseError,
@@ -4164,6 +4462,27 @@ async function main() {
       }
     }
 
+    const agentOutputItems = Array.isArray(agentOutputResult.items) ? agentOutputResult.items : [];
+    const needsFailureDiagnostics =
+      failureCategories.includes("agent_failure") || failureCategories.includes("engine_driver_failure") || agentOutputItems.some(item => item?.type === "report_incomplete" && item.reason === "infrastructure_error");
+    const failingStep = needsFailureDiagnostics ? await getFailedAgentStep() : "";
+
+    // Check if parent issue creation is enabled (defaults to false)
+    const groupReports = process.env.GH_AW_GROUP_REPORTS === "true";
+
+    // Ensure parent issue exists first (only if enabled)
+    let parentIssue;
+    if (groupReports) {
+      try {
+        parentIssue = await ensureParentIssue(null, owner, repo, actionFailureIssueExpiresHours);
+      } catch (error) {
+        core.warning(`Could not create parent issue, proceeding without parent: ${getErrorMessage(error)}`);
+        // Continue without parent issue
+      }
+    } else {
+      core.info("Parent issue creation is disabled (group-reports: false)");
+    }
+
     core.info(`Checking for existing issue with precise failure metadata for title: "${issueTitle}"`);
 
     try {
@@ -4174,6 +4493,7 @@ async function main() {
             repo,
             workflowId: workflowID,
             failureCategories,
+            failureCause: terminalOutputFailureCause,
           });
 
       // Build missing model pricing context once; both issue-create and issue-comment
@@ -4256,17 +4576,24 @@ async function main() {
         // context is the more actionable signal.
         // Also suppress when missing-model-pricing is detected: the pricing error is the
         // root cause and the engine error block would be redundant noise.
-        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected)
+        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected, Boolean(terminalOutputFailureCause))
           ? buildEngineFailureContext({
               suppressEngineRateLimit429: maxAICreditsExceeded,
               maxCacheMissesExceeded,
             })
           : "";
+        const failureDiagnosticsContext = buildFailureDiagnosticsContext({
+          failureCategories,
+          failingStep,
+          engineFailureContext,
+          items: agentOutputItems,
+        });
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
 
         // Build inference access error context
         const copilotOrgBillingErrorContext = buildCopilotOrgBillingErrorContext(copilotOrgBillingError);
+        const copilotAgentNotFoundContext = buildCopilotAgentNotFoundContext(copilotAgentNotFound);
         const inferenceAccessErrorContext = copilotOrgBillingErrorContext ? "" : buildInferenceAccessErrorContext(inferenceAccessError);
 
         // Build MCP policy error context
@@ -4289,7 +4616,7 @@ async function main() {
 
         // Build stale lock file failure context
         const staleLockFileFailedContext = buildStaleLockFileFailedContext(hasStaleLockFileFailed);
-        const dailyAICExceededContext = buildDailyAICExceededContext(hasDailyAICExceeded, dailyAICTotal, dailyAICThreshold);
+        const dailyAICExceededContext = buildDailyAICExceededContext(hasDailyAICExceeded, dailyAICTotal, dailyAICThreshold, dailyAICEstimated);
         const dailyAICGuardrailErrorContext = buildDailyAICGuardrailErrorContext(hasDailyAICGuardrailError, dailyAICGuardrailStatus, dailyAICGuardrailError, dailyAICContinueOnError);
 
         // Build copilot assignment failure context for created issues
@@ -4299,7 +4626,7 @@ async function main() {
         const skillInstallFailureContext = buildSkillInstallFailureContext(hasSkillInstallFailures, skillInstallErrors);
 
         // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
-        const credentialAuthErrorContext = copilotOrgBillingErrorContext ? "" : buildCredentialAuthErrorContext();
+        const credentialAuthErrorContext = copilotOrgBillingErrorContext || maxAICreditsExceeded ? "" : buildCredentialAuthErrorContext();
 
         // Create template context
         const templateContext = {
@@ -4310,9 +4637,9 @@ async function main() {
           workflow_source_url: workflowSourceURL,
           secret_verification_failed: String(hasSecretVerificationFailed),
           secret_verification_context: buildSecretVerificationContext(secretVerificationResult, engineSecretFailureMessage),
-          docker_sbx_secrets_context: buildDockerSbxSecretsContext(dockerSbxSecretsResult),
           credential_auth_error_context: credentialAuthErrorContext,
           copilot_org_billing_error_context: copilotOrgBillingErrorContext,
+          copilot_agent_not_found_context: copilotAgentNotFoundContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           skill_install_failure_context: skillInstallFailureContext,
@@ -4325,6 +4652,7 @@ async function main() {
           permission_denied_context: permissionDeniedContext,
           tool_denials_exceeded_context: toolDenialsExceededContext,
           report_incomplete_context: reportIncompleteContext,
+          failure_diagnostics_context: failureDiagnosticsContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
           engine_failure_context: engineFailureContext,
           timeout_context: timeoutContext,
@@ -4492,15 +4820,22 @@ async function main() {
         // context is the more actionable signal.
         // Also suppress when missing-model-pricing is detected: the pricing error is the
         // root cause and the engine error block would be redundant noise.
-        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected)
+        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected, Boolean(terminalOutputFailureCause))
           ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded })
           : "";
+        const failureDiagnosticsContext = buildFailureDiagnosticsContext({
+          failureCategories,
+          failingStep,
+          engineFailureContext,
+          items: agentOutputItems,
+        });
 
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
 
         // Build inference access error context
         const copilotOrgBillingErrorContext = buildCopilotOrgBillingErrorContext(copilotOrgBillingError);
+        const copilotAgentNotFoundContext = buildCopilotAgentNotFoundContext(copilotAgentNotFound);
         const inferenceAccessErrorContext = copilotOrgBillingErrorContext ? "" : buildInferenceAccessErrorContext(inferenceAccessError);
 
         // Build MCP policy error context
@@ -4523,7 +4858,7 @@ async function main() {
 
         // Build stale lock file failure context
         const staleLockFileFailedContext = buildStaleLockFileFailedContext(hasStaleLockFileFailed);
-        const dailyAICExceededContext = buildDailyAICExceededContext(hasDailyAICExceeded, dailyAICTotal, dailyAICThreshold);
+        const dailyAICExceededContext = buildDailyAICExceededContext(hasDailyAICExceeded, dailyAICTotal, dailyAICThreshold, dailyAICEstimated);
         const dailyAICGuardrailErrorContext = buildDailyAICGuardrailErrorContext(hasDailyAICGuardrailError, dailyAICGuardrailStatus, dailyAICGuardrailError, dailyAICContinueOnError);
 
         // Build copilot assignment failure context for created issues
@@ -4533,7 +4868,7 @@ async function main() {
         const skillInstallFailureContext = buildSkillInstallFailureContext(hasSkillInstallFailures, skillInstallErrors);
 
         // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
-        const credentialAuthErrorContext = copilotOrgBillingErrorContext ? "" : buildCredentialAuthErrorContext();
+        const credentialAuthErrorContext = copilotOrgBillingErrorContext || maxAICreditsExceeded ? "" : buildCredentialAuthErrorContext();
 
         // Build optimize token consumption context (shown when a guardrail was the failure root cause)
         const optimizeTokenConsumptionContext = buildOptimizeTokenConsumptionContext({ maxAICreditsExceeded, hasDailyAICExceeded, hasToolDenialsExceeded, isTimedOut, runUrl });
@@ -4548,9 +4883,9 @@ async function main() {
           pull_request_info: pullRequest ? `  \n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})` : "",
           secret_verification_failed: String(hasSecretVerificationFailed),
           secret_verification_context: buildSecretVerificationContext(secretVerificationResult, engineSecretFailureMessage),
-          docker_sbx_secrets_context: buildDockerSbxSecretsContext(dockerSbxSecretsResult),
           credential_auth_error_context: credentialAuthErrorContext,
           copilot_org_billing_error_context: copilotOrgBillingErrorContext,
+          copilot_agent_not_found_context: copilotAgentNotFoundContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           skill_install_failure_context: skillInstallFailureContext,
@@ -4563,6 +4898,7 @@ async function main() {
           permission_denied_context: permissionDeniedContext,
           tool_denials_exceeded_context: toolDenialsExceededContext,
           report_incomplete_context: reportIncompleteContext,
+          failure_diagnostics_context: failureDiagnosticsContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
           engine_failure_context: engineFailureContext,
           timeout_context: timeoutContext,
@@ -4603,6 +4939,7 @@ async function main() {
           branch: currentBranch,
           pullRequestNumber: pullRequest?.number,
           failureCategories,
+          failureCause: terminalOutputFailureCause,
         });
 
         // Add expiration marker inside the quoted footer section using helper
@@ -4675,6 +5012,7 @@ async function main() {
 }
 
 module.exports = {
+  isInvalidatedPRMergeCheckout,
   main,
   buildCodePushFailureContext,
   buildPushRepoMemoryFailureContext,
@@ -4687,6 +5025,7 @@ module.exports = {
   buildOptimizeTokenConsumptionContext,
   buildTimeoutContext,
   shouldBuildEngineFailureContext,
+  isReusableFailureIssue,
   isIssueWritePermissionError,
   setFailureIssueOutputs,
   buildAssignCopilotFailureContext,
@@ -4695,9 +5034,13 @@ module.exports = {
   isDroppedPipeSafeOutputsCommand,
   detectAWFFirewallStartupFailureFromLog,
   buildReportIncompleteContext,
+  getFailedAgentStep,
+  buildFailureDiagnosticsContext,
   buildMCPPolicyErrorContext,
   buildCopilotOrgBillingErrorContext,
   detectCopilotOrgBillingErrorFromLog,
+  buildCopilotAgentNotFoundContext,
+  detectCopilotAgentNotFoundFromLog,
   buildModelNotSupportedErrorContext,
   buildHTTP400ResponseErrorContext,
   buildMissingDataContext,
@@ -4733,7 +5076,6 @@ module.exports = {
   detectAndHandleFailureCascade,
   findRecentFailureIssues,
   buildSecretVerificationContext,
-  buildDockerSbxSecretsContext,
   CASCADE_WINDOW_MINUTES,
   CASCADE_WINDOW_MS,
   CASCADE_THRESHOLD,
@@ -4742,6 +5084,9 @@ module.exports = {
   CASCADE_ROLLUP_TITLE,
   FAILURE_TITLE_PATTERN,
   buildFailureMatchCategories,
+  hasMCPTransportWedge,
+  getAgentStdioLogPath,
+  getAgentSessionPath,
   buildFailureIssueTitle,
   FAILURE_CATEGORIES_PATH,
 };

@@ -1,0 +1,69 @@
+// @ts-check
+
+/** @type {Record<string, Record<string, string[]>>} */
+const COPILOT_WORKFLOW_EVENT_FIELDS = {
+  "workflow.run_started": { runId: ["runId"], workflowName: ["workflowName"], attempt: ["attempt"] },
+  "workflow.run_updated": { runId: ["runId"], revision: ["revision"] },
+  "workflow.run_settled": {
+    runId: ["runId"],
+    status: ["status"],
+    consumedNanoAiu: ["consumedNanoAiu"],
+    consumedSubagents: ["consumedSubagents"],
+    elapsedMs: ["elapsedMs"],
+    failureType: ["failureType"],
+  },
+  "subagent.started": {
+    invocationId: ["invocationId"],
+    workflowRunId: ["workflowRunId", "factoryRunId"],
+    toolCallId: ["toolCallId"],
+    agentName: ["agentName"],
+    agentDisplayName: ["agentDisplayName"],
+    agentType: ["agentType"],
+    parentId: ["parentId"],
+    model: ["model"],
+    resolvedModel: ["resolvedModel"],
+    modelSelectionSource: ["modelSelectionSource"],
+    executionMode: ["executionMode"],
+    spawnDepth: ["spawnDepth", "spawn_depth"],
+  },
+  "subagent.configured": { invocationId: ["invocationId"], model: ["model"], contextTier: ["contextTier"], reasoningEffort: ["reasoningEffort"], multiTurn: ["multiTurn"] },
+  "subagent.request": {
+    invocationId: ["invocationId"],
+    agentName: ["agentName"],
+    requestId: ["requestId"],
+    model: ["model"],
+    inputTokens: ["inputTokens"],
+    outputTokens: ["outputTokens"],
+    cacheReadTokens: ["cacheReadTokens"],
+    cacheWriteTokens: ["cacheWriteTokens"],
+  },
+  "subagent.completed": {
+    invocationId: ["invocationId"],
+    outcome: ["outcome"],
+    toolCallId: ["toolCallId"],
+    agentName: ["agentName"],
+    agentDisplayName: ["agentDisplayName"],
+    model: ["model"],
+    firstDispatchedModel: ["firstDispatchedModel"],
+    durationMs: ["durationMs"],
+    totalTokens: ["totalTokens"],
+    totalToolCalls: ["totalToolCalls"],
+    cancelled: ["cancelled"],
+  },
+  "subagent.failed": {
+    invocationId: ["invocationId"],
+    outcome: ["outcome"],
+    errorCode: ["errorCode"],
+    toolCallId: ["toolCallId"],
+    agentName: ["agentName"],
+    model: ["model"],
+    durationMs: ["durationMs"],
+    totalTokens: ["totalTokens"],
+    totalToolCalls: ["totalToolCalls"],
+    error: ["error"],
+  },
+};
+
+const COPILOT_WORKFLOW_EVENT_TYPES = new Set(Object.keys(COPILOT_WORKFLOW_EVENT_FIELDS));
+
+module.exports = { COPILOT_WORKFLOW_EVENT_FIELDS, COPILOT_WORKFLOW_EVENT_TYPES };

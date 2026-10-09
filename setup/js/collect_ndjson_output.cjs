@@ -3,19 +3,25 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { repairJson, sanitizePrototypePollution } = require("./json_repair_helpers.cjs");
+const { normalizeRuntimeMessage, readClaimScopeContext, currentClaimHandle, currentClaimAssignment } = require("./work_queue_claim_scope.cjs");
+const { parseStrictJSON } = require("./work_queue_codec.cjs");
 const { AGENT_OUTPUT_FILENAME, TMP_GH_AW_PATH } = require("./constants.cjs");
 const { ERR_API, ERR_PARSE } = require("./error_codes.cjs");
-const { isPayloadUserBot } = require("./resolve_mentions.cjs");
 const { parseIntTemplatable } = require("./templatable.cjs");
-const { parseAllowedRepos, validateTargetRepo } = require("./repo_helpers.cjs");
+const { isProbingNoopMessage } = require("./intent_probe.cjs");
+const { buildEmptyOutputOutcome } = require("./empty_output_outcome.cjs");
+
+const MENTION_AWARE_OUTPUT_TYPES = new Set(["add_comment", "close_discussion", "create_discussion", "create_issue", "create_pull_request", "create_pull_request_review_comment", "reply_to_pull_request_review_comment"]);
 
 async function main() {
   try {
     const fs = require("fs");
+    const claimHandle = currentClaimHandle();
+    const runtimeScope = claimHandle ? null : readClaimScopeContext();
+    const queueScope = Boolean(claimHandle || runtimeScope);
+    const assignment = currentClaimAssignment() || runtimeScope?.assignment;
     const { sanitizeContent } = require("./sanitize_content.cjs");
     const { validateItem, getMaxAllowedForType, getMinRequiredForType, hasValidationConfig, MAX_BODY_LENGTH: maxBodyLength, resetValidationConfigCache } = require("./safe_output_type_validator.cjs");
-    const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
-
     // Load validation config from file and set it in environment for the validator to read
     const validationConfigPath = process.env.GH_AW_VALIDATION_CONFIG_PATH || `${process.env.RUNNER_TEMP}/gh-aw/safeoutputs/validation.json`;
     /** @type {any} */
@@ -36,9 +42,10 @@ async function main() {
     const mentionsConfig = validationConfig?.mentions || null;
     const maxMentions = parseIntTemplatable(mentionsConfig?.max, 50);
 
-    // Resolve allowed mentions for the output collector
-    // This determines which @mentions are allowed in the agent output
-    const allowedMentions = await resolveAllowedMentionsFromPayload(context, github, core, mentionsConfig);
+    // Mention filtering happens in the trusted safe_outputs job. Preserve mentions
+    // in these output types until their destination and allowlist can be resolved.
+    let allowedMentions = [];
+    let deferMentionFiltering = false;
 
     // maxBotMentions is populated after safeOutputsConfig is read below
     /** @type {number | undefined} */
@@ -67,7 +74,7 @@ async function main() {
               error: `Line ${lineNum}: ${fieldName} must be a string`,
             };
           }
-          normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen });
+          normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen, deferMentions: deferMentionFiltering });
           break;
         case "boolean":
           if (typeof value !== "boolean") {
@@ -98,11 +105,11 @@ async function main() {
               error: `Line ${lineNum}: ${fieldName} must be one of: ${inputSchema.options.join(", ")}`,
             };
           }
-          normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen });
+          normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen, deferMentions: deferMentionFiltering });
           break;
         default:
           if (typeof value === "string") {
-            normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen });
+            normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen, deferMentions: deferMentionFiltering });
           }
           break;
       }
@@ -175,52 +182,22 @@ async function main() {
     }
 
     core.info(`[INGESTION] Output file path: ${outputFile}`);
-    if (!outputFile) {
-      core.info("GH_AW_SAFE_OUTPUTS not set, no output to collect");
-      core.setOutput("output", "");
-      core.setOutput("output_types", "");
-      core.setOutput("has_patch", "false");
-      return;
-    }
-    if (!fs.existsSync(outputFile)) {
-      // Before treating a missing outputs file as a graceful no-op, check whether
-      // the safeoutputs MCP gateway reported 0 registered tools during setup.
-      // When that flag exists the agent could not emit any safe outputs because
-      // every safeoutputs call failed with "unknown tool" — this is a gateway
-      // infrastructure failure, not an intentional no-op, and must surface as an
-      // error rather than a silent green run.
+    const collectionErrors = [];
+    if (!outputFile || !fs.existsSync(outputFile)) {
+      core.info(outputFile ? `Output file does not exist: ${outputFile}` : "GH_AW_SAFE_OUTPUTS not set, no output to collect");
       const runnerTemp = process.env.RUNNER_TEMP || "/home/runner/work/_temp";
       const gatewayEmptyFlagPath = `${runnerTemp}/gh-aw/safeoutputs/gateway_empty.flag`;
       if (fs.existsSync(gatewayEmptyFlagPath)) {
-        core.setFailed(
+        const reason =
           `safeoutputs MCP gateway registered 0 tools during setup; the agent could not emit any safe outputs. ` +
-            `This is a gateway infrastructure failure, not a normal no-op. ` +
-            `Check the MCP gateway startup logs for ECONNRESET errors or delayed backend registration and re-run the workflow.`
-        );
-        return;
+          `This is a gateway infrastructure failure, not a normal no-op. ` +
+          `Check the MCP gateway startup logs for ECONNRESET errors or delayed backend registration and re-run the workflow.`;
+        collectionErrors.push(reason);
+        // eslint-disable-next-line gh-aw-custom/require-return-after-core-setfailed
+        core.setFailed(reason);
       }
-      core.info(`Output file does not exist: ${outputFile} — no safe-output items were emitted; treating as empty collection (graceful no-op)`);
-      const emptyOutput = { items: [], errors: [] };
-      const emptyOutputJson = JSON.stringify(emptyOutput);
-      // Write agent_output.json for consistent downstream handling so the safe_outputs job
-      // always finds a valid (empty) collection file even when the agent emitted nothing.
-      try {
-        fs.mkdirSync(TMP_GH_AW_PATH, { recursive: true });
-        const agentOutputFile = require("path").join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME);
-        fs.writeFileSync(agentOutputFile, emptyOutputJson, "utf8");
-        core.info(`Stored empty collection to: ${agentOutputFile}`);
-        core.exportVariable("GH_AW_AGENT_OUTPUT", agentOutputFile);
-      } catch (writeError) {
-        core.error(`Failed to write empty agent output file: ${getErrorMessage(writeError)}`);
-      }
-      // Always set the step output even if the artifact write failed;
-      // downstream steps reading GH_AW_AGENT_OUTPUT must handle the var being absent.
-      core.setOutput("output", emptyOutputJson);
-      core.setOutput("output_types", "");
-      core.setOutput("has_patch", "false");
-      return;
     }
-    const outputContent = fs.readFileSync(outputFile, "utf8");
+    const outputContent = outputFile && fs.existsSync(outputFile) ? fs.readFileSync(outputFile, "utf8") : "";
     if (outputContent.trim() === "") {
       core.info("Output file is empty");
     }
@@ -253,74 +230,31 @@ async function main() {
     // indentation/pretty-printing, parsing will fail.
     const lines = outputContent.trim().split("\n");
 
-    // Resolve allowed repos for cross-repo targeting validation in the pre-scan loop.
-    // The triggering repository is always allowed; additional repos come from config.
-    const defaultTargetRepo = `${context.repo.owner}/${context.repo.repo}`;
-    const allowedRepos = parseAllowedRepos(safeOutputsConfig?.allowed_repos || safeOutputsConfig?.["allowed-repos"]);
-
-    // Pre-scan: collect target issue authors from add_comment items with explicit item_number
-    // so they are included in the first sanitization pass.
-    // We do this before the main loop so the allowed mentions array can be extended.
-    for (const line of lines) {
-      const trimmedLine = line.trim();
-      if (!trimmedLine) continue;
-      try {
-        const preview = JSON.parse(trimmedLine);
-        const previewType = (preview?.type || "").replace(/-/g, "_");
-        if (previewType === "add_comment" && preview.item_number != null && typeof preview.item_number === "number") {
-          // Determine which repo to query (use explicit repo field or fall back to triggering repo)
-          let targetOwner = context.repo.owner;
-          let targetRepo = context.repo.repo;
-          if (typeof preview.repo === "string") {
-            const candidateRepo = preview.repo.trim();
-            if (candidateRepo.includes("/")) {
-              // Validate the user-supplied repo against allowedRepos before making API calls
-              const repoValidation = validateTargetRepo(candidateRepo, defaultTargetRepo, allowedRepos);
-              if (repoValidation.valid) {
-                const parts = candidateRepo.split("/");
-                targetOwner = parts[0];
-                targetRepo = parts[1];
-              } else {
-                core.info(`[MENTIONS] Skipping cross-repo mention lookup for '${candidateRepo}': ${repoValidation.error}`);
-              }
-            }
-          }
-          try {
-            const { data: issueData } = await github.rest.issues.get({
-              owner: targetOwner,
-              repo: targetRepo,
-              issue_number: preview.item_number,
-            });
-            if (issueData.user?.login && !isPayloadUserBot(issueData.user)) {
-              const issueAuthor = issueData.user.login;
-              if (!allowedMentions.some(m => m.toLowerCase() === issueAuthor.toLowerCase())) {
-                allowedMentions.push(issueAuthor);
-                core.info(`[MENTIONS] Added target issue #${preview.item_number} author '${issueAuthor}' to allowed mentions`);
-              }
-            }
-          } catch (fetchErr) {
-            core.info(`[MENTIONS] Could not fetch issue #${preview.item_number} author for mention allowlist: ${getErrorMessage(fetchErr)}`);
-          }
-        }
-      } catch {
-        // Ignore parse errors - main loop will report them
-      }
-    }
-
     const parsedItems = [];
-    const errors = [];
+    const errors = collectionErrors;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       if (line === "") continue;
       core.info(`[INGESTION] Processing line ${i + 1}: ${line.substring(0, 200)}...`);
+      let item;
+      const rejectItem = (message, code = "claim_scope_invalid") => {
+        errors.push(message);
+        if (queueScope)
+          parsedItems.push({
+            type: typeof item?.type === "string" ? item.type : "invalid",
+            ...(item && Object.hasOwn(item, "claim_handle") ? { claim_handle: item.claim_handle } : {}),
+            _claimScopeError: message,
+            _claimScopeErrorCode: code,
+          });
+      };
       try {
-        const item = parseJsonWithRepair(line);
+        item = queueScope ? sanitizePrototypePollution(parseStrictJSON(line)) : parseJsonWithRepair(line);
         if (item === undefined) {
-          errors.push(`Line ${i + 1}: Invalid JSON - JSON parsing failed`);
+          rejectItem(`Line ${i + 1}: Invalid JSON - JSON parsing failed`);
           continue;
         }
-        if (!item.type) {
-          errors.push(`Line ${i + 1}: Missing required 'type' field`);
+        if (queueScope ? !item?.type || typeof item.type !== "string" : !item.type) {
+          rejectItem(`Line ${i + 1}: ${queueScope ? "Missing or invalid" : "Missing"} required 'type' field`);
           continue;
         }
         // Normalize type to use underscores (convert any dashes to underscores for resilience)
@@ -329,15 +263,29 @@ async function main() {
         core.info(`[INGESTION] Line ${i + 1}: Original type='${originalType}', Normalized type='${itemType}'`);
         // Update item.type to normalized value
         item.type = itemType;
+        if (queueScope) {
+          try {
+            item = normalizeRuntimeMessage(item);
+          } catch (error) {
+            const message = `Line ${i + 1}: ${getErrorMessage(error)}`;
+            rejectItem(message, error.code);
+            continue;
+          }
+        }
+        deferMentionFiltering = MENTION_AWARE_OUTPUT_TYPES.has(itemType);
         if (!expectedOutputTypes[itemType]) {
           core.warning(`[INGESTION] Line ${i + 1}: Type '${itemType}' not found in expected types: ${JSON.stringify(Object.keys(expectedOutputTypes))}`);
-          errors.push(`Line ${i + 1}: Unexpected output type '${itemType}'. Expected one of: ${Object.keys(expectedOutputTypes).join(", ")}`);
+          rejectItem(`Line ${i + 1}: Unexpected output type '${itemType}'. Expected one of: ${Object.keys(expectedOutputTypes).join(", ")}`);
           continue;
         }
-        const typeCount = parsedItems.filter(existing => existing.type === itemType).length;
+        if (!queueScope && itemType === "noop" && isProbingNoopMessage(item.message)) {
+          core.info(`[INGESTION] Line ${i + 1}: Ignoring probing noop message (does not count against the noop budget): ${JSON.stringify(item.message)}`);
+          continue;
+        }
+        const typeCount = parsedItems.filter(existing => existing.type === itemType && (!queueScope || (existing.claim_handle === item.claim_handle && !existing._claimScopeError))).length;
         const maxAllowed = getMaxAllowedForType(itemType, expectedOutputTypes);
         if (typeCount >= maxAllowed) {
-          errors.push(`Line ${i + 1}: Too many items of type '${itemType}'. Maximum allowed: ${maxAllowed}.`);
+          rejectItem(`Line ${i + 1}: Too many items of type '${itemType}'. Maximum allowed: ${maxAllowed}.`);
           continue;
         }
         core.info(`Line ${i + 1}: type '${itemType}'`);
@@ -361,39 +309,38 @@ async function main() {
             allowedAliases: allowedMentions,
             maxMentions,
             maxBotMentions,
+            deferMentions: deferMentionFiltering,
             normalizeIssueClosingKeywords,
             dataEnabled: typeConfig !== null && typeof typeConfig === "object" && typeConfig.data_enabled === true,
             dataSchema: typeConfig !== null && typeof typeConfig === "object" ? typeConfig.data_schema : undefined,
           });
           if (!validationResult.isValid) {
-            if (validationResult.error) {
-              errors.push(validationResult.error);
-            }
+            rejectItem(validationResult.error || `Line ${i + 1}: Invalid ${itemType} output`);
             continue;
           }
           // Use the normalized item (with sanitized/validated fields) rather
           // than the raw input, so downstream consumers see the canonical form.
           core.info(`Line ${i + 1}: Valid ${itemType} item`);
-          parsedItems.push(validationResult.normalizedItem);
+          parsedItems.push(queueScope ? { ...validationResult.normalizedItem, ...(item.claim_handle ? { claim_handle: item.claim_handle } : {}) } : validationResult.normalizedItem);
         } else {
           // Fall back to validateItemWithSafeJobConfig for unknown types
           const jobOutputType = expectedOutputTypes[itemType];
           if (!jobOutputType) {
-            errors.push(`Line ${i + 1}: Unknown output type '${itemType}'`);
+            rejectItem(`Line ${i + 1}: Unknown output type '${itemType}'`);
             continue;
           }
           const safeJobConfig = jobOutputType;
           const validation = validateItemWithSafeJobConfig(item, safeJobConfig, i + 1);
           if (!validation.isValid) {
-            errors.push(...validation.errors);
+            for (const error of validation.errors) rejectItem(error);
             continue;
           }
           core.info(`Line ${i + 1}: Valid ${itemType} item`);
-          parsedItems.push(validation.normalizedItem);
+          parsedItems.push(queueScope ? { ...validation.normalizedItem, ...(item.claim_handle ? { claim_handle: item.claim_handle } : {}) } : validation.normalizedItem);
         }
       } catch (error) {
         const errorMsg = getErrorMessage(error);
-        errors.push(`Line ${i + 1}: Invalid JSON - ${errorMsg}`);
+        rejectItem(`Line ${i + 1}: Invalid JSON - ${errorMsg}`);
       }
     }
     if (errors.length > 0) {
@@ -403,16 +350,47 @@ async function main() {
     for (const itemType of Object.keys(expectedOutputTypes)) {
       const minRequired = getMinRequiredForType(itemType, expectedOutputTypes);
       if (minRequired > 0) {
-        const actualCount = parsedItems.filter(item => item.type === itemType).length;
-        if (actualCount < minRequired) {
-          errors.push(`Too few items of type '${itemType}'. Minimum required: ${minRequired}, found: ${actualCount}.`);
+        const handles = claimHandle ? [claimHandle] : assignment ? assignment.claims.map(member => member.handle) : [undefined];
+        for (const handle of handles) {
+          const actualCount = parsedItems.filter(item => item.type === itemType && (!queueScope || (!item._claimScopeError && item.claim_handle === handle))).length;
+          if (actualCount < minRequired) {
+            const message = `Too few items of type '${itemType}'. Minimum required: ${minRequired}, found: ${actualCount}.`;
+            errors.push(handle ? `Claim '${handle}': ${message}` : message);
+            if (handle) {
+              parsedItems.push({
+                type: itemType,
+                claim_handle: handle,
+                _claimScopeError: message,
+                _claimScopeErrorCode: "claim_scope_invalid",
+              });
+            }
+          }
         }
       }
     }
     core.info(`Successfully parsed ${parsedItems.length} valid output items`);
+    let collectorEmptyOutputCause;
+    let collectorFailureCause;
+    let collectorDriverExitCode;
+    let collectorRetryCount;
+    let collectorEngineErrorType;
+    if (!queueScope && !parsedItems.some(item => !["missing_tool", "missing_data"].includes(item.type))) {
+      const incompleteOutcome = buildEmptyOutputOutcome(errors);
+      parsedItems.push(incompleteOutcome);
+      collectorEmptyOutputCause = incompleteOutcome.reason;
+      collectorFailureCause = incompleteOutcome.failureCause;
+      collectorDriverExitCode = incompleteOutcome.driverExitCode;
+      collectorRetryCount = incompleteOutcome.retryCount;
+      collectorEngineErrorType = incompleteOutcome.engineErrorType;
+    }
     const validatedOutput = {
       items: parsedItems,
       errors: errors,
+      ...(collectorEmptyOutputCause ? { collectorEmptyOutputCause } : {}),
+      ...(collectorFailureCause ? { collectorFailureCause } : {}),
+      ...(collectorDriverExitCode !== undefined ? { collectorDriverExitCode } : {}),
+      ...(collectorRetryCount !== undefined ? { collectorRetryCount } : {}),
+      ...(collectorEngineErrorType ? { collectorEngineErrorType } : {}),
     };
     const path = require("path");
     const agentOutputFile = path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME);
@@ -439,7 +417,7 @@ async function main() {
     let hasPatch = false;
     const patchFiles = [];
     try {
-      if (fs.existsSync(patchDir)) {
+      if ((!queueScope || outputContent.trim()) && fs.existsSync(patchDir)) {
         const dirEntries = fs.readdirSync(patchDir);
         for (const entry of dirEntries) {
           if (/^aw-.+\.(patch|bundle)$/.test(entry)) {

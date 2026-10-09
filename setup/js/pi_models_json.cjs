@@ -18,6 +18,7 @@
  *
  * Environment variables:
  *   GH_AW_PI_MODEL_ID              — Pi model ID (without provider prefix)
+ *   GH_AW_PI_CONTEXT_WINDOW        — optional model context window to write into models.json
  *   GH_AW_PI_GATEWAY_SECRET_ENV    — name of the env var holding the provider API key
  *   GH_AW_PI_GATEWAY_FALLBACK_PORT — compile-time api-proxy port, used when /reflect
  *                                    is unavailable or has no matching configured endpoint
@@ -31,10 +32,24 @@
 
 const fs = require("fs");
 const path = require("path");
-const { fetchAWFReflect, normalizeReflectProviderName, REFLECT_PROVIDER_ALIASES, resolveProviderEndpointFromReflect } = require("./awf_reflect.cjs");
+const { fetchAWFReflect, getCatalogModelEntry, normalizeReflectProviderName, REFLECT_PROVIDER_ALIASES, resolveProviderEndpointFromReflect } = require("./awf_reflect.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { loadModelsJson } = require("./model_costs.cjs");
+const { loadPiSDK, nativePiProvider, parsePiConfig, stagePiArtifacts } = require("./pi_runtime.cjs");
+const { preparePiSubagents } = require("./pi_subagent_config.cjs");
+const { buildCatalogFromReflect } = require("./resolve_model_alias.cjs");
+const { resolveAWFModelRoutingSelection, getAWFRoutingModel, getAWFRoutingModelAmbiguityError, mapAWFRoutingEffort, recordAWFModelRoutingOutcome, getAWFModelRoutingPolicy } = require("./awf_model_routing.cjs");
 
 const DEFAULT_PI_CODING_AGENT_DIR = "/tmp/gh-aw/pi-agent-dir";
+const PI_ROUTING_ENDPOINT_APIS = Object.freeze({
+  "/v1/messages": "anthropic-messages",
+  "/responses": "openai-responses",
+  "/chat/completions": "openai-completions",
+});
+const PI_API_ROUTING_ENDPOINTS = Object.freeze(Object.fromEntries(Object.entries(PI_ROUTING_ENDPOINT_APIS).map(([endpoint, api]) => [api, endpoint])));
+const PI_ROUTING_POLICY = getAWFModelRoutingPolicy("pi");
+const PI_ROUTING_ENDPOINTS = PI_ROUTING_POLICY.endpoints;
+const COPILOT_CLAUDE_SONNET_5_CONTEXT_WINDOW = 1000000;
 
 // prettier-ignore
 const DEFAULT_LOGGER = /** @type {(msg: string) => void} */ (msg => process.stderr.write(`[gh-aw/pi-models-json] ${new Date().toISOString()} ${msg}\n`));
@@ -79,21 +94,55 @@ function resolveGatewayBaseUrl(options) {
  * "COPILOT_GITHUB_TOKEN") causes Pi to automatically use the value that is
  * already present in the container environment.
  *
- * @param {{ baseUrl: string, apiKeyEnvVar: string, modelId: string, api?: string }} options
+ * @param {{ baseUrl: string, apiKeyEnvVar: string, modelId: string, api?: string, provider?: string, nativeProvider?: string, contextWindow?: number|string, metadata?: Record<string, any>, models?: Record<string, any>[], logger?: (msg: string) => void }} options
  * @returns {string}
  */
 function buildModelsJSON(options) {
-  const { baseUrl, apiKeyEnvVar, modelId, api } = options;
+  const { baseUrl, modelId, api, provider, nativeProvider, metadata = {}, contextWindow: configuredContextWindow, logger = () => {} } = options;
+  // Pi's built-in github-copilot catalog lists claude-sonnet-5 with a 1M context window.
+  const fallbackContextWindow = provider === "github" && modelId === "claude-sonnet-5" ? COPILOT_CLAUDE_SONNET_5_CONTEXT_WINDOW : undefined;
+  const resolvedContextWindow = resolveContextWindow(configuredContextWindow, logger);
+  const contextWindow = resolvedContextWindow === undefined ? fallbackContextWindow : resolvedContextWindow;
   return JSON.stringify({
     providers: {
       "aw-gateway": {
         baseUrl,
         api: api || "openai-completions",
-        apiKey: apiKeyEnvVar,
-        models: [{ id: modelId }],
+        // AWF owns the upstream credential; Pi only needs a non-secret placeholder.
+        apiKey: "awf-proxy",
+        models: [
+          {
+            ...metadata,
+            id: modelId,
+            ...(contextWindow ? { contextWindow } : {}),
+            // Copilot's Responses adapter only supports apply_patch custom tools.
+            ...(provider === "github" && api === "openai-responses" ? { compat: { ...metadata.compat, supportsOpenAIGrammarTools: false } } : {}),
+          },
+          ...(options.models || []),
+        ],
       },
+      ...(nativeProvider && !["github-copilot", "anthropic", "openai", "google"].includes(nativeProvider) ? { [nativeProvider]: { baseUrl, apiKey: "awf-proxy" } } : {}),
     },
   });
+}
+
+/**
+ * Resolve a configured context window, returning undefined for empty or invalid values so callers can apply a fallback.
+ *
+ * @param {number|string|undefined} value
+ * @param {(msg: string) => void} logger
+ * @returns {number|undefined}
+ */
+function resolveContextWindow(value, logger) {
+  if (value === undefined || value === "") {
+    return undefined;
+  }
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    logger(`warning: ignoring invalid contextWindow=${JSON.stringify(value)}; expected a positive integer`);
+    return undefined;
+  }
+  return parsed;
 }
 
 /**
@@ -119,19 +168,175 @@ function resolvePiApiForProvider(provider) {
   if (provider === "openai" || provider === "codex") {
     return "openai-responses";
   }
+  if (provider === "google" || provider === "gemini") return "google-generative-ai";
   return provider === "anthropic" ? "anthropic-messages" : "openai-completions";
 }
 
-async function main() {
-  const logger = DEFAULT_LOGGER;
-  const modelId = process.env.GH_AW_PI_MODEL_ID || "";
+/**
+ * Fail before inference when a completed proxy model inventory excludes the selected model.
+ *
+ * @param {{ provider: string, modelId: string, reflectData?: any, logger?: (msg: string) => void }} options
+ */
+function validatePiModelAvailability(options) {
+  const { provider, modelId, reflectData, logger = () => {} } = options;
+  if (!reflectData) {
+    logger("awf-reflect: model availability check skipped (reflection data unavailable)");
+    return;
+  }
+  if (reflectData.models_fetch_complete !== true) {
+    logger("awf-reflect: model availability check skipped (model discovery incomplete)");
+    return;
+  }
+
+  const normalizedProvider = normalizeReflectProviderName(provider);
+  const isCopilotProvider = REFLECT_PROVIDER_ALIASES.github.has(normalizedProvider);
+  const aliases = isCopilotProvider ? REFLECT_PROVIDER_ALIASES.github : REFLECT_PROVIDER_ALIASES[normalizedProvider] || new Set([normalizedProvider]);
+  const endpoint = reflectData.endpoints?.find(endpoint => endpoint?.configured === true && aliases.has(normalizeReflectProviderName(endpoint.provider)));
+  if (!endpoint) {
+    logger(`awf-reflect: model availability check skipped (no configured endpoint for provider=${normalizedProvider})`);
+    return;
+  }
+  const normalizedModelId = modelId.split("?")[0].toLowerCase();
+  // Copilot auto is a gateway routing sentinel, not a concrete catalog model.
+  if (isCopilotProvider && normalizedModelId === "auto") {
+    logger("awf-reflect: Copilot auto selection delegated to the proxy");
+    return;
+  }
+  if (!Array.isArray(endpoint.models)) {
+    logger(`awf-reflect: model availability check skipped (endpoint=${endpoint.provider} has no model inventory)`);
+    return;
+  }
+
+  const advertisedModels = endpoint.models.map(model => {
+    if (typeof model === "string") return model.toLowerCase();
+    if (model && typeof model === "object") return String(model.id || model.name || "").toLowerCase();
+    return "";
+  });
+  if (advertisedModels.includes(normalizedModelId)) {
+    logger(`awf-reflect: model availability confirmed (provider=${endpoint.provider}, model=${modelId})`);
+    return;
+  }
+  logger(`warning: awf-reflect model availability check failed (provider=${endpoint.provider}, model=${modelId})`);
+  throw new Error(`Pi model "${modelId}" is not advertised by the configured ${endpoint.provider} proxy endpoint; choose a model listed by AWF /reflect`);
+}
+
+/**
+ * Resolve a model-specific Pi API from model metadata, rejecting an explicit
+ * chat-completions override when the model only supports the Responses API.
+ *
+ * @param {{ provider: string, modelId: string, model?: any, modelsJson?: any, wireApi?: string, overrideApi?: string, strictOverrideApi?: boolean, logger?: (msg: string) => void }} options
+ * @returns {string}
+ */
+function resolvePiApiForModel(options) {
+  const { provider, modelId, model, modelsJson, wireApi: reflectedWireApi, overrideApi, strictOverrideApi = false, logger = () => {} } = options;
+  const catalogProvider = ["github", "copilot", "github-copilot"].includes(provider) ? "github-copilot" : provider;
+  const catalogEntry = getCatalogModelEntry(modelsJson, modelId, catalogProvider);
+  const wireApi = String(catalogEntry?.wire_api || catalogEntry?.wireApi || reflectedWireApi || "")
+    .toLowerCase()
+    .trim();
+  const requiresResponses = model?.api === "openai-responses" || wireApi === "responses";
+  const wireApiFamily = {
+    responses: "openai-responses",
+    "chat-completions": "openai-completions",
+    chat_completions: "openai-completions",
+    messages: "anthropic-messages",
+    "anthropic-messages": "anthropic-messages",
+  }[wireApi];
+  const catalogApi = model?.api || wireApiFamily;
+  if (strictOverrideApi && overrideApi && catalogApi && catalogApi !== overrideApi) {
+    throw new Error(`Pi model "${modelId}" API metadata is "${catalogApi}", which does not match routed API "${overrideApi}"`);
+  }
+  logger(`Pi model API metadata (provider=${provider}, model=${modelId}, catalog_wire_api=${wireApi || "(unset)"}, catalog_api=${model?.api || "(unset)"}, override_api=${overrideApi || "(unset)"})`);
+  if (requiresResponses && overrideApi && overrideApi !== "openai-responses") {
+    logger(`warning: Pi model API override conflicts with Responses-only model (model=${modelId}, override_api=${overrideApi})`);
+    throw new Error(`Pi model "${modelId}" requires the OpenAI Responses API, but engine.config.model.api is "${overrideApi}"`);
+  }
+  const api = requiresResponses ? "openai-responses" : overrideApi || model?.api || wireApiFamily || resolvePiApiForProvider(provider);
+  const source = overrideApi ? "engine.config.model.api" : model?.api ? "Pi model catalog" : wireApiFamily ? "AWF model catalog" : "provider default";
+  logger(`resolved model API=${api} (provider=${provider}, model=${modelId}, source=${source})`);
+  return api;
+}
+
+/**
+ * Resolve reasoning support from the selected provider's reflected model metadata.
+ *
+ * @param {{ provider: string, modelId: string, reflectData?: any }} options
+ * @returns {boolean|undefined}
+ */
+function resolvePiReasoningForModel({ provider, modelId, reflectData }) {
+  if (reflectData?.models_fetch_complete !== true) return undefined;
+  const normalizedProvider = normalizeReflectProviderName(provider);
+  const aliases = REFLECT_PROVIDER_ALIASES[normalizedProvider] || new Set([normalizedProvider]);
+  const endpoint = reflectData?.endpoints?.find(endpoint => endpoint?.configured === true && aliases.has(normalizeReflectProviderName(endpoint.provider)));
+  if (!endpoint) return undefined;
+  const normalizedModelId = modelId.split("?")[0].toLowerCase();
+  const routingModel = endpoint.routing_models?.find(model => typeof model?.model_id === "string" && model.model_id.toLowerCase() === normalizedModelId);
+  const model = endpoint.model_metadata?.find(model => typeof model?.id === "string" && model.id.toLowerCase() === normalizedModelId);
+  const supports = model?.capabilities?.supports;
+  const efforts = routingModel?.supported_reasoning_efforts ?? model?.supportedReasoningEfforts ?? supports?.reasoning_effort;
+  if (Array.isArray(efforts) && efforts.every(effort => typeof effort === "string")) {
+    return efforts.some(effort => effort !== "none");
+  }
+  if (supports?.reasoningEffort === false) return false;
+  return undefined;
+}
+
+/**
+ * @param {any} reflectData
+ * @returns {{selection: any, error: string|null}}
+ */
+function resolvePiModelRouting(reflectData) {
+  const result = resolveAWFModelRoutingSelection(reflectData, true, PI_ROUTING_ENDPOINTS, PI_ROUTING_POLICY.allowEndpointOverride);
+  if (result.error || !result.selection) {
+    recordAWFModelRoutingOutcome({ status: reflectData?.routing?.status === "failed" ? "failed" : "rejected", failure_code: reflectData?.routing?.failure_code, detail: result.error });
+    return { selection: null, error: result.error || "AWF model routing selection is missing" };
+  }
+  const mappedEffort = mapAWFRoutingEffort("pi", result.selection.effort);
+  if (mappedEffort.error) {
+    recordAWFModelRoutingOutcome({ status: "rejected", failure_code: "unsupported_effort", detail: mappedEffort.error });
+    return { selection: null, error: mappedEffort.error };
+  }
+  return {
+    selection: { ...result.selection, mapped_effort: mappedEffort.effort },
+    error: null,
+  };
+}
+
+/**
+ * @param {{ reflectData: any, modelId: string, api: string }} options
+ * @returns {{ endpoint: string|null, error: string|null }}
+ */
+function resolvePiRoutingEndpoint({ reflectData, modelId, api }) {
+  const endpoint = PI_API_ROUTING_ENDPOINTS[api] || null;
+  const routingModelAmbiguity = getAWFRoutingModelAmbiguityError(reflectData, modelId);
+  if (routingModelAmbiguity) return { endpoint, error: routingModelAmbiguity };
+  const routingModel = getAWFRoutingModel(reflectData, modelId);
+  const supportedEndpoints = routingModel?.supported_endpoints;
+  if (routingModel?.candidate_metadata_complete !== true || !Array.isArray(supportedEndpoints) || !supportedEndpoints.every(value => typeof value === "string")) {
+    return { endpoint, error: `AWF /reflect cannot verify endpoints for Pi model ${modelId}; candidate metadata is incomplete` };
+  }
+  if (!endpoint || !supportedEndpoints.includes(endpoint)) {
+    return {
+      endpoint,
+      error: `Pi model "${modelId}" API "${api}" maps to endpoint ${endpoint || "(unsupported)"}, which is not advertised in supported_endpoints [${supportedEndpoints.join(", ")}]`,
+    };
+  }
+  return { endpoint, error: null };
+}
+
+/** @param {{ loadSDK?: typeof loadPiSDK, loadModelsJson?: typeof loadModelsJson, fetchReflect?: typeof fetchAWFReflect, logger?: (message: string) => void }} [options] */
+async function main(options = {}) {
+  const logger = options.logger || DEFAULT_LOGGER;
+  let modelId = process.env.GH_AW_PI_MODEL_ID || "";
+  const routingRequired = process.env.GH_AW_MODEL_ROUTING === "1";
   const apiKeyEnvVar = process.env.GH_AW_PI_GATEWAY_SECRET_ENV || "";
+  const contextWindow = process.env.GH_AW_PI_CONTEXT_WINDOW || "";
   const fallbackPort = Number.parseInt(process.env.GH_AW_PI_GATEWAY_FALLBACK_PORT || "", 10);
-  const provider = process.env.GH_AW_LLM_PROVIDER || "github";
+  const provider = routingRequired ? "github" : process.env.GH_AW_LLM_PROVIDER || "github";
   const agentDir = process.env.PI_CODING_AGENT_DIR || DEFAULT_PI_CODING_AGENT_DIR;
   const outputPath = process.env.GH_AW_PI_MODELS_JSON_PATH || path.join(agentDir, "models.json");
 
-  if (!modelId || !apiKeyEnvVar || !Number.isFinite(fallbackPort)) {
+  if ((!modelId && !routingRequired) || !apiKeyEnvVar || !Number.isFinite(fallbackPort)) {
     logger("fatal: missing required env vars (GH_AW_PI_MODEL_ID, GH_AW_PI_GATEWAY_SECRET_ENV, GH_AW_PI_GATEWAY_FALLBACK_PORT)");
     process.exitCode = 1;
     return;
@@ -139,9 +344,9 @@ async function main() {
 
   /** @type {any} */
   let reflectData = null;
-  if (process.env.AWF_REFLECT_ENABLED === "1") {
+  if (process.env.AWF_REFLECT_ENABLED === "1" || routingRequired) {
     try {
-      const result = await fetchAWFReflect({ logger });
+      const result = await (options.fetchReflect || fetchAWFReflect)({ logger });
       if (result && result.ok && result.reflectData) {
         reflectData = result.reflectData;
       }
@@ -150,15 +355,116 @@ async function main() {
     }
   }
 
+  /** @type {any} */
+  let routingSelection = null;
+  if (routingRequired) {
+    const result = resolvePiModelRouting(reflectData);
+    if (result.error || !result.selection) throw new Error(`${result.error || "AWF model routing selection is missing"}; refusing to start Pi`);
+    routingSelection = result.selection;
+    modelId = routingSelection.wire_model;
+  }
+
+  validatePiModelAvailability({ provider, modelId, reflectData, logger });
   const { baseUrl, source } = resolveGatewayBaseUrl({ provider, fallbackPort, reflectData, logger });
   logger(`resolved gateway baseUrl=${baseUrl} (source=${source}, provider=${provider}, fallbackPort=${fallbackPort})`);
 
-  const api = resolvePiApiForProvider(provider);
-  logger(`resolved gateway api=${api} (provider=${provider})`);
-
-  const modelsJSON = buildModelsJSON({ baseUrl, apiKeyEnvVar, modelId, api });
+  const overrides = parsePiConfig().model || {};
+  const nativeProvider = routingRequired ? nativePiProvider("github") : nativePiProvider(process.env.GH_AW_PI_NATIVE_PROVIDER || provider);
+  const modelsJson = (options.loadModelsJson || loadModelsJson)();
+  let catalogModel;
+  if (["reasoning", "input", "contextWindow", "maxTokens"].every(key => Object.hasOwn(overrides, key))) {
+    logger(`using explicit model metadata for ${nativeProvider}/${modelId}`);
+  } else {
+    const sdk = await (options.loadSDK || loadPiSDK)();
+    const runtime = await sdk.ModelRuntime.create({ modelsPath: null });
+    catalogModel = runtime.getModel(nativeProvider, modelId.split("?")[0]);
+  }
+  let api = resolvePiApiForModel({
+    provider,
+    modelId,
+    model: catalogModel,
+    modelsJson,
+    wireApi: routingRequired ? getAWFRoutingModel(reflectData, modelId)?.wire_api : undefined,
+    overrideApi: routingRequired ? undefined : overrides.api,
+    logger,
+  });
+  if (routingRequired) {
+    const result = resolvePiRoutingEndpoint({ reflectData, modelId, api });
+    if (result.error) throw new Error(`${result.error}; refusing to start Pi`);
+    const endpointOverride = routingSelection.selected_endpoint && routingSelection.selected_endpoint !== result.endpoint ? ` selected_endpoint=${routingSelection.selected_endpoint}` : "";
+    recordAWFModelRoutingOutcome({
+      status: "selected",
+      wire_model: routingSelection.wire_model,
+      endpoint: result.endpoint,
+      selected_endpoint: routingSelection.selected_endpoint,
+      effort: routingSelection.effort,
+      applied_effort: routingSelection.mapped_effort,
+    });
+    logger(`inference routing: mode=awf-routed model=${modelId} effort=${routingSelection.effort || "(unset)"} endpoint=${result.endpoint}${endpointOverride}`);
+  }
+  logger(`resolved gateway api=${api} (provider=${provider}, model=${modelId})`);
+  const metadata = {};
+  if (catalogModel) {
+    for (const key of ["name", "reasoning", "thinkingLevelMap", "input", "inputLimits", "cost", "promptCache", "contextWindow", "maxTokens", "samplingParams", "compat"]) {
+      if (catalogModel[key] !== undefined) metadata[key] = catalogModel[key];
+    }
+  } else if (nativeProvider === "github-copilot" && modelId.split("?")[0].toLowerCase() === "auto") {
+    logger("Copilot auto uses gateway-selected model metadata");
+  } else {
+    logger(`warning: Pi has no catalog metadata for ${nativeProvider}/${modelId}; configure engine.config.model for a custom model`);
+  }
+  for (const key of Object.keys(overrides)) {
+    if (!["api", "name", "reasoning", "thinkingLevelMap", "input", "inputLimits", "cost", "promptCache", "contextWindow", "maxTokens", "samplingParams", "compat"].includes(key)) {
+      throw new Error(`Unsupported Pi model metadata field: ${key}`);
+    }
+  }
+  if (!routingRequired && overrides.api !== undefined) {
+    if (!["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"].includes(overrides.api)) throw new Error("Pi model API must match a supported AWF protocol");
+    api = overrides.api;
+  }
+  Object.assign(metadata, overrides);
+  const reasoning = resolvePiReasoningForModel({ provider, modelId, reflectData });
+  if (reasoning !== undefined) {
+    metadata.reasoning = reasoning;
+    logger(`resolved reasoning=${reasoning} from AWF /reflect (provider=${provider}, model=${modelId})`);
+  } else {
+    logger(`awf-reflect: reasoning metadata unavailable; retaining Pi model configuration (provider=${provider}, model=${modelId})`);
+  }
+  const models = [];
+  stagePiArtifacts(agentDir);
+  if (fs.existsSync(path.join(agentDir, "agents"))) {
+    const sdk = await (options.loadSDK || loadPiSDK)();
+    const runtime = await sdk.ModelRuntime.create({ modelsPath: null });
+    const catalog = reflectData?.models_fetch_complete === true ? buildCatalogFromReflect(reflectData) : runtime.getModels(nativeProvider).map(model => `${model.provider}/${model.id}`);
+    const agents = preparePiSubagents({ agentDir, sdk, provider: nativeProvider, catalog, gateway: true, parentModel: `${nativeProvider}/${modelId}`, logger });
+    const seen = new Set([modelId]);
+    for (const agent of agents) {
+      if (seen.has(agent.modelId)) continue;
+      seen.add(agent.modelId);
+      validatePiModelAvailability({ provider, modelId: agent.modelId, reflectData, logger });
+      const catalogModel = runtime.getModel(nativeProvider, agent.modelId);
+      const childApi = resolvePiApiForModel({ provider, modelId: agent.modelId, model: catalogModel, modelsJson, logger });
+      const childMetadata = {};
+      if (catalogModel) {
+        for (const key of ["name", "reasoning", "thinkingLevelMap", "input", "inputLimits", "cost", "promptCache", "contextWindow", "maxTokens", "samplingParams", "compat"]) {
+          if (catalogModel[key] !== undefined) childMetadata[key] = catalogModel[key];
+        }
+      }
+      const childReasoning = resolvePiReasoningForModel({ provider, modelId: agent.modelId, reflectData });
+      if (childReasoning !== undefined) childMetadata.reasoning = childReasoning;
+      const payload = JSON.parse(buildModelsJSON({ baseUrl, apiKeyEnvVar, modelId: agent.modelId, api: childApi, provider, metadata: childMetadata, logger }));
+      models.push({ ...payload.providers["aw-gateway"].models[0], api: childApi });
+    }
+  }
+  const modelsJSON = buildModelsJSON({ baseUrl, apiKeyEnvVar, modelId, api, provider, nativeProvider, contextWindow, metadata, models, logger });
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-  fs.writeFileSync(outputPath, modelsJSON, "utf8");
+  fs.writeFileSync(outputPath, modelsJSON, { encoding: "utf8", mode: 0o600 });
+  if (routingSelection) {
+    fs.writeFileSync(path.join(agentDir, "model-routing-selection.json"), JSON.stringify(routingSelection), { encoding: "utf8", mode: 0o600 });
+    const routingModelFile = process.env.GH_AW_PI_MODEL_ROUTING_MODEL_FILE || "/tmp/gh-aw/pi-routing-model";
+    fs.mkdirSync(path.dirname(routingModelFile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(routingModelFile, modelId, { encoding: "utf8", mode: 0o600 });
+  }
   logger(`wrote ${outputPath}`);
 }
 
@@ -169,4 +475,15 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, resolveGatewayBaseUrl, buildModelsJSON, resolvePiApiForProvider, DEFAULT_PI_CODING_AGENT_DIR };
+module.exports = {
+  main,
+  resolveGatewayBaseUrl,
+  buildModelsJSON,
+  resolvePiApiForProvider,
+  resolvePiApiForModel,
+  resolvePiModelRouting,
+  resolvePiRoutingEndpoint,
+  resolvePiReasoningForModel,
+  validatePiModelAvailability,
+  DEFAULT_PI_CODING_AGENT_DIR,
+};

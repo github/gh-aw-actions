@@ -270,6 +270,7 @@ async function lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken
 async function pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken }) {
   const pushArgs = pushRemoteUrl ? ["push", pushRemoteUrl, branch] : ["push", "origin", branch];
   const pushOnce = async () => {
+    await require("./work_queue_git_effects.cjs").assertGitPushAuthorized({ remote: pushRemoteUrl || "origin", branch, cwd, gitAuthEnv });
     await exec.exec("git", pushArgs, {
       cwd,
       env: { ...process.env, ...(gitAuthEnv || {}) },
@@ -280,6 +281,7 @@ async function pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl
     return pushOnce();
   }
 
+  await require("./work_queue_git_effects.cjs").assertGitPushAuthorized({ remote: pushRemoteUrl, branch, cwd, gitAuthEnv });
   const githubServerUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
   let previousExtraheaders = [];
   let overrideApplied = false;
@@ -361,6 +363,7 @@ async function resolveLocalHeadSha(cwd) {
  * @param {string} [opts.pushToken] - Optional token used when pushing to pushRemoteUrl
  * @param {boolean} [opts.signedCommits=true] - When false, skip GraphQL signed commits and use git push directly
  * @param {boolean} [opts.allowGitPushFallback=true] - When false, refuse any fallback path that would use direct git push
+ * @param {boolean} [opts.requireBaseRefMatch=false] - Refuse a signed commit against a remote head other than baseRef
  * @param {Record<string, any>} [opts.resolvedTemporaryIds] - Resolved temporary IDs map
  * @param {string} [opts.currentRepo] - Repository slug used for same-repo temporary ID resolution
  * @param {Record<string, any>} [opts.validationConfig] - Optional safe-output policy config applied to synthesized GraphQL fileChanges
@@ -379,6 +382,7 @@ async function pushSignedCommits({
   pushToken,
   signedCommits = true,
   allowGitPushFallback = true,
+  requireBaseRefMatch = false,
   resolvedTemporaryIds,
   currentRepo,
   validationConfig,
@@ -395,6 +399,7 @@ async function pushSignedCommits({
 
   // The default parameter value converts undefined to true; this check tests only the explicit false value.
   if (signedCommits === false) {
+    if (requireBaseRefMatch) throw new Error(`${ERR_VALIDATION}: signed commits are required for an atomic ledger transition`);
     core.info(`pushSignedCommits: signed-commits disabled (using direct git push) for branch ${branch}`);
     const headSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken });
     core.info(`pushSignedCommits: git push and HEAD resolution completed, HEAD=${headSha}`);
@@ -483,7 +488,8 @@ async function pushSignedCommits({
   let graphqlParentIsAncestorOfHead = true;
   if (firstGraphqlParentOid) {
     try {
-      const ancestryCheck = await exec.getExecOutput("git", ["merge-base", "--is-ancestor", firstGraphqlParentOid, "HEAD"], { cwd, ignoreReturnCode: true });
+      // Partial clones may fetch a missing remote head during this probe.
+      const ancestryCheck = await exec.getExecOutput("git", ["merge-base", "--is-ancestor", firstGraphqlParentOid, "HEAD"], { cwd, env: { ...process.env, ...(gitAuthEnv || {}) }, ignoreReturnCode: true });
       graphqlParentIsAncestorOfHead = ancestryCheck.exitCode === 0;
     } catch {
       // Ancestry probe failed — ignored, keep the default (true) and avoid rewrite.
@@ -802,6 +808,9 @@ async function pushSignedCommits({
           }
         } else {
           core.info(`pushSignedCommits: using remote HEAD OID from ls-remote: ${expectedHeadOid}`);
+        }
+        if (requireBaseRefMatch && expectedHeadOid !== baseRefOid) {
+          throw new Error(`${ERR_API}: ledger branch moved after transition validation`);
         }
       }
 
