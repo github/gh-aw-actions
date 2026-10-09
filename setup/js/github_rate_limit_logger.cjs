@@ -30,19 +30,9 @@ const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { GITHUB_RATE_LIMITS_JSONL_PATH } = require("./constants.cjs");
 
-const CREDENTIAL_SOURCES = new Set(["github_actions", "pat", "app", "unknown"]);
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/**
- * @param {unknown} source
- * @returns {string | undefined}
- */
-function normalizeCredentialSource(source) {
-  return typeof source === "string" && CREDENTIAL_SOURCES.has(source) ? source : undefined;
-}
 
 /**
  * Ensure the directory containing the log file exists.
@@ -100,9 +90,8 @@ function parseResetTimestamp(resetHeader) {
  *
  * @param {{ headers?: Record<string, string | undefined> }} response - The github.rest response object
  * @param {string} operation - Human-readable description of the operation (e.g. "issues.listComments")
- * @param {unknown} [credentialSource] - Known credential category, never a token
  */
-function logRateLimitFromResponse(response, operation, credentialSource) {
+function logRateLimitFromResponse(response, operation) {
   const headers = response?.headers;
   if (!headers) return;
 
@@ -121,8 +110,6 @@ function logRateLimitFromResponse(response, operation, credentialSource) {
     source: "response_headers",
     operation,
   };
-  const normalizedCredentialSource = normalizeCredentialSource(credentialSource);
-  if (normalizedCredentialSource) entry.credentialSource = normalizedCredentialSource;
 
   if (resource) entry.resource = resource;
   if (limit !== undefined) entry.limit = parseInt(limit, 10);
@@ -246,12 +233,9 @@ function logRetryEvent(error, operation, attempt, delayMs) {
  * ```
  *
  * @param {any} github - The github object injected by actions/github-script
- * @param {unknown} [credentialSource] - Known credential category, never a token
  * @returns {any} A proxied github object with automatic rate-limit logging
  */
-function createRateLimitAwareGithub(github, credentialSource) {
-  const normalizedCredentialSource = normalizeCredentialSource(credentialSource) ?? "unknown";
-
+function createRateLimitAwareGithub(github) {
   /**
    * Wrap a single REST namespace (e.g. github.rest.issues) so each method
    * call intercepts the response and logs rate-limit headers.
@@ -267,7 +251,7 @@ function createRateLimitAwareGithub(github, credentialSource) {
         if (typeof fn !== "function") return fn;
         const wrapper = async (/** @type {any[]} */ ...args) => {
           const response = await fn.apply(target, args);
-          logRateLimitFromResponse(response, `${namespaceName}.${String(method)}`, normalizedCredentialSource);
+          logRateLimitFromResponse(response, `${namespaceName}.${String(method)}`);
           return response;
         };
         // Wrap the wrapper in a Proxy so that Octokit-specific property accesses

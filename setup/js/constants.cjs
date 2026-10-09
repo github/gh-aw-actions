@@ -21,12 +21,6 @@ const AGENT_OUTPUT_FILENAME = "agent_output.json";
  */
 const TMP_GH_AW_PATH = "/tmp/gh-aw";
 
-/**
- * Default GitHub REST API version for Actions clients.
- * @type {string}
- */
-const GITHUB_API_VERSION = "2026-03-10";
-
 // ---------------------------------------------------------------------------
 // GitHub reviewer bot
 // ---------------------------------------------------------------------------
@@ -96,16 +90,6 @@ const RPC_MESSAGES_PATH = `${TMP_GH_AW_PATH}/mcp-logs/rpc-messages.jsonl`;
 const MANIFEST_FILE_PATH = `${TMP_GH_AW_PATH}/safe-output-items.jsonl`;
 
 /**
- * Path to the ledger transaction log JSONL file.
- * The ledger MCP server appends redacted `ledger_mutation` audit entries here during the
- * agent run. A trusted step merges validated entries into the safe-output file before
- * ingestion; the file is deliberately separate from the safe-output manifest so agent-run
- * writes can never be mistaken for executed safe outputs.
- * @type {string}
- */
-const LEDGER_TRANSACTION_LOG_PATH = `${TMP_GH_AW_PATH}/ledger-transactions.jsonl`;
-
-/**
  * Path to the temporary ID map JSON file.
  * This file stores the mapping of temporary IDs (e.g., aw_abc123) to their resolved
  * GitHub resource references ({repo, number}) for review and audit purposes.
@@ -156,40 +140,9 @@ const DETECTION_LOG_FILENAME = "detection.log";
  */
 const DETECTION_RESULT_FILENAME = "detection_result.json";
 
-/**
- * Default timeout for a Codex MCP tool call when no server timeout is configured.
- * @type {number}
- */
-const DEFAULT_MCP_CALL_WATCHDOG_MS = 120_000;
-
-/**
- * Grace period added to the configured MCP tool timeout before terminating Codex.
- * @type {number}
- */
-const MCP_CALL_TRANSPORT_GRACE_MS = 60_000;
-
-/**
- * Maximum number of prior runs to check when restoring the AIC scan cache.
- * @type {number}
- */
-const MAX_RESTORE_RUNS = 10;
-
-/**
- * Maximum number of repository history pages to search when restoring the AIC scan cache.
- * @type {number}
- */
-const MAX_RESTORE_PAGES = 25;
-
-/**
- * Time window searched when restoring the AIC scan cache.
- * @type {number}
- */
-const SCAN_WINDOW_MS = 24 * 60 * 60 * 1000;
-
 module.exports = {
   AGENT_OUTPUT_FILENAME,
   TMP_GH_AW_PATH,
-  GITHUB_API_VERSION,
   COPILOT_REVIEWER_BOT,
   COPILOT_REVIEWER_BOT_ID,
   FAQ_CREATE_PR_PERMISSIONS_URL,
@@ -198,16 +151,10 @@ module.exports = {
   GATEWAY_JSONL_PATH,
   RPC_MESSAGES_PATH,
   MANIFEST_FILE_PATH,
-  LEDGER_TRANSACTION_LOG_PATH,
   TEMPORARY_ID_MAP_FILE_PATH,
   SAFE_OUTPUT_ERRORS_FILE_PATH,
   OTEL_JSONL_PATH,
   GITHUB_RATE_LIMITS_JSONL_PATH,
   DETECTION_LOG_FILENAME,
   DETECTION_RESULT_FILENAME,
-  DEFAULT_MCP_CALL_WATCHDOG_MS,
-  MCP_CALL_TRANSPORT_GRACE_MS,
-  MAX_RESTORE_RUNS,
-  MAX_RESTORE_PAGES,
-  SCAN_WINDOW_MS,
 };

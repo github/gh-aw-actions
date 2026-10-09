@@ -233,7 +233,6 @@ async function updateReusableStatusComment(reusableComment, invocationContext, r
  * Add a comment with a workflow run link to the triggering item.
  * This script ONLY creates comments - it does NOT add reactions.
  * Use add_reaction.cjs in the pre-activation job to add reactions first for immediate feedback.
- * @param {Omit<typeof context, "issue" | "repo"> & {repo?: typeof context.repo, workflowEmoji?: string, nonFatalStatusCommentErrors?: boolean}} [rawContext]
  */
 async function createOrReuseStatusComment(rawContext = context) {
   const messagesConfig = getMessages();

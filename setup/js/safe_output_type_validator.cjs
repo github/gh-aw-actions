@@ -15,7 +15,6 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { unfenceMarkdown } = require("./markdown_unfencing.cjs");
 const { validateValueAgainstSchema } = require("./mcp_scripts_validation.cjs");
 const { resolveDataSchema } = require("./data_schema_normalizer.cjs");
-const { isBlankOptionalField, normalizeBlankOptionalFields } = require("./optional_field_normalizer.cjs");
 
 /**
  * Default max body length for GitHub content
@@ -35,7 +34,6 @@ const ISSUE_INTENT_RATIONALE_MAX_LENGTH = 280;
  *   maxMentions?: number,
  *   allowedAliasesSeen?: Set<string>,
  *   maxBotMentions?: number,
- *   deferMentions?: boolean,
  *   normalizeIssueClosingKeywords?: boolean,
  *   dataEnabled?: boolean,
  *   dataSchema?: any
@@ -44,12 +42,16 @@ const ISSUE_INTENT_RATIONALE_MAX_LENGTH = 280;
 
 // GitHub issue-closing keywords:
 // https://docs.github.com/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue
-const ISSUE_CLOSING_KEYWORDS_PATTERN = "fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved";
+const ISSUE_CLOSING_KEYWORDS = "fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved";
 const ISSUE_REFERENCE_PATTERN = "(?:[a-zA-Z0-9_.-]+\\/[a-zA-Z0-9_.-]+)?#\\d+";
-const ISSUE_CLOSING_WHOLE_SPAN_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS_PATTERN})\\b\\s+${ISSUE_REFERENCE_PATTERN})\``, "gi");
-const ISSUE_CLOSING_BOTH_BACKTICK_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS_PATTERN})\\b)\`(\\s+)\`(${ISSUE_REFERENCE_PATTERN})\``, "gi");
-const ISSUE_CLOSING_KEYWORD_BACKTICK_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS_PATTERN})\\b)\`(\\s+)(${ISSUE_REFERENCE_PATTERN})`, "gi");
-const ISSUE_CLOSING_REFERENCE_BACKTICK_PATTERN = new RegExp(`(\\b(?:${ISSUE_CLOSING_KEYWORDS_PATTERN})\\b)(\\s+)\`(${ISSUE_REFERENCE_PATTERN})\``, "gi");
+// eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- ISSUE_CLOSING_KEYWORDS and ISSUE_REFERENCE_PATTERN are intentional regex fragments (alternation and character classes), not user input
+const ISSUE_CLOSING_WHOLE_SPAN_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b\\s+${ISSUE_REFERENCE_PATTERN})\``, "gi");
+// eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- ISSUE_CLOSING_KEYWORDS and ISSUE_REFERENCE_PATTERN are intentional regex fragments (alternation and character classes), not user input
+const ISSUE_CLOSING_BOTH_BACKTICK_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)\`(\\s+)\`(${ISSUE_REFERENCE_PATTERN})\``, "gi");
+// eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- ISSUE_CLOSING_KEYWORDS and ISSUE_REFERENCE_PATTERN are intentional regex fragments (alternation and character classes), not user input
+const ISSUE_CLOSING_KEYWORD_BACKTICK_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)\`(\\s+)(${ISSUE_REFERENCE_PATTERN})`, "gi");
+// eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- ISSUE_CLOSING_KEYWORDS and ISSUE_REFERENCE_PATTERN are intentional regex fragments (alternation and character classes), not user input
+const ISSUE_CLOSING_REFERENCE_BACKTICK_PATTERN = new RegExp(`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)(\\s+)\`(${ISSUE_REFERENCE_PATTERN})\``, "gi");
 const NORMALIZE_CLOSER_BODY_TYPES = new Set(["create_issue", "add_comment", "create_pull_request"]);
 const ISSUE_INTENT_LABEL_TYPES = new Set(["add_labels", "remove_labels", "update_issue"]);
 const STRUCTURED_DATA_LABEL = "Structured data:";
@@ -93,7 +95,6 @@ function normalizeIssueIntentRationale(rationale, options) {
     maxMentions: options?.maxMentions,
     allowedAliasesSeen: options?.allowedAliasesSeen,
     maxBotMentions: options?.maxBotMentions,
-    deferMentions: options?.deferMentions,
   }).trim();
   // sanitizeContent appends "\n[Content truncated due to length]" when it truncates,
   // so clamp again to guarantee the GitHub API hard limit.
@@ -122,7 +123,6 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
         maxMentions: options?.maxMentions,
         allowedAliasesSeen: options?.allowedAliasesSeen,
         maxBotMentions: options?.maxBotMentions,
-        deferMentions: options?.deferMentions,
       });
       if (!name) {
         return { isValid: false, error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}] must be a non-empty string` };
@@ -158,7 +158,6 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
       maxMentions: options?.maxMentions,
       allowedAliasesSeen: options?.allowedAliasesSeen,
       maxBotMentions: options?.maxBotMentions,
-      deferMentions: options?.deferMentions,
     });
     if (!name) {
       return {
@@ -203,7 +202,6 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
 /**
  * @typedef {Object} FieldValidation
  * @property {boolean} [required] - Whether the field is required
- * @property {boolean} [allowEmpty] - Whether a required string may be explicitly empty
  * @property {string} [type] - Expected type: 'string', 'number', 'boolean', 'array'
  * @property {string} [typeHint] - Overrides the type description in error messages (e.g. "GraphQL node ID string")
  * @property {boolean} [sanitize] - Whether to sanitize string content
@@ -212,7 +210,6 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
  * @property {boolean} [positiveInteger] - Must be a positive integer
  * @property {boolean} [optionalPositiveInteger] - Optional but if present must be positive integer
  * @property {boolean} [allowAuto] - Allows "auto" for optional positive integer fields
- * @property {boolean} [allowNull] - Preserves explicit JSON null for optional fields that accept it
  * @property {boolean} [issueOrPRNumber] - Can be issue/PR number or undefined
  * @property {boolean} [issueNumberOrTemporaryId] - Can be issue number or temporary ID
  * @property {string[]} [enum] - Allowed values for the field
@@ -237,7 +234,6 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
  * @property {string} [customValidation] - Custom validation rule identifier
  * @property {boolean} [dataEnabled] - Whether structured data is enabled for this type
  * @property {any} [dataSchema] - Optional schema used to validate structured data
- * @property {boolean} [collapseData] - Whether to render structured data in a collapsed details section
  */
 
 /** @type {Object.<string, TypeValidationConfig>|null} */
@@ -453,10 +449,6 @@ function validateIssueNumberOrTemporaryId(value, fieldName, lineNum) {
  * @returns {{isValid: boolean, normalizedValue?: any, error?: string}}
  */
 function validateField(value, fieldName, validation, itemType, lineNum, options) {
-  if (isBlankOptionalField(value, validation, false, fieldName)) {
-    return { isValid: true };
-  }
-
   // For positiveInteger fields, delegate required check to validatePositiveInteger
   if (validation.positiveInteger) {
     return validatePositiveInteger(value, `${itemType} '${fieldName}'`, lineNum);
@@ -472,7 +464,7 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
   }
 
   // Handle required check for other fields
-  if (validation.required && (value === undefined || value === null || (!validation.allowEmpty && !validation.minLength && typeof value === "string" && value.trim() === ""))) {
+  if (validation.required && (value === undefined || value === null)) {
     const fieldType = validation.typeHint || validation.type || "string";
     return {
       isValid: false,
@@ -481,9 +473,6 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
   }
 
   // If not required and not present, skip other validations
-  if (value === null && validation.allowNull) {
-    return { isValid: true, normalizedValue: null };
-  }
   if (value === undefined || value === null) {
     return { isValid: true };
   }
@@ -570,7 +559,6 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
           maxMentions: options?.maxMentions,
           allowedAliasesSeen: options?.allowedAliasesSeen,
           maxBotMentions: options?.maxBotMentions,
-          deferMentions: options?.deferMentions,
         });
       }
       return { isValid: true, normalizedValue: normalizedResult };
@@ -595,7 +583,6 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
         maxMentions: options?.maxMentions,
         allowedAliasesSeen: options?.allowedAliasesSeen,
         maxBotMentions: options?.maxBotMentions,
-        deferMentions: options?.deferMentions,
       });
     }
     if (options?.normalizeIssueClosingKeywords && fieldName === "body" && NORMALIZE_CLOSER_BODY_TYPES.has(itemType)) {
@@ -676,7 +663,6 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
                 maxMentions: options?.maxMentions,
                 allowedAliasesSeen: options?.allowedAliasesSeen,
                 maxBotMentions: options?.maxBotMentions,
-                deferMentions: options?.deferMentions,
               })
             : item
         );
@@ -779,11 +765,6 @@ function validateItem(item, itemType, lineNum, options) {
     // Unknown type - let the caller handle this
     return { isValid: true, normalizedItem: item };
   }
-
-  const runtimeDataSchema = options?.dataSchema;
-  const dataEnabled = options?.dataEnabled === true || runtimeDataSchema !== undefined || typeConfig.dataEnabled === true || typeConfig.dataSchema !== undefined;
-  const normalizationFields = dataEnabled ? { ...typeConfig.fields, data: { type: "object" } } : typeConfig.fields;
-  item = normalizeBlankOptionalFields(item, normalizationFields);
 
   // Build the downstream payload from the declared contract. The raw item is
   // agent-controlled, so forwarding undeclared fields would let consumers act
@@ -889,8 +870,7 @@ function validateItem(item, itemType, lineNum, options) {
     // If this safe-output type supports a body field, append structured data
     // as fenced JSON so it survives body sanitization.
     if (Object.prototype.hasOwnProperty.call(typeConfig.fields, "body")) {
-      const fencedData = `\`\`\`json\n${dataJSON}\n\`\`\``;
-      const dataBlock = typeConfig.collapseData === true ? `<details>\n<summary>Structured data</summary>\n\n${fencedData}\n\n</details>` : `${STRUCTURED_DATA_LABEL}\n${fencedData}`;
+      const dataBlock = `${STRUCTURED_DATA_LABEL}\n\`\`\`json\n${dataJSON}\n\`\`\``;
       if (typeof normalizedItem.body === "string" && normalizedItem.body.length > 0) {
         normalizedItem.body = `${normalizedItem.body}\n\n${dataBlock}`;
       } else {

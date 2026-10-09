@@ -291,7 +291,6 @@ interface AssignToAgentConfig extends SafeOutputConfig {
   "custom-agent"?: string;
   "custom-instructions"?: string;
   allowed?: string[];
-  "required-labels"?: string[];
   target?: string;
   "target-repo"?: string;
   "pull-request-repo"?: string;

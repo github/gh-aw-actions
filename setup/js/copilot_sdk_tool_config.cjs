@@ -3,13 +3,11 @@
 "use strict";
 
 const { createCopilotSDKWebFetchTool } = require("./copilot_sdk_web_fetch.cjs");
-const { parseMaxToolCalls } = require("./copilot_sdk_tool_budget.cjs");
 
 const COPILOT_SDK_TOOL_CONFIG_VERSION = 1;
 const COPILOT_SDK_NEUTRAL_BUILTIN_TOOLS = Object.freeze(["view", "rg", "glob", "sql"]);
 const COPILOT_SDK_SHELL_BUILTIN_TOOLS = Object.freeze(["bash", "read_bash", "stop_bash", "list_bash"]);
 const COPILOT_SDK_EDIT_BUILTIN_TOOLS = Object.freeze(["apply_patch", "edit", "create", "delete", "move", "write_bash"]);
-const COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS = Object.freeze(["run_dynamic_workflow", "dynamic_workflows_manage"]);
 
 /**
  * @typedef {{
@@ -17,7 +15,6 @@ const COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS = Object.freeze(["run_dynamic_workflow"
  *   edit: boolean,
  *   webFetch: boolean,
  *   webSearch: boolean,
- *   dynamicWorkflows: boolean,
  *   mcp: boolean,
  *   cliProxy: boolean,
  * }} CopilotSDKToolCapabilities
@@ -28,7 +25,6 @@ const COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS = Object.freeze(["run_dynamic_workflow"
  *   version: number,
  *   capabilities: CopilotSDKToolCapabilities,
  *   permissions: {allowedTools: string[]},
- *   maxToolCalls?: number,
  *   explicitlyDisabledTools: string[],
  * }} CopilotSDKToolConfig
  */
@@ -68,16 +64,11 @@ function parseCapabilities(value) {
       throw new Error(`capabilities.${field} must be a boolean`);
     }
   }
-  if (value.dynamicWorkflows !== undefined && typeof value.dynamicWorkflows !== "boolean") {
-    throw new Error("capabilities.dynamicWorkflows must be a boolean");
-  }
   return /** @type {CopilotSDKToolCapabilities} */ {
     bash: Boolean(value.bash),
     edit: Boolean(value.edit),
     webFetch: Boolean(value.webFetch),
     webSearch: Boolean(value.webSearch),
-    // Older version-1 contracts omit this capability and must not expose workflows.
-    dynamicWorkflows: value.dynamicWorkflows === true,
     mcp: Boolean(value.mcp),
     cliProxy: Boolean(value.cliProxy),
   };
@@ -95,9 +86,7 @@ function parseCapabilities(value) {
  * @returns {boolean}
  */
 function isReservedSDKPermission(tool) {
-  return (
-    tool === "read" || tool === "write" || tool === "web_fetch" || tool === "web_search" || tool === "workflow" || tool === "shell" || (tool.startsWith("read(") && tool.endsWith(")")) || (tool.startsWith("shell(") && tool.endsWith(")"))
-  );
+  return tool === "read" || tool === "write" || tool === "web_fetch" || tool === "web_search" || tool === "shell" || (tool.startsWith("read(") && tool.endsWith(")")) || (tool.startsWith("shell(") && tool.endsWith(")"));
 }
 
 /**
@@ -119,12 +108,6 @@ function validateToolPermissionParity(config) {
   }
   if (config.capabilities.webSearch !== allowed.has("web_search")) {
     throw new Error("SDK tool contract mismatch: web_search visibility and permissions differ");
-  }
-  if (config.capabilities.webSearch) {
-    throw new Error("Copilot native web_search is unavailable in offline BYOK mode; configure an MCP search server instead");
-  }
-  if (config.capabilities.dynamicWorkflows !== allowed.has("workflow")) {
-    throw new Error("SDK tool contract mismatch: workflow visibility and permissions differ");
   }
   if (!config.capabilities.mcp && hasMCPPermission) {
     throw new Error("SDK tool contract mismatch: MCP permissions exist while MCP visibility is disabled");
@@ -184,14 +167,12 @@ function parseCopilotSDKToolConfig(value) {
   if (allowedTools.length === 0) {
     throw new Error("permissions.allowedTools must not be empty");
   }
-  const maxToolCalls = Object.hasOwn(parsed, "maxToolCalls") ? parseMaxToolCalls(parsed.maxToolCalls) : undefined;
   const config = {
     version: COPILOT_SDK_TOOL_CONFIG_VERSION,
     capabilities: parseCapabilities(parsed.capabilities),
     permissions: {
       allowedTools,
     },
-    ...(maxToolCalls === undefined ? {} : { maxToolCalls }),
     explicitlyDisabledTools: parsed.explicitlyDisabledTools == null ? [] : parseStringArray(parsed.explicitlyDisabledTools, "explicitlyDisabledTools"),
   };
   validateToolPermissionParity(config);
@@ -215,14 +196,14 @@ function buildCopilotSDKSessionToolConfig(config, sdk, options = {}) {
   }
 
   const availableTools = new sdk.ToolSet();
-  availableTools.addBuiltIn(sdk.BuiltInTools.Isolated.filter(name => name !== "ask_user" && !COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS.includes(name)));
+  availableTools.addBuiltIn(sdk.BuiltInTools.Isolated.filter(name => name !== "ask_user"));
   availableTools.addBuiltIn(COPILOT_SDK_NEUTRAL_BUILTIN_TOOLS);
   if (config.capabilities.bash) availableTools.addBuiltIn(COPILOT_SDK_SHELL_BUILTIN_TOOLS);
   if (config.capabilities.edit) availableTools.addBuiltIn(COPILOT_SDK_EDIT_BUILTIN_TOOLS);
-  if (config.capabilities.webSearch) {
-    throw new Error("Copilot native web_search is unavailable in offline BYOK mode; configure an MCP search server instead");
-  }
-  if (config.capabilities.dynamicWorkflows) availableTools.addBuiltIn(COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS);
+  // web_search is a Copilot SDK built-in tool; the compiler emits webSearch: true
+  // only when the workflow declares tools.web-search, and the parity check above
+  // makes a stray webSearch: true without a matching permission fail closed.
+  if (config.capabilities.webSearch) availableTools.addBuiltIn("web_search");
   if (config.capabilities.mcp) availableTools.addMcp("*");
   // cliProxy mounts MCP servers as CLI wrapper scripts on PATH; those scripts are
   // invoked through the bash builtin (already added above when capabilities.bash
@@ -249,7 +230,6 @@ module.exports = {
   COPILOT_SDK_NEUTRAL_BUILTIN_TOOLS,
   COPILOT_SDK_SHELL_BUILTIN_TOOLS,
   COPILOT_SDK_EDIT_BUILTIN_TOOLS,
-  COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS,
   parseStringArray,
   parseCapabilities,
   isReservedSDKPermission,

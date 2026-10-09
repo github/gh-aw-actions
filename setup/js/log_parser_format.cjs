@@ -1,10 +1,6 @@
 // @ts-check
 
 const { buildStepSummaryDetailsSection } = require("./log_parser_step_summary_builder.cjs");
-const { normalizeSessionUsage, sessionTokenTotal, sessionOutputText, observedSessionModel, projectSessionResult, sessionContext, isSingleNestedSession } = require("./agent_session.cjs");
-const { collapseStreamedMessages, escapeSummaryText, renderInitializationLines, toolOutcome, boundSummaryLines } = require("./agent_session_render.cjs");
-const { isUnifiedSessionTrace, publicationAgentSessions, renderUnifiedSession } = require("./unified_session_render.cjs");
-const { renderSubagentSummary } = require("./subagent_session_render.cjs");
 
 /**
  * Minimal dependency contract injected from log_parser_shared.cjs.
@@ -23,9 +19,6 @@ const { renderSubagentSummary } = require("./subagent_session_render.cjs");
  * @property {(text: string) => string} unfenceMarkdown
  * @property {(entries: Array<any>) => boolean} isCopilotEventLogEntries
  * @property {(entries: Array<any>) => Array<any>} convertCopilotEventsToLegacyLogEntries
- * @property {(entry: any) => string} generateInformationSection
- * @property {() => any} createSummaryTracker
- * @property {number} MAX_STEP_SUMMARY_SIZE
  * @property {number} MAX_AGENT_TEXT_LENGTH
  * @property {string} SIZE_LIMIT_WARNING
  */
@@ -34,10 +27,10 @@ const { renderSubagentSummary } = require("./subagent_session_render.cjs");
  * Public formatter API returned by createLogParserFormatters().
  *
  * @typedef {Object} LogParserFormatters
- * @property {(logEntries: Array<any>, options: {formatToolCallback: Function, formatInitCallback: Function, summaryTracker?: any, includeInformation?: boolean}) => {markdown: string, commandSummary: Array<string>, sizeLimitReached: boolean}} generateConversationMarkdown
+ * @property {(logEntries: Array<any>, options: {formatToolCallback: Function, formatInitCallback: Function, summaryTracker?: any}) => {markdown: string, commandSummary: Array<string>, sizeLimitReached: boolean}} generateConversationMarkdown
  * @property {(toolUse: any, toolResult: any, options?: {includeDetailedParameters?: boolean}) => string} formatToolUse
  * @property {(logEntries: Array<any>, options?: {model?: string, parserName?: string}) => string} generatePlainTextSummary
- * @property {(logEntries: Array<any>, options?: {model?: string, parserName?: string, maxBytes?: number}) => string} generateCopilotCliStyleSummary
+ * @property {(logEntries: Array<any>, options?: {model?: string, parserName?: string}) => string} generateCopilotCliStyleSummary
  */
 
 /**
@@ -61,9 +54,6 @@ function createLogParserFormatters(deps) {
     unfenceMarkdown,
     isCopilotEventLogEntries,
     convertCopilotEventsToLegacyLogEntries,
-    generateInformationSection,
-    createSummaryTracker,
-    MAX_STEP_SUMMARY_SIZE,
     MAX_AGENT_TEXT_LENGTH,
     SIZE_LIMIT_WARNING,
   } = deps;
@@ -93,8 +83,6 @@ function createLogParserFormatters(deps) {
   }
 
   function normalizeEntriesForRendering(logEntries) {
-    if (!Array.isArray(logEntries)) return [];
-    logEntries = collapseStreamedMessages(logEntries.filter(entry => entry && typeof entry === "object"));
     if (isCopilotEventLogEntries(logEntries)) {
       return convertCopilotEventsToLegacyLogEntries(logEntries);
     }
@@ -113,21 +101,10 @@ function createLogParserFormatters(deps) {
    * @param {Function} options.formatToolCallback - Callback function to format tool use (content, toolResult) => string
    * @param {Function} options.formatInitCallback - Callback function to format initialization (initEntry) => string or {markdown: string, mcpFailures: string[]}
    * @param {any} [options.summaryTracker] - Optional tracker for step summary size limits
-   * @param {boolean} [options.includeInformation] - Include accounting for canonical traces by default
    * @returns {{markdown: string, commandSummary: Array<string>, sizeLimitReached: boolean}} Generated markdown, command summary, and size limit status
    */
   function generateConversationMarkdown(logEntries, options) {
-    if (isUnifiedSessionTrace(logEntries)) {
-      const markdown = unifiedSummary(logEntries, true);
-      return {
-        markdown,
-        commandSummary: publicationAgentSessions(logEntries).flatMap(group => generateConversationMarkdown(group.events, options).commandSummary),
-        sizeLimitReached: markdown.includes("summary truncated:") || markdown.includes("byte limit reached"),
-      };
-    }
-    const standard = isCopilotEventLogEntries(logEntries);
-    const { formatToolCallback, formatInitCallback } = options;
-    const summaryTracker = options.summaryTracker ?? (standard ? createSummaryTracker() : undefined);
+    const { formatToolCallback, formatInitCallback, summaryTracker } = options;
     const renderEntries = normalizeEntriesForRendering(logEntries);
     const toolUsePairs = collectToolUsePairs(renderEntries);
 
@@ -153,10 +130,9 @@ function createLogParserFormatters(deps) {
      */
     function addDetailsSectionFitting(title, body) {
       const fullSection = buildStepSummaryDetailsSection(title, body);
-      if (!summaryTracker || Buffer.byteLength(fullSection, "utf8") <= summaryTracker.remaining()) {
-        return addContent(fullSection);
+      if (addContent(fullSection)) {
+        return true;
       }
-      sizeLimitReached = true;
 
       // Full section doesn't fit — try truncating the body to use what remains.
       if (!summaryTracker) {
@@ -189,32 +165,11 @@ function createLogParserFormatters(deps) {
       return addContent(buildStepSummaryDetailsSection(title, truncatedBody));
     }
 
-    const groups = publicationAgentSessions(logEntries);
-    if (groups.length > 1 && groups.some(group => group.events.some(event => sessionContext(event).parentToolUseId))) {
-      const commandSummary = [];
-      for (const group of groups) {
-        const section = generateConversationMarkdown(group.events, { ...options, summaryTracker: createSummaryTracker() });
-        if (!addDetailsSectionFitting(`Agent conversation: ${escapeSummaryText(group.label).replace(/[\r\n]/g, " ")}`, section.markdown)) {
-          markdown += SIZE_LIMIT_WARNING;
-          break;
-        }
-        commandSummary.push(...section.commandSummary);
-        sizeLimitReached ||= section.sizeLimitReached;
-      }
-      return { markdown, commandSummary, sizeLimitReached };
-    }
     const initEntry = renderEntries.find(entry => entry.type === "system" && entry.subtype === "init");
     if (initEntry && formatInitCallback) {
       const initResult = formatInitCallback(initEntry);
       const initBody = typeof initResult === "string" ? initResult : initResult && initResult.markdown ? initResult.markdown : "";
       if (!addContent(buildStepSummaryDetailsSection("Initialization", initBody))) {
-        markdown += SIZE_LIMIT_WARNING;
-        return { markdown, commandSummary: [], sizeLimitReached };
-      }
-    }
-    const observedModel = observedSessionModel(logEntries, { includeNested: isSingleNestedSession(logEntries) });
-    if (observedModel && observedModel !== initEntry?.model) {
-      if (!addDetailsSectionFitting("Model", `**Observed Model:** ${escapeSummaryText(observedModel)}\n`)) {
         markdown += SIZE_LIMIT_WARNING;
         return { markdown, commandSummary: [], sizeLimitReached };
       }
@@ -235,14 +190,12 @@ function createLogParserFormatters(deps) {
         if (content.type === "text" && content.text) {
           let text = content.text.trim();
           text = unfenceMarkdown(text);
-          if (standard) text = escapeSummaryText(text);
           if (text) {
             reasoningBody += text + "\n\n";
           }
         } else if (content.type === "thinking" && content.thinking) {
           let text = content.thinking.trim();
           text = unfenceMarkdown(text);
-          if (standard) text = escapeSummaryText(text);
           if (text) {
             reasoningBody += `<sub><em>${text.replace(/\n/g, "<br>")}</em></sub>\n\n`;
           }
@@ -275,33 +228,26 @@ function createLogParserFormatters(deps) {
           continue;
         }
 
-        const toolName = typeof content.name === "string" ? content.name : "unknown";
-        const input = content.input === undefined ? {} : content.input;
-        const fields = input && typeof input === "object" && !Array.isArray(input) ? input : {};
-        if (!standard && INTERNAL_TOOLS.includes(toolName)) {
+        const toolName = content.name;
+        const input = content.input || {};
+        if (INTERNAL_TOOLS.includes(toolName)) {
           continue;
         }
 
         const toolResult = toolUsePairs.get(content.id);
         let statusIcon = "❓";
         if (toolResult) {
-          statusIcon = toolResult.is_error === true ? "❌" : toolResult.is_error === false ? "✅" : "❓";
+          statusIcon = toolResult.is_error === true ? "❌" : "✅";
         }
 
         if (toolName === "Bash") {
-          const command = typeof fields.command === "string" ? fields.command : typeof content.command === "string" ? content.command : undefined;
-          if (command === undefined) commandSummary.push(`* ${statusIcon} ${escapeSummaryText(formatToolDisplayName(toolName, input))}`);
-          else {
-            const formattedCommand = formatBashCommand(command);
-            const fence = formattedCommand.includes("`") ? buildSafeOuterCodeFence([formattedCommand]) : "`";
-            commandSummary.push(`* ${statusIcon} ${fence}${formattedCommand}${fence}`);
-          }
+          const formattedCommand = formatBashCommand(input.command || "");
+          commandSummary.push(`* ${statusIcon} \`${formattedCommand}\``);
         } else if (toolName.startsWith("mcp__")) {
           const mcpName = formatMcpName(toolName);
-          const fence = mcpName.includes("`") ? buildSafeOuterCodeFence([mcpName]) : "`";
-          commandSummary.push(`* ${statusIcon} ${fence}${mcpName}(...)${fence}`);
+          commandSummary.push(`* ${statusIcon} \`${mcpName}(...)\``);
         } else {
-          commandSummary.push(`* ${statusIcon} ${escapeSummaryText(toolName)}`);
+          commandSummary.push(`* ${statusIcon} ${toolName}`);
         }
       }
     }
@@ -320,13 +266,6 @@ function createLogParserFormatters(deps) {
       markdown += SIZE_LIMIT_WARNING;
       return { markdown, commandSummary, sizeLimitReached: true };
     }
-    if (options.includeInformation ?? standard) {
-      const info = generateInformationSection(projectSessionResult(logEntries, { includeNested: isSingleNestedSession(logEntries) }));
-      if (!addContent(info)) {
-        markdown += SIZE_LIMIT_WARNING;
-        return { markdown, commandSummary, sizeLimitReached: true };
-      }
-    }
 
     return { markdown, commandSummary, sizeLimitReached };
   }
@@ -341,34 +280,39 @@ function createLogParserFormatters(deps) {
    */
   function formatToolUse(toolUse, toolResult, options = {}) {
     const { includeDetailedParameters = false } = options;
-    const toolName = typeof toolUse.name === "string" ? toolUse.name : "unknown";
-    const input = toolUse.input === undefined ? {} : toolUse.input;
-    const fields = input && typeof input === "object" && !Array.isArray(input) ? input : {};
-    const standard = toolUse.standard_trace === true;
+    const toolName = toolUse.name;
+    const input = toolUse.input || {};
 
-    if (toolName === "TodoWrite" && !standard) {
+    if (toolName === "TodoWrite") {
       return "";
     }
 
     function getStatusIcon() {
-      return { failed: "❌", succeeded: "✅", pending: "❓", unknown: "❓" }[toolOutcome(toolResult)];
+      if (toolResult) {
+        return toolResult.is_error === true ? "❌" : "✅";
+      }
+      return "❓";
     }
 
     const statusIcon = getStatusIcon();
     let summary = "";
     let details = "";
 
-    const outputPresent = toolResult && (toolResult.has_output ?? toolResult.content !== undefined);
-    if (outputPresent) details = sessionOutputText(toolResult.content);
-    const errorText = toolResult?.error != null ? sessionOutputText(toolResult.error) : "";
+    if (toolResult && toolResult.content) {
+      if (typeof toolResult.content === "string") {
+        details = toolResult.content;
+      } else if (Array.isArray(toolResult.content)) {
+        details = toolResult.content.map(c => (typeof c === "string" ? c : c.text || "")).join("\n");
+      }
+    }
 
     const inputText = JSON.stringify(input);
     const outputText = details;
     const totalTokens = estimateTokens(inputText) + estimateTokens(outputText);
 
     let metadata = "";
-    if (toolResult && toolResult.duration_ms !== undefined) {
-      metadata += `<code>${toolResult.duration_ms === 0 ? "0s" : formatDuration(toolResult.duration_ms)}</code> `;
+    if (toolResult && toolResult.duration_ms) {
+      metadata += `<code>${formatDuration(toolResult.duration_ms)}</code> `;
     }
     if (totalTokens > 0) {
       metadata += `<code>~${totalTokens}t</code>`;
@@ -377,49 +321,45 @@ function createLogParserFormatters(deps) {
 
     switch (toolName) {
       case "Bash": {
-        const command = typeof fields.command === "string" ? fields.command : typeof toolUse.command === "string" ? toolUse.command : undefined;
-        const description = typeof fields.description === "string" ? fields.description : "";
-        if (command === undefined) {
-          summary = escapeSummaryText(formatToolDisplayName(toolName, input));
-          break;
-        }
+        const command = input.command || "";
+        const description = input.description || "";
         const formattedCommand = formatBashCommand(command);
 
         if (description) {
-          summary = `${escapeSummaryText(description)}: <code>${escapeSummaryText(formattedCommand)}</code>`;
+          summary = `${description}: <code>${formattedCommand}</code>`;
         } else {
-          summary = `<code>${escapeSummaryText(formattedCommand)}</code>`;
+          summary = `<code>${formattedCommand}</code>`;
         }
         break;
       }
 
       case "Read": {
-        const filePath = typeof fields.file_path === "string" ? fields.file_path : typeof fields.path === "string" ? fields.path : "";
+        const filePath = input.file_path || input.path || "";
         const relativePath = filePath.replace(/^\/[^\/]*\/[^\/]*\/[^\/]*\/[^\/]*\//, "");
-        summary = filePath ? `Read <code>${escapeSummaryText(relativePath)}</code>` : escapeSummaryText(formatToolDisplayName(toolName, input));
+        summary = `Read <code>${relativePath}</code>`;
         break;
       }
 
       case "Write":
       case "Edit":
       case "MultiEdit": {
-        const writeFilePath = typeof fields.file_path === "string" ? fields.file_path : typeof fields.path === "string" ? fields.path : "";
+        const writeFilePath = input.file_path || input.path || "";
         const writeRelativePath = writeFilePath.replace(/^\/[^\/]*\/[^\/]*\/[^\/]*\/[^\/]*\//, "");
-        summary = writeFilePath ? `Write <code>${escapeSummaryText(writeRelativePath)}</code>` : escapeSummaryText(formatToolDisplayName(toolName, input));
+        summary = `Write <code>${writeRelativePath}</code>`;
         break;
       }
 
       case "Grep":
       case "Glob": {
-        const query = typeof fields.query === "string" ? fields.query : typeof fields.pattern === "string" ? fields.pattern : "";
-        summary = query ? `Search for <code>${escapeSummaryText(truncateString(query, 80))}</code>` : escapeSummaryText(formatToolDisplayName(toolName, input));
+        const query = input.query || input.pattern || "";
+        summary = `Search for <code>${truncateString(query, 80)}</code>`;
         break;
       }
 
       case "LS": {
-        const lsPath = typeof fields.path === "string" ? fields.path : "";
+        const lsPath = input.path || "";
         const lsRelativePath = lsPath.replace(/^\/[^\/]*\/[^\/]*\/[^\/]*\/[^\/]*\//, "");
-        summary = lsPath ? `LS: ${escapeSummaryText(lsRelativePath || lsPath)}` : escapeSummaryText(formatToolDisplayName(toolName, input));
+        summary = `LS: ${lsRelativePath || lsPath}`;
         break;
       }
 
@@ -427,20 +367,20 @@ function createLogParserFormatters(deps) {
         if (toolName.startsWith("mcp__")) {
           const mcpName = formatMcpName(toolName);
           const params = formatMcpParameters(input);
-          summary = escapeSummaryText(`${mcpName}(${params})`);
+          summary = `${mcpName}(${params})`;
         } else {
-          const keys = Object.keys(fields);
+          const keys = Object.keys(input);
           if (keys.length > 0) {
             const mainParam = keys.find(k => ["query", "command", "path", "file_path", "content"].includes(k)) || keys[0];
-            const value = sessionOutputText(fields[mainParam]);
+            const value = String(input[mainParam] || "");
 
             if (value) {
-              summary = escapeSummaryText(`${toolName}: ${truncateString(value, 100)}`);
+              summary = `${toolName}: ${truncateString(value, 100)}`;
             } else {
-              summary = escapeSummaryText(toolName);
+              summary = toolName;
             }
           } else {
-            summary = escapeSummaryText(standard && toolUse.has_input && input && typeof input === "object" && !Array.isArray(input) ? `${toolName}({})` : formatToolDisplayName(toolName, input));
+            summary = toolName;
           }
         }
     }
@@ -449,7 +389,8 @@ function createLogParserFormatters(deps) {
     const sections = [];
 
     if (includeDetailedParameters) {
-      if (Object.keys(fields).length > 0 || input === null || typeof input !== "object" || Array.isArray(input) || toolUse.has_input) {
+      const inputKeys = Object.keys(input);
+      if (inputKeys.length > 0) {
         sections.push({
           label: "Parameters",
           content: JSON.stringify(input, null, 2),
@@ -458,17 +399,11 @@ function createLogParserFormatters(deps) {
       }
     }
 
-    if (outputPresent) {
+    if (details && details.trim()) {
       sections.push({
         label: includeDetailedParameters ? "Response" : "Output",
-        content: details || "[empty output]",
+        content: details,
       });
-    }
-    if (errorText) sections.push({ label: "Error", content: errorText });
-    if (standard) {
-      if (toolUse.orphaned) summary += " [start unavailable]";
-      if (!toolResult) summary += " [pending]";
-      else if (toolOutcome(toolResult) === "unknown") summary += " [outcome unknown]";
     }
 
     return formatToolCallAsDetails({
@@ -484,7 +419,7 @@ function createLogParserFormatters(deps) {
     for (const entry of logEntries) {
       if (entry.type === "user" && entry.message?.content) {
         for (const content of entry.message.content) {
-          if (content.type === "tool_result" && content.tool_use_id !== undefined) {
+          if (content.type === "tool_result" && content.tool_use_id) {
             toolUsePairs.set(content.tool_use_id, content);
           }
         }
@@ -542,35 +477,43 @@ function createLogParserFormatters(deps) {
   }
 
   function appendToolExecutionLine(lines, content, toolUsePairs, state) {
-    const toolName = typeof content.name === "string" ? content.name : "unknown";
-    const input = content.input === undefined ? {} : content.input;
-    const fields = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+    const toolName = content.name;
+    const input = content.input || {};
 
-    if (!state.standard && INTERNAL_TOOLS.includes(toolName)) {
+    if (INTERNAL_TOOLS.includes(toolName)) {
       return;
     }
 
     const toolResult = toolUsePairs.get(content.id);
-    const outcome = toolOutcome(toolResult);
-    const statusIcon = outcome === "failed" ? "✗" : outcome === "succeeded" ? "✓" : "?";
+    const isError = toolResult?.is_error === true;
+    const statusIcon = isError ? "✗" : "✓";
 
     let displayName;
+    let resultPreview = "";
 
     if (toolName === "Bash") {
-      const command = typeof fields.command === "string" ? fields.command : typeof content.command === "string" ? content.command : undefined;
-      displayName = command === undefined ? formatToolDisplayName(toolName, input) : `$ ${formatBashCommand(command)}`;
+      const cmd = formatBashCommand(input.command || "");
+      displayName = `$ ${cmd}`;
+
+      if (toolResult && toolResult.content) {
+        const resultText = typeof toolResult.content === "string" ? toolResult.content : String(toolResult.content);
+        resultPreview = formatResultPreview(resultText);
+      }
     } else if (toolName.startsWith("mcp__")) {
       const formattedName = formatMcpName(toolName).replace("::", "-");
       displayName = formatToolDisplayName(formattedName, input);
+
+      if (toolResult && toolResult.content) {
+        const resultText = typeof toolResult.content === "string" ? toolResult.content : JSON.stringify(toolResult.content);
+        resultPreview = formatResultPreview(resultText);
+      }
     } else {
       displayName = formatToolDisplayName(toolName, input);
-    }
-    if (state.standard) {
-      if (content.has_input && input && typeof input === "object" && !Array.isArray(input) && Object.keys(input).length === 0) displayName += " [input: {}]";
-      if (content.orphaned) displayName += " [start unavailable]";
-      if (outcome === "pending") displayName += " [pending]";
-      if (outcome === "unknown") displayName += " [outcome unknown]";
-      if (toolResult?.duration_ms !== undefined) displayName += ` [${toolResult.duration_ms === 0 ? "0s" : formatDuration(toolResult.duration_ms)}]`;
+
+      if (toolResult && toolResult.content) {
+        const resultText = typeof toolResult.content === "string" ? toolResult.content : String(toolResult.content);
+        resultPreview = formatResultPreview(resultText);
+      }
     }
 
     state.traceEventCount += 1;
@@ -578,58 +521,47 @@ function createLogParserFormatters(deps) {
       return;
     }
 
-    if (state.standard && toolName === "Bash" && content.has_input && (Object.keys(fields).length > 1 || input === null || typeof input !== "object" || Array.isArray(input))) {
-      if (!appendConversationLine(lines, `   Arguments: ${formatMcpParameters(input)}`, state)) return;
-    }
-    if (toolResult && (toolResult.has_output ?? toolResult.content !== undefined)) {
-      const resultText = sessionOutputText(toolResult.content) || "[empty output]";
-      for (const previewLine of formatResultPreview(resultText).split("\n")) {
+    if (resultPreview) {
+      for (const previewLine of resultPreview.split("\n")) {
         if (!appendConversationLine(lines, previewLine, state)) {
           return;
         }
-      }
-    }
-    if (toolResult?.error != null) {
-      const error = toolResult.error;
-      const errorText = typeof error.message === "string" ? `${error.code !== undefined ? `${sessionOutputText(error.code)}: ` : ""}${error.message}` : sessionOutputText(error);
-      for (const errorLine of formatResultPreview(errorText).split("\n")) {
-        if (!appendConversationLine(lines, `   Error: ${errorLine.trimStart()}`, state)) return;
       }
     }
 
     appendConversationLine(lines, "", state);
   }
 
-  function appendStatistics(lines, logEntries, toolUsePairs, standard) {
-    const lastEntry = logEntries.findLast(entry => entry.type === "result");
+  function appendStatistics(lines, logEntries, toolUsePairs) {
+    const lastEntry = logEntries[logEntries.length - 1];
     lines.push("Statistics:");
-    if (lastEntry?.num_turns !== undefined) {
+    if (lastEntry?.num_turns) {
       lines.push(`  Turns: ${lastEntry.num_turns}`);
     }
-    if (lastEntry?.duration_ms !== undefined) {
-      const duration = lastEntry.duration_ms === 0 ? "0s" : formatDuration(lastEntry.duration_ms);
+    if (lastEntry?.duration_ms) {
+      const duration = formatDuration(lastEntry.duration_ms);
       if (duration) {
         lines.push(`  Duration: ${duration}`);
       }
     }
 
-    let toolCounts = { total: 0, success: 0, error: 0, pending: 0, unknown: 0 };
+    let toolCounts = { total: 0, success: 0, error: 0 };
     for (const entry of logEntries) {
       if (entry.type === "assistant" && entry.message?.content) {
         for (const content of entry.message.content) {
           if (content.type === "tool_use") {
             const toolName = content.name;
-            if (!standard && INTERNAL_TOOLS.includes(toolName)) {
+            if (INTERNAL_TOOLS.includes(toolName)) {
               continue;
             }
             toolCounts.total++;
             const toolResult = toolUsePairs.get(content.id);
-            const outcome = toolOutcome(toolResult);
-            if (outcome === "failed") {
+            const isError = toolResult?.is_error === true;
+            if (isError) {
               toolCounts.error++;
-            } else if (outcome === "succeeded") {
+            } else {
               toolCounts.success++;
-            } else toolCounts[outcome]++;
+            }
           }
         }
       }
@@ -637,44 +569,31 @@ function createLogParserFormatters(deps) {
 
     if (toolCounts.total > 0) {
       lines.push(`  Tools: ${toolCounts.success}/${toolCounts.total} succeeded`);
-      if (standard) {
-        if (toolCounts.error) lines.push(`  Failed Tools: ${toolCounts.error}`);
-        if (toolCounts.pending) lines.push(`  Pending Tools: ${toolCounts.pending}`);
-        if (toolCounts.unknown) lines.push(`  Unknown Outcomes: ${toolCounts.unknown}`);
-      }
     }
     if (lastEntry?.usage) {
-      const usage = normalizeSessionUsage(lastEntry.usage) ?? lastEntry.usage;
-      const totalTokens = sessionTokenTotal(usage);
-      if (totalTokens !== undefined) {
-        const inputTokens = usage.input_tokens === undefined ? "unknown" : usage.input_tokens.toLocaleString();
-        const outputTokens = usage.output_tokens === undefined ? "unknown" : usage.output_tokens.toLocaleString();
-        const complete = usage.total_tokens !== undefined || (usage.input_tokens !== undefined && usage.output_tokens !== undefined);
-        lines.push(`  Tokens: ${totalTokens.toLocaleString()} ${complete ? "total" : "observed"} (${inputTokens} in / ${outputTokens} out)`);
+      const usage = lastEntry.usage;
+      if (usage.input_tokens || usage.output_tokens) {
+        const inputTokens = usage.input_tokens || 0;
+        const outputTokens = usage.output_tokens || 0;
+        const cacheCreationTokens = usage.cache_creation_input_tokens || 0;
+        const cacheReadTokens = usage.cache_read_input_tokens || 0;
+        const totalTokens = inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
+
+        lines.push(`  Tokens: ${totalTokens.toLocaleString()} total (${inputTokens.toLocaleString()} in / ${outputTokens.toLocaleString()} out)`);
       }
-      if (usage.cache_read_input_tokens !== undefined) lines.push(`  Cache Read Tokens: ${usage.cache_read_input_tokens.toLocaleString()}`);
-      if (usage.cache_creation_input_tokens !== undefined) lines.push(`  Cache Creation Tokens: ${usage.cache_creation_input_tokens.toLocaleString()}`);
     }
-    if (lastEntry?.total_cost_usd !== undefined) {
+    if (lastEntry?.total_cost_usd) {
       lines.push(`  Cost: $${lastEntry.total_cost_usd.toFixed(4)}`);
     }
     if (lastEntry?.errors && Array.isArray(lastEntry.errors) && lastEntry.errors.length > 0) {
       lines.push("  Errors:");
       for (const error of lastEntry.errors) {
-        lines.push(`    ${sessionOutputText(error)}`);
+        lines.push(`    ${error}`);
       }
-    }
-    if (Array.isArray(lastEntry?.permission_denials)) {
-      lines.push(`  Permission Denials: ${lastEntry.permission_denials.length}`);
-      for (const denial of lastEntry.permission_denials) lines.push(`    ${sessionOutputText(denial)}`);
     }
   }
 
-  function generateSummaryLines(logEntries, includeStatistics = true) {
-    const groups = publicationAgentSessions(logEntries);
-    if (groups.length > 1 && groups.some(group => group.events.some(event => sessionContext(event).parentToolUseId))) {
-      return groups.flatMap(group => [`Agent conversation: ${group.label.replace(/[\r\n]/g, " ")}`, "", ...generateSummaryLines(group.events, includeStatistics), ""]);
-    }
+  function generateSummaryLines(logEntries) {
     const renderEntries = normalizeEntriesForRendering(logEntries);
     const lines = [];
     const toolUsePairs = collectToolUsePairs(renderEntries);
@@ -684,7 +603,6 @@ function createLogParserFormatters(deps) {
       maxConversationLines: 5000,
       conversationTruncated: false,
       traceEventCount: 0,
-      standard: isCopilotEventLogEntries(logEntries),
     };
 
     for (const entry of renderEntries) {
@@ -724,10 +642,7 @@ function createLogParserFormatters(deps) {
       lines.push("");
     }
 
-    if (includeStatistics) {
-      appendStatistics(lines, renderEntries, toolUsePairs, state.standard);
-      lines.push(...renderSubagentSummary(logEntries));
-    }
+    appendStatistics(lines, renderEntries, toolUsePairs);
 
     return lines;
   }
@@ -741,16 +656,13 @@ function createLogParserFormatters(deps) {
    * @returns {string} Plain text summary for console output
    */
   function generatePlainTextSummary(logEntries, options = {}) {
-    if (isUnifiedSessionTrace(logEntries)) return unifiedSummary(logEntries, false);
-    const { parserName = "Agent" } = options;
-    const model = options.model ?? observedSessionModel(logEntries);
+    const { model, parserName = "Agent" } = options;
     const lines = [];
 
     lines.push(`=== ${parserName} Execution Summary ===`);
     if (model) {
       lines.push(`Model: ${model}`);
     }
-    if (isCopilotEventLogEntries(logEntries)) lines.push(...renderInitializationLines(normalizeEntriesForRendering(logEntries).find(entry => entry.type === "system" && entry.subtype === "init")));
     lines.push("");
 
     lines.push("Conversation:");
@@ -758,7 +670,7 @@ function createLogParserFormatters(deps) {
 
     lines.push(...generateSummaryLines(logEntries));
 
-    return boundSummaryLines(lines, MAX_STEP_SUMMARY_SIZE, 4 * MAX_AGENT_TEXT_LENGTH + 128).join("\n");
+    return lines.join("\n");
   }
 
   /**
@@ -767,54 +679,18 @@ function createLogParserFormatters(deps) {
    * @param {Object} options - Configuration options
    * @param {string} [options.model] - Model name to include in the header
    * @param {string} [options.parserName] - Name of the parser (e.g., "Copilot", "Claude")
-   * @param {number} [options.maxBytes] - Remaining publication budget for a unified trace
    * @returns {string} Markdown-formatted summary for step summary rendering
    */
   function generateCopilotCliStyleSummary(logEntries, options = {}) {
-    if (isUnifiedSessionTrace(logEntries)) return unifiedSummary(logEntries, true, options.maxBytes);
     const lines = [];
-    const standard = isCopilotEventLogEntries(logEntries);
-    const model = options.model ?? observedSessionModel(logEntries);
-    const initialization = isCopilotEventLogEntries(logEntries) ? renderInitializationLines(normalizeEntriesForRendering(logEntries).find(entry => entry.type === "system" && entry.subtype === "init")) : [];
-    const fullBody = [...(model ? [`Model: ${model}`, ""] : []), ...initialization, "Conversation:", "", ...generateSummaryLines(logEntries)];
-    const maxLineBytes = 4 * MAX_AGENT_TEXT_LENGTH + 128;
-    let preamble = "";
-    if (standard) {
-      const entries = normalizeEntriesForRendering(logEntries);
-      const statistics = [];
-      appendStatistics(statistics, entries, collectToolUsePairs(entries), true);
-      const visibleStats = boundSummaryLines(statistics, 16 * 1024, maxLineBytes);
-      const statsFence = buildSafeOuterCodeFence(visibleStats);
-      preamble = `### Agent session\n\n${statsFence}\n${visibleStats.join("\n")}\n${statsFence}\n\n<details><summary>Trace details</summary>\n\n`;
-    }
-    const tail = standard ? "\n\n</details>" : "";
-    const budget = MAX_STEP_SUMMARY_SIZE - Buffer.byteLength(preamble + tail, "utf8") - 2 * (maxLineBytes + 1) - 3;
-    const bodyLines = boundSummaryLines(fullBody, budget, maxLineBytes);
+    const bodyLines = ["Conversation:", "", ...generateSummaryLines(logEntries)];
     const fence = buildSafeOuterCodeFence(bodyLines);
 
     lines.push(fence);
     lines.push(...bodyLines);
     lines.push(fence);
 
-    return preamble + lines.join("\n") + tail;
-  }
-
-  /** @param {Array<any>} events @param {boolean} markdown @param {number} [maxBytes] @returns {string} */
-  function unifiedSummary(events, markdown, maxBytes = MAX_STEP_SUMMARY_SIZE) {
-    return renderUnifiedSession(events, {
-      markdown,
-      maxBytes: Math.min(maxBytes, MAX_STEP_SUMMARY_SIZE),
-      maxLineBytes: 4 * MAX_AGENT_TEXT_LENGTH + 128,
-      agentStatistics: entries => {
-        const projected = normalizeEntriesForRendering(entries);
-        const model = observedSessionModel(entries);
-        const lines = [...(model ? [`Model: ${model}`] : []), ...renderInitializationLines(projected.find(entry => entry.type === "system" && entry.subtype === "init"))];
-        appendStatistics(lines, projected, collectToolUsePairs(projected), true);
-        lines.push(...renderSubagentSummary(entries));
-        return lines;
-      },
-      agentConversation: entries => generateSummaryLines(entries, false),
-    });
+    return lines.join("\n");
   }
 
   return {

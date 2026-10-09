@@ -26,7 +26,6 @@ const PROJECT_GRAPHQL_HINTS = {
  */
 async function getOwnerId(ownerType, ownerLogin) {
   if (ownerType === "org") {
-    /** @type {{ organization: { id: string } }} */
     const result = await github.graphql(
       `query($login: String!) {
         organization(login: $login) {
@@ -37,7 +36,6 @@ async function getOwnerId(ownerType, ownerLogin) {
     );
     return result.organization.id;
   } else {
-    /** @type {{ user: { id: string } }} */
     const result = await github.graphql(
       `query($login: String!) {
         user(login: $login) {
@@ -59,7 +57,6 @@ async function getOwnerId(ownerType, ownerLogin) {
 async function createProjectV2(ownerId, title) {
   core.info(`Creating project with title: "${title}"`);
 
-  /** @type {{ createProjectV2: { projectV2: { id: string, number: number, title: string, url: string } } }} */
   const result = await github.graphql(
     `mutation($ownerId: ID!, $title: String!) {
       createProjectV2(input: { ownerId: $ownerId, title: $title }) {
@@ -95,7 +92,6 @@ async function createProjectV2(ownerId, title) {
 async function addItemToProject(projectId, contentId) {
   core.info(`Adding item to project...`);
 
-  /** @type {{ addProjectV2ItemById: { item: { id: string } } }} */
   const result = await github.graphql(
     `mutation($projectId: ID!, $contentId: ID!) {
       addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
@@ -121,7 +117,6 @@ async function addItemToProject(projectId, contentId) {
  * @returns {Promise<string>} Issue node ID
  */
 async function getIssueNodeId(owner, repo, issueNumber) {
-  /** @type {{ repository: { issue: { id: string } } }} */
   const result = await github.graphql(
     `query($owner: String!, $repo: String!, $issueNumber: Int!) {
       repository(owner: $owner, name: $repo) {
@@ -166,7 +161,6 @@ function parseProjectUrl(projectUrl) {
 async function listProjectViews(projectId) {
   core.info(`Listing views for project...`);
 
-  /** @type {{ node: { views: { nodes: Array<{ id: string, name: string, number: number }> } } }} */
   const result = await github.graphql(
     `query($projectId: ID!) {
       node(id: $projectId) {
@@ -211,7 +205,7 @@ async function createProjectView(projectUrl, viewConfig) {
   }
 
   const layout = typeof viewConfig.layout === "string" ? viewConfig.layout.trim() : "";
-  if (layout !== "table" && layout !== "board" && layout !== "roadmap") {
+  if (!layout || !["table", "board", "roadmap"].includes(layout)) {
     throw new Error(`${ERR_VALIDATION}: Invalid view layout "${layout}". Must be one of: table, board, roadmap`);
   }
 
@@ -236,8 +230,6 @@ async function createProjectView(projectUrl, viewConfig) {
 
   const route = projectInfo.scope === "orgs" ? "POST /orgs/{org}/projectsV2/{project_number}/views" : "POST /users/{user_id}/projectsV2/{project_number}/views";
 
-  // The locked Octokit schema predates these routes; keep their payload typed explicitly.
-  /** @type {{project_number: number, name: string, layout: "table" | "board" | "roadmap", filter?: string, visible_fields?: number[]} & ({org: string} | {user_id: string})} */
   const params =
     projectInfo.scope === "orgs"
       ? {

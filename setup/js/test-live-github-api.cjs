@@ -59,7 +59,6 @@ async function testLiveGitHubAPI() {
     core.info(`📥 Fetching workflow from GitHub API...`);
     const hash = await computeFrontmatterHash(workflowPath, {
       fileReader,
-      readerMode: "github-api",
     });
 
     core.info(`\n✅ Success! Hash computed from live GitHub API data:`);
@@ -69,7 +68,6 @@ async function testLiveGitHubAPI() {
     core.info(`\n🔄 Verifying determinism (fetching again)...`);
     const hash2 = await computeFrontmatterHash(workflowPath, {
       fileReader,
-      readerMode: "github-api",
     });
 
     if (hash === hash2) {

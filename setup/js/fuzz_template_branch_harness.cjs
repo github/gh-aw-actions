@@ -18,12 +18,11 @@ const { isTruthy } = require("./is_truthy.cjs");
 
 // Minimal shim so renderMarkdownTemplate can call core.info
 if (!global.core) {
-  require("./shim.cjs");
-  Object.assign(global.core, {
+  global.core = {
     info: () => {},
     warning: () => {},
     setFailed: () => {},
-  });
+  };
 }
 
 const { renderMarkdownTemplate } = require("./render_template.cjs");

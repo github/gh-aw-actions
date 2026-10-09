@@ -6,20 +6,6 @@ const { unfenceMarkdown } = require("./markdown_unfencing.cjs");
 const { ERR_PARSE } = require("./error_codes.cjs");
 const createLogParserFormatters = require("./log_parser_format.cjs");
 const { buildStepSummaryDetailsSection } = require("./log_parser_step_summary_builder.cjs");
-const {
-  isSessionEvent,
-  normalizeAgentSession,
-  normalizeSessionUsage,
-  projectSessionResult,
-  projectSessionInitialization,
-  sessionOutputText,
-  sessionToolSuccess,
-  sessionTokenTotal,
-  isMetric,
-  sessionScopeKey,
-  isSingleNestedSession,
-} = require("./agent_session.cjs");
-const { escapeSummaryText, toolInventoryName, displayArgument } = require("./agent_session_render.cjs");
 
 /**
  * Shared utility functions for log parsers
@@ -301,18 +287,18 @@ function generateInformationSection(lastEntry, options = {}) {
     return buildStepSummaryDetailsSection("Information", "", { emptyBodyMessage: "No information available." });
   }
 
-  if (lastEntry.num_turns !== undefined) {
+  if (lastEntry.num_turns) {
     markdown += `**Turns:** ${lastEntry.num_turns}\n\n`;
   }
 
-  if (lastEntry.duration_ms !== undefined) {
+  if (lastEntry.duration_ms) {
     const durationSec = Math.round(lastEntry.duration_ms / 1000);
     const minutes = Math.floor(durationSec / 60);
     const seconds = durationSec % 60;
     markdown += `**Duration:** ${minutes}m ${seconds}s\n\n`;
   }
 
-  if (lastEntry.total_cost_usd !== undefined) {
+  if (lastEntry.total_cost_usd) {
     markdown += `**Total Cost:** $${lastEntry.total_cost_usd.toFixed(4)}\n\n`;
   }
 
@@ -325,19 +311,21 @@ function generateInformationSection(lastEntry, options = {}) {
   }
 
   if (lastEntry.usage) {
-    const usage = normalizeSessionUsage(lastEntry.usage) ?? lastEntry.usage;
-    const totalTokens = sessionTokenTotal(usage);
-    if (totalTokens !== undefined || usage.cache_creation_input_tokens !== undefined || usage.cache_read_input_tokens !== undefined) {
+    const usage = lastEntry.usage;
+    if (usage.input_tokens || usage.output_tokens) {
+      // Calculate total tokens (matching Go parser logic)
+      const inputTokens = usage.input_tokens || 0;
+      const outputTokens = usage.output_tokens || 0;
+      const cacheCreationTokens = usage.cache_creation_input_tokens || 0;
+      const cacheReadTokens = usage.cache_read_input_tokens || 0;
+      const totalTokens = inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
+
       markdown += `**Token Usage:**\n`;
-      const calculation = usage.total_tokens !== undefined ? "source total" : usage.input_tokens_include_cache === false ? "input + output + separate cache" : "input + output";
-      if (totalTokens !== undefined) {
-        const complete = usage.total_tokens !== undefined || (usage.input_tokens !== undefined && usage.output_tokens !== undefined);
-        markdown += complete ? `- Total: ${totalTokens.toLocaleString()} (${calculation})\n` : `- Observed Tokens: ${totalTokens.toLocaleString()} (partial accounting)\n`;
-      }
-      if (usage.input_tokens !== undefined) markdown += `- Input: ${usage.input_tokens.toLocaleString()}\n`;
-      if (usage.cache_creation_input_tokens !== undefined) markdown += `- Cache Creation: ${usage.cache_creation_input_tokens.toLocaleString()}\n`;
-      if (usage.cache_read_input_tokens !== undefined) markdown += `- Cache Read: ${usage.cache_read_input_tokens.toLocaleString()}\n`;
-      if (usage.output_tokens !== undefined) markdown += `- Output: ${usage.output_tokens.toLocaleString()}\n`;
+      if (totalTokens > 0) markdown += `- Total: ${totalTokens.toLocaleString()}\n`;
+      if (usage.input_tokens) markdown += `- Input: ${usage.input_tokens.toLocaleString()}\n`;
+      if (usage.cache_creation_input_tokens) markdown += `- Cache Creation: ${usage.cache_creation_input_tokens.toLocaleString()}\n`;
+      if (usage.cache_read_input_tokens) markdown += `- Cache Read: ${usage.cache_read_input_tokens.toLocaleString()}\n`;
+      if (usage.output_tokens) markdown += `- Output: ${usage.output_tokens.toLocaleString()}\n`;
       markdown += "\n";
     }
   }
@@ -345,14 +333,13 @@ function generateInformationSection(lastEntry, options = {}) {
   if (lastEntry.errors && Array.isArray(lastEntry.errors) && lastEntry.errors.length > 0) {
     markdown += `**Errors:**\n`;
     for (const error of lastEntry.errors) {
-      markdown += `- ${escapeSummaryText(sessionOutputText(error))}\n`;
+      markdown += `- ${error}\n`;
     }
     markdown += "\n";
   }
 
-  if (Array.isArray(lastEntry.permission_denials)) {
+  if (lastEntry.permission_denials && lastEntry.permission_denials.length > 0) {
     markdown += `**Permission Denials:** ${lastEntry.permission_denials.length}\n\n`;
-    for (const denial of lastEntry.permission_denials) markdown += `- ${escapeSummaryText(sessionOutputText(denial))}\n`;
   }
 
   return buildStepSummaryDetailsSection("Information", markdown, { emptyBodyMessage: "No information available." });
@@ -360,12 +347,10 @@ function generateInformationSection(lastEntry, options = {}) {
 
 /**
  * Formats MCP parameters into a human-readable string
- * @param {any} input - JSON arguments, including arrays and scalar values
+ * @param {Record<string, any>} input - The input object containing parameters
  * @returns {string} Formatted parameters string
  */
 function formatMcpParameters(input) {
-  if (input === undefined) return "";
-  if (input === null || typeof input !== "object" || Array.isArray(input)) return truncateString(displayArgument(input), 100);
   const keys = Object.keys(input);
   if (keys.length === 0) return "";
 
@@ -393,7 +378,7 @@ function formatMcpParameters(input) {
       value = JSON.stringify(rawValue);
     } else {
       // Primitive values (string, number, boolean, null, undefined)
-      value = rawValue === undefined ? "" : String(rawValue);
+      value = String(rawValue || "");
     }
 
     paramStrs.push(`${key}: ${truncateString(value, 40)}`);
@@ -432,10 +417,9 @@ function formatInitializationSummary(initEntry, options = {}) {
   let markdown = "";
   const mcpFailures = [];
 
-  if (initEntry.source_engine !== undefined) markdown += `**Engine:** ${escapeSummaryText(sessionOutputText(initEntry.source_engine))}\n\n`;
   // Display model and session info
-  if (initEntry.model !== undefined) {
-    markdown += `**Model:** ${escapeSummaryText(sessionOutputText(initEntry.model) || '""')}\n\n`;
+  if (initEntry.model) {
+    markdown += `**Model:** ${initEntry.model}\n\n`;
   }
 
   // Call model info callback for engine-specific model information (e.g., Copilot premium info)
@@ -444,30 +428,24 @@ function formatInitializationSummary(initEntry, options = {}) {
     if (modelInfo) {
       markdown += modelInfo;
     }
-  } else if (initEntry.model_info !== undefined) {
-    markdown += formatToolCallAsDetails({ summary: "Model Information", sections: [{ label: "Metadata", content: JSON.stringify(initEntry.model_info, null, 2), language: "json" }] });
   }
 
-  if (initEntry.session_id !== undefined) {
-    markdown += `**Session ID:** ${escapeSummaryText(sessionOutputText(initEntry.session_id) || '""')}\n\n`;
+  if (initEntry.session_id) {
+    markdown += `**Session ID:** ${initEntry.session_id}\n\n`;
   }
 
-  if (typeof initEntry.cwd === "string") {
+  if (initEntry.cwd) {
     // Show a cleaner path by removing common prefixes
     const cleanCwd = initEntry.cwd.replace(/^\/home\/runner\/work\/[^\/]+\/[^\/]+/, ".");
-    markdown += `**Working Directory:** ${escapeSummaryText(cleanCwd || '""')}\n\n`;
+    markdown += `**Working Directory:** ${cleanCwd}\n\n`;
   }
 
   // Display MCP servers status
   if (initEntry.mcp_servers && Array.isArray(initEntry.mcp_servers)) {
     markdown += "**MCP Servers:**\n";
     for (const server of initEntry.mcp_servers) {
-      if (!server || typeof server !== "object") {
-        markdown += `- ❓ ${escapeSummaryText(sessionOutputText(server))} (unknown)\n`;
-        continue;
-      }
       const statusIcon = server.status === "connected" ? "✅" : server.status === "failed" ? "❌" : "❓";
-      markdown += `- ${statusIcon} ${escapeSummaryText(typeof server.name === "string" ? server.name : "unknown")} (${escapeSummaryText(typeof server.status === "string" ? server.status : "unknown")})\n`;
+      markdown += `- ${statusIcon} ${server.name} (${server.status})\n`;
 
       // Track failed MCP servers - call callback if provided (for Claude's detailed error tracking)
       if (server.status === "failed") {
@@ -511,9 +489,7 @@ function formatInitializationSummary(initEntry, options = {}) {
     // Internal tools that are specific to Copilot CLI
     const internalTools = ["fetch_copilot_cli_documentation"];
 
-    for (const toolEntry of initEntry.tools) {
-      const tool = toolInventoryName(toolEntry);
-      if (typeof tool !== "string") continue;
+    for (const tool of initEntry.tools) {
       const toolLower = tool.toLowerCase();
 
       if (["Task", "Bash", "BashOutput", "KillBash", "ExitPlanMode"].includes(tool)) {
@@ -551,7 +527,7 @@ function formatInitializationSummary(initEntry, options = {}) {
       if (tools.length > 0) {
         markdown += `- **${category}:** ${tools.length} tools\n`;
         // Show all tools for complete visibility
-        markdown += `  - ${tools.map(escapeSummaryText).join(", ")}\n`;
+        markdown += `  - ${tools.join(", ")}\n`;
       }
     }
     markdown += "\n";
@@ -562,9 +538,9 @@ function formatInitializationSummary(initEntry, options = {}) {
     const commandCount = initEntry.slash_commands.length;
     markdown += `**Slash Commands:** ${commandCount} available\n`;
     if (commandCount <= 10) {
-      markdown += `- ${initEntry.slash_commands.map(toolInventoryName).map(escapeSummaryText).join(", ")}\n`;
+      markdown += `- ${initEntry.slash_commands.join(", ")}\n`;
     } else {
-      markdown += `- ${initEntry.slash_commands.slice(0, 5).map(toolInventoryName).map(escapeSummaryText).join(", ")}, and ${commandCount - 5} more\n`;
+      markdown += `- ${initEntry.slash_commands.slice(0, 5).join(", ")}, and ${commandCount - 5} more\n`;
     }
     markdown += "\n";
   }
@@ -584,7 +560,6 @@ function formatInitializationSummary(initEntry, options = {}) {
  * @returns {Array|null} Array of parsed log entries, or null if parsing fails
  */
 function parseLogEntries(logContent) {
-  if (typeof logContent !== "string" || !logContent.trim()) return null;
   let logEntries;
 
   // First, try to parse as JSON array (old format)
@@ -654,7 +629,24 @@ function isCopilotEventLogEntries(logEntries) {
     return false;
   }
 
-  return logEntries.some(isSessionEvent);
+  const eventTypePrefixes = ["user.", "assistant.", "tool.", "session."];
+  let eventLikeCount = 0;
+
+  for (const entry of logEntries) {
+    if (!entry || typeof entry !== "object" || typeof entry.type !== "string") continue;
+    // Legacy Claude/Pi message entries disqualify the array outright. A bare `result`
+    // entry is NOT treated as a disqualifier here: an OTEL-enrichment `result` summary
+    // may be appended to an otherwise copilot-event array (see parse_pi_log.cjs), and a
+    // genuinely legacy array is already identified by its assistant/user/system entries.
+    if (entry.type === "assistant" || entry.type === "user" || entry.type === "system") {
+      return false;
+    }
+    if (eventTypePrefixes.some(prefix => entry.type.startsWith(prefix))) {
+      eventLikeCount++;
+    }
+  }
+
+  return eventLikeCount > 0;
 }
 
 /**
@@ -664,7 +656,122 @@ function isCopilotEventLogEntries(logEntries) {
  * @returns {Array<any>}
  */
 function convertLegacyLogEntriesToCopilotEvents(logEntries, options = {}) {
-  return normalizeAgentSession(logEntries, options);
+  if (!Array.isArray(logEntries) || logEntries.length === 0) {
+    return [];
+  }
+  if (isCopilotEventLogEntries(logEntries)) {
+    return logEntries;
+  }
+
+  const { sourceEngine = "unknown" } = options;
+  /** @type {Array<any>} */
+  const events = [];
+  const toolUsesById = new Map();
+
+  for (const entry of logEntries) {
+    if (!entry || typeof entry !== "object") continue;
+
+    if (entry.type === "system" && entry.subtype === "init") {
+      events.push({
+        type: "session.init",
+        data: {
+          sourceEngine,
+          model: entry.model,
+          sessionId: entry.session_id,
+          cwd: entry.cwd,
+          tools: Array.isArray(entry.tools) ? entry.tools : [],
+          mcpServers: Array.isArray(entry.mcp_servers) ? entry.mcp_servers : [],
+          slashCommands: Array.isArray(entry.slash_commands) ? entry.slash_commands : [],
+          modelInfo: entry.model_info,
+        },
+      });
+      continue;
+    }
+
+    if (entry.type === "system" && entry.subtype && entry.subtype !== "init") {
+      if (entry.message?.content && Array.isArray(entry.message.content)) {
+        for (const content of entry.message.content) {
+          if (content?.type === "text" && typeof content.text === "string" && content.text.trim()) {
+            events.push({
+              type: "assistant.message",
+              data: { content: content.text },
+            });
+          }
+        }
+      } else if (typeof entry.message === "string" && entry.message.trim()) {
+        events.push({
+          type: "assistant.message",
+          data: { content: entry.message },
+        });
+      }
+      continue;
+    }
+
+    if (entry.type === "assistant" && entry.message?.content && Array.isArray(entry.message.content)) {
+      for (const content of entry.message.content) {
+        if (!content || typeof content !== "object") continue;
+
+        if (content.type === "text" && typeof content.text === "string" && content.text.trim()) {
+          events.push({
+            type: "assistant.message",
+            data: { content: content.text },
+          });
+        } else if (content.type === "thinking" && typeof content.thinking === "string" && content.thinking.trim()) {
+          events.push({
+            type: "assistant.reasoning",
+            data: { content: content.thinking },
+          });
+        } else if (content.type === "tool_use") {
+          const toolCallId = typeof content.id === "string" && content.id.trim() ? content.id : `tool_${events.length + 1}`;
+          toolUsesById.set(toolCallId, content);
+          events.push({
+            type: "tool.execution_start",
+            data: {
+              toolCallId,
+              toolName: content.name,
+              input: content.input || {},
+            },
+          });
+        }
+      }
+      continue;
+    }
+
+    if (entry.type === "user" && entry.message?.content && Array.isArray(entry.message.content)) {
+      for (const content of entry.message.content) {
+        if (!content || content.type !== "tool_result") continue;
+        const toolCallId = typeof content.tool_use_id === "string" && content.tool_use_id.trim() ? content.tool_use_id : `tool_${events.length + 1}`;
+        const toolUse = toolUsesById.get(toolCallId);
+        events.push({
+          type: "tool.execution_complete",
+          data: {
+            toolCallId,
+            toolName: toolUse?.name,
+            success: content.is_error !== true,
+            output: content.content,
+            durationMs: content.duration_ms,
+          },
+        });
+      }
+      continue;
+    }
+
+    if (entry.type === "result") {
+      events.push({
+        type: "session.result",
+        data: {
+          numTurns: entry.num_turns,
+          durationMs: entry.duration_ms,
+          totalCostUsd: entry.total_cost_usd,
+          usage: entry.usage,
+          errors: entry.errors,
+          permissionDenials: entry.permission_denials,
+        },
+      });
+    }
+  }
+
+  return events;
 }
 
 /**
@@ -679,32 +786,14 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
   if (!isCopilotEventLogEntries(logEntries)) {
     return logEntries;
   }
-  logEntries = normalizeAgentSession(logEntries);
 
   /** @type {Array<any>} */
   const normalizedEntries = [];
   const pendingByToolCallId = new Map();
   const pendingIdsByToolName = new Map();
-  const displayIdsByCall = new Map();
-  const claimedDisplayIds = new Set();
   let toolCounter = 0;
-  const usedToolIds = new Set(logEntries.filter(e => typeof e.data?.toolCallId === "string").map(e => e.data.toolCallId));
-  const displayToolId = () => {
-    let id;
-    do {
-      id = `sdk_tool_${++toolCounter}`;
-    } while (usedToolIds.has(id));
-    usedToolIds.add(id);
-    return id;
-  };
-  const scopedDisplayId = (key, nativeId) => {
-    if (!displayIdsByCall.has(key)) {
-      const id = claimedDisplayIds.has(nativeId) ? displayToolId() : nativeId;
-      displayIdsByCall.set(key, id);
-      claimedDisplayIds.add(id);
-    }
-    return displayIdsByCall.get(key);
-  };
+  let turnCount = 0;
+  let assistantMessageCount = 0;
 
   const addPendingId = (toolName, toolId) => {
     const existing = pendingIdsByToolName.get(toolName);
@@ -722,7 +811,7 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
     if (existing.length === 0) {
       pendingIdsByToolName.delete(toolName);
     }
-    return toolId ?? null;
+    return toolId || null;
   };
 
   const removePendingId = (toolName, toolId) => {
@@ -743,12 +832,15 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
     // the capitalized "Bash" name used by Claude. Normalize so Copilot's bash
     // calls get the same command formatting instead of falling through to the
     // generic tool renderer.
+    if (toolName.toLowerCase() === "bash") {
+      toolName = "Bash";
+    }
     if (toolName.startsWith("mcp__")) {
       return toolName;
     }
     const serverName = typeof mcpServerName === "string" ? mcpServerName.trim() : "";
     if (!serverName) {
-      return toolName.toLowerCase() === "bash" ? "Bash" : toolName;
+      return toolName;
     }
     return `mcp__${serverName}__${toolName}`;
   };
@@ -756,7 +848,6 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
   const readString = (...values) => {
     for (const value of values) {
       if (typeof value === "string") return value;
-      if (value !== undefined) return sessionOutputText(value);
     }
     return "";
   };
@@ -770,22 +861,17 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
   // may still carry structured input but cannot reliably recover the original command.
   const buildToolInput = (data, options = {}) => {
     const { includeCommand = true } = options;
-    const base = Object.hasOwn(data, "input") ? data.input : data.parameters;
+    const base = data.input || data.parameters;
     if (base && typeof base === "object" && !Array.isArray(base)) {
-      if (!data.mcpServerName && ["Agent", "Task"].includes(data.toolName)) {
-        const { prompt, ...publicInput } = base;
-        return publicInput;
-      }
       if (includeCommand && base.command === undefined && typeof data.command === "string") {
         return { ...base, command: data.command };
       }
       return base;
     }
-    if (base !== undefined) return base;
     if (includeCommand && typeof data.command === "string") {
       return { command: data.command };
     }
-    return base === undefined ? {} : base;
+    return {};
   };
 
   for (const entry of logEntries) {
@@ -793,24 +879,28 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
     const data = entry.data && typeof entry.data === "object" ? entry.data : {};
 
     switch (entry.type) {
-      case "session.start":
       case "session.init":
+        normalizedEntries.push({
+          type: "system",
+          subtype: "init",
+          model: data.model,
+          session_id: data.sessionId,
+          cwd: data.cwd,
+          tools: Array.isArray(data.tools) ? data.tools : [],
+          mcp_servers: Array.isArray(data.mcpServers) ? data.mcpServers : [],
+          slash_commands: Array.isArray(data.slashCommands) ? data.slashCommands : [],
+          model_info: data.modelInfo,
+        });
         break;
 
       case "user.message":
-        normalizedEntries.push({ type: "user", message: { content: [{ type: "text", text: data.content }] } });
-        break;
-
-      case "assistant.refusal":
-        normalizedEntries.push({
-          type: "assistant",
-          message: { content: [{ type: "text", text: `[Policy refusal: ${data.reason}${data.partial === true ? ", partial" : ""}]\n${readString(data.content, data.explanation)}` }] },
-        });
+        turnCount++;
         break;
 
       case "assistant.message": {
         const text = readString(data.content, data.message);
         if (!text.trim()) break;
+        assistantMessageCount++;
         normalizedEntries.push({
           type: "assistant",
           message: {
@@ -822,7 +912,7 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
 
       case "assistant.reasoning":
       case "reasoning": {
-        const text = readString(data.content);
+        const text = typeof data.content === "string" ? data.content : "";
         if (!text.trim()) break;
         normalizedEntries.push({
           type: "assistant",
@@ -835,18 +925,16 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
 
       case "tool.execution_start": {
         const toolName = normalizeToolName(data.toolName, data.mcpServerName);
-        const toolCallId = typeof data.toolCallId === "string" ? data.toolCallId : null;
-        const callKey = JSON.stringify([sessionScopeKey(entry), toolCallId]);
-        const nameKey = JSON.stringify([sessionScopeKey(entry), toolName]);
-        const resolvedToolId = toolCallId === null ? displayToolId() : scopedDisplayId(callKey, toolCallId);
-        if (toolCallId !== null) {
-          pendingByToolCallId.set(callKey, { id: resolvedToolId, name: nameKey });
+        const toolCallId = typeof data.toolCallId === "string" && data.toolCallId.trim() ? data.toolCallId : null;
+        const resolvedToolId = toolCallId || `sdk_tool_${++toolCounter}`;
+        if (toolCallId) {
+          pendingByToolCallId.set(toolCallId, resolvedToolId);
         }
-        addPendingId(nameKey, resolvedToolId);
+        addPendingId(toolName, resolvedToolId);
         normalizedEntries.push({
           type: "assistant",
           message: {
-            content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: buildToolInput(data), command: data.command, has_input: data.input !== undefined || data.parameters !== undefined, standard_trace: true }],
+            content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: buildToolInput(data) }],
           },
         });
         break;
@@ -854,39 +942,76 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
 
       case "tool.execution_complete": {
         const toolName = normalizeToolName(data.toolName, data.mcpServerName);
-        const toolCallId = typeof data.toolCallId === "string" ? data.toolCallId : null;
-        const callKey = JSON.stringify([sessionScopeKey(entry), toolCallId]);
-        const nameKey = JSON.stringify([sessionScopeKey(entry), toolName]);
+        const toolCallId = typeof data.toolCallId === "string" && data.toolCallId.trim() ? data.toolCallId : null;
         /** @type {any} */
         let resolvedToolId = null;
 
-        if (toolCallId !== null && pendingByToolCallId.has(callKey)) {
-          const pending = pendingByToolCallId.get(callKey);
-          resolvedToolId = pending.id;
-          pendingByToolCallId.delete(callKey);
-          if (resolvedToolId !== null) {
-            removePendingId(pending.name, resolvedToolId);
+        if (toolCallId && pendingByToolCallId.has(toolCallId)) {
+          resolvedToolId = pendingByToolCallId.get(toolCallId);
+          pendingByToolCallId.delete(toolCallId);
+          if (resolvedToolId) {
+            removePendingId(toolName, resolvedToolId);
           }
         }
-        if (resolvedToolId === null && toolCallId === null && (pendingIdsByToolName.get(nameKey)?.length ?? 0) === 1) {
-          resolvedToolId = shiftPendingId(nameKey);
+        if (!resolvedToolId) {
+          resolvedToolId = shiftPendingId(toolName);
         }
-        if (resolvedToolId === null) {
-          resolvedToolId = toolCallId === null ? displayToolId() : scopedDisplayId(callKey, toolCallId);
+        if (!resolvedToolId) {
+          resolvedToolId = `sdk_tool_${++toolCounter}`;
           normalizedEntries.push({
             type: "assistant",
             message: {
               // Orphaned completion events have no corresponding start event, so keep
               // structured input but do not synthesize a command from completion data.
-              content: [
-                { type: "tool_use", id: resolvedToolId, name: toolName, input: buildToolInput(data, { includeCommand: false }), has_input: data.input !== undefined || data.parameters !== undefined, orphaned: true, standard_trace: true },
-              ],
+              content: [{ type: "tool_use", id: resolvedToolId, name: toolName, input: buildToolInput(data, { includeCommand: false }) }],
             },
           });
         }
 
-        const success = sessionToolSuccess(data);
-        const output = Object.hasOwn(data, "output") && data.output !== undefined ? sessionOutputText(data.output) : Object.hasOwn(data, "result") ? sessionOutputText(data.result) : data.error != null ? sessionOutputText(data.error) : "";
+        const success = typeof data.success === "boolean" ? data.success : !data.error;
+        // Order of precedence for structured result payloads:
+        // 1) direct text/content fields
+        // 2) json payloads
+        // 3) serialized object fallback
+        const extractResultContentText = value => {
+          if (typeof value === "string") return value;
+          if (!value || typeof value !== "object") return "";
+          if (typeof value.text === "string") return value.text;
+          if (typeof value.content === "string") return value.content;
+          if (value.type === "json" && value.json !== undefined) {
+            try {
+              return JSON.stringify(value.json, null, 2);
+            } catch {
+              return String(value.json);
+            }
+          }
+          try {
+            return JSON.stringify(value, null, 2);
+          } catch {
+            return String(value);
+          }
+        };
+
+        let output = "";
+        if (typeof data.output === "string") {
+          output = data.output;
+        } else if (typeof data.result === "string") {
+          output = data.result;
+        } else if (data.result && data.result.content !== undefined && data.result.content !== null) {
+          // Native Copilot CLI events.jsonl format: result.content is the concise
+          // tool result payload sent to the LLM (may be truncated for token efficiency).
+          if (Array.isArray(data.result.content)) {
+            output = data.result.content.map(extractResultContentText).filter(Boolean).join("\n");
+          } else if (typeof data.result.content === "string" || typeof data.result.content === "object") {
+            output = extractResultContentText(data.result.content);
+          }
+        } else if (data.error) {
+          output = typeof data.error === "object" && typeof data.error.message === "string" ? data.error.message : String(data.error);
+        } else if (success) {
+          output = "success";
+        } else {
+          output = "Tool execution failed";
+        }
 
         normalizedEntries.push({
           type: "user",
@@ -896,10 +1021,8 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
                 type: "tool_result",
                 tool_use_id: resolvedToolId,
                 content: output,
-                has_output: data.output !== undefined || data.result !== undefined,
-                error: data.error,
-                is_error: success === undefined ? undefined : !success,
-                duration_ms: isMetric(data.durationMs) ? data.durationMs : undefined,
+                is_error: !success,
+                duration_ms: typeof data.durationMs === "number" ? data.durationMs : undefined,
               },
             ],
           },
@@ -908,19 +1031,48 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
       }
 
       case "session.result": {
+        const usage = data.usage && typeof data.usage === "object" ? data.usage : {};
+        normalizedEntries.push({
+          type: "result",
+          num_turns: typeof data.numTurns === "number" ? data.numTurns : undefined,
+          duration_ms: typeof data.durationMs === "number" ? data.durationMs : undefined,
+          total_cost_usd: typeof data.totalCostUsd === "number" ? data.totalCostUsd : undefined,
+          usage: {
+            input_tokens: usage.input_tokens ?? usage.inputTokens,
+            output_tokens: usage.output_tokens ?? usage.outputTokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens ?? usage.cacheReadInputTokens,
+          },
+          errors: Array.isArray(data.errors) ? data.errors : undefined,
+          permission_denials: Array.isArray(data.permissionDenials) ? data.permissionDenials : undefined,
+        });
         break;
       }
+
+      case "result":
+        // A pre-formed legacy result summary may be appended to a copilot-event array
+        // (e.g. parse_pi_log.cjs appends one so log_parser_bootstrap.cjs can emit OTEL
+        // turn/token metrics). Pass it through unchanged so token/turn statistics still
+        // render and the synthetic-result fallback below does not duplicate it.
+        normalizedEntries.push(entry);
+        break;
 
       default:
         break;
     }
   }
 
-  const options = { includeNested: isSingleNestedSession(logEntries) };
-  const result = projectSessionResult(logEntries, options);
-  const init = projectSessionInitialization(logEntries, options);
-  if (init) normalizedEntries.unshift(init);
-  if (result) normalizedEntries.push(result);
+  if (normalizedEntries.length === 0) {
+    return [];
+  }
+
+  const hasResult = normalizedEntries.some(entry => entry.type === "result");
+  if (!hasResult) {
+    normalizedEntries.push({
+      type: "result",
+      num_turns: turnCount > 0 ? turnCount : assistantMessageCount,
+    });
+  }
 
   return normalizedEntries;
 }
@@ -938,9 +1090,6 @@ const { generateConversationMarkdown, formatToolUse, generatePlainTextSummary, g
   unfenceMarkdown,
   isCopilotEventLogEntries,
   convertCopilotEventsToLegacyLogEntries,
-  generateInformationSection,
-  createSummaryTracker: () => new StepSummaryTracker(MAX_STEP_SUMMARY_SIZE - Buffer.byteLength(SIZE_LIMIT_WARNING, "utf8")),
-  MAX_STEP_SUMMARY_SIZE,
   MAX_AGENT_TEXT_LENGTH,
   SIZE_LIMIT_WARNING,
 });
@@ -1014,11 +1163,14 @@ function formatToolCallAsDetails(options) {
       content = content.substring(0, maxContentLength) + "... (truncated)";
     }
 
-    const runs = content.match(/`+/g) ?? [];
-    const fence = "`".repeat(runs.reduce((longest, run) => Math.max(longest, run.length + 1), 6));
-    detailsContent += `${fence}${section.language || ""}\n`;
+    // Use 6 backticks to avoid conflicts with content that may contain 3 or 5 backticks
+    if (section.language) {
+      detailsContent += `\`\`\`\`\`\`${section.language}\n`;
+    } else {
+      detailsContent += "``````\n";
+    }
     detailsContent += content;
-    detailsContent += `\n${fence}\n\n`;
+    detailsContent += "\n``````\n\n";
   }
 
   // Remove trailing newlines from details content

@@ -12,7 +12,7 @@ const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { getBodyFooterMessage } = require("./messages_footer.cjs");
 const { isTemplatableTrue, isStagedMode, logStagedPreviewInfo, checkRequiredFilter } = require("./safe_output_helpers.cjs");
-const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
+const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 const { parseIntTemplatable } = require("./templatable.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
@@ -61,11 +61,11 @@ async function main(config = {}) {
   if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
 
   const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
-  let defaultMentionAliases = [];
+  let allowedMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
-    defaultMentionAliases = config.allowedMentionAliases;
+    allowedMentionAliases = config.allowedMentionAliases;
   } else if (config.mentions != null) {
-    defaultMentionAliases = await resolveDefaultMentions(context, githubClient, core, config.mentions, defaultTargetRepo);
+    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
   }
 
   if (!registry && !legacyBuffer) {
@@ -169,7 +169,6 @@ async function main(config = {}) {
       };
     }
     const { repo: itemRepo, repoParts } = repoResult;
-    const allowedMentionAliases = await resolveMentionsForItem(context, githubClient, core, config.mentions, defaultMentionAliases, defaultTargetRepo, repoResult);
     core.info(`Target repository: ${itemRepo}`);
 
     // Check if we're in a pull request context, or an issue comment context on a PR

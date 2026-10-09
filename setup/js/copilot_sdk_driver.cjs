@@ -32,7 +32,6 @@ const { parsePermissionConfigFromServerArgs } = require("./copilot_sdk_permissio
 const { parseCopilotSDKToolConfig } = require("./copilot_sdk_tool_config.cjs");
 const { parseMultiProviderJson } = require("./copilot_sdk_multi_provider.cjs");
 const { applyModelFallback } = require("./model_fallback.cjs");
-const { resolveRoutingReasoningEffort } = require("./copilot_routing_effort.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 
 // Re-export the session and permission helpers so that existing callers that
@@ -107,9 +106,7 @@ async function main() {
   const providers = multiProviderConfig.providers;
   /** @type {import("@github/copilot-sdk").ProviderModelConfig[]} */
   const sdkModels = multiProviderConfig.models;
-  const routingEnabled = process.env.GH_AW_MODEL_ROUTING === "1";
-  let model = (routingEnabled ? process.env.COPILOT_MODEL : applyModelFallback(process.env, "COPILOT_MODEL", log)) || multiProviderConfig.model || undefined;
-  const reasoningEffort = resolveRoutingReasoningEffort(process.env);
+  let model = applyModelFallback(process.env, "COPILOT_MODEL", log) || multiProviderConfig.model || undefined;
   log(`multi-provider mode: ${providers.length} providers, ${sdkModels.length} models, model=${model ?? "(env)"}`);
   for (const p of providers) {
     log(`  provider: name=${p.name} type=${p.type} baseUrl=${p.baseUrl}${p.wireApi ? ` wireApi=${p.wireApi}` : ""}`);
@@ -129,7 +126,6 @@ async function main() {
     prompt,
     logger: log,
     model,
-    reasoningEffort,
     connectionToken,
     providers,
     models: sdkModels,

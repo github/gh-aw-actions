@@ -6,15 +6,6 @@ const path = require("path");
 const { computeInferenceAIC, findModelPricing, formatAIC } = require("./model_costs.cjs");
 
 const TOKEN_USAGE_FILENAME = "token-usage.jsonl";
-const DAILY_AIC_USAGE_JSONL_FILE = /(?:^|[/\\])(?:agent_usage|detection_usage|evals|token_usage)[^/\\]*\.jsonl$/;
-
-/**
- * @param {string} filePath
- * @returns {boolean}
- */
-function isDailyAICUsageJSONLFile(filePath) {
-  return DAILY_AIC_USAGE_JSONL_FILE.test(filePath);
-}
 
 /**
  * @param {string} root
@@ -309,7 +300,6 @@ function formatAICCredits(value) {
 
 module.exports = {
   findJSONLFiles,
-  isDailyAICUsageJSONLFile,
   sumAICFromUsageJSONLFiles,
   calculateDailyAICStats,
   formatAICCredits,

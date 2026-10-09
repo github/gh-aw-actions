@@ -43,19 +43,6 @@ function readDirectory(targetPath) {
   }
 }
 
-function pruneEmptyDirectories(dirPath) {
-  for (const entry of readDirectory(dirPath)) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const childPath = path.join(dirPath, entry.name);
-    pruneEmptyDirectories(childPath);
-    if (readDirectory(childPath).length === 0) {
-      removePath(childPath, { recursive: true, force: true });
-    }
-  }
-}
-
 /**
  * @param {string} targetPath
  * @param {BufferEncoding | undefined} [encoding]
@@ -125,9 +112,8 @@ function boundedOutput(output) {
 /**
  * @param {string} dirPath
  * @param {number} maxFileSize
- * @param {(relativePath: string) => boolean} [isEligibleFile]
  */
-function formatJSONFiles(dirPath, maxFileSize, isEligibleFile = () => true) {
+function formatJSONFiles(dirPath, maxFileSize) {
   if (!fs.existsSync(dirPath)) {
     return [];
   }
@@ -136,20 +122,18 @@ function formatJSONFiles(dirPath, maxFileSize, isEligibleFile = () => true) {
 
   /**
    * @param {string} currentDir
-   * @param {string} relativePath
    */
-  function visit(currentDir, relativePath) {
+  function visit(currentDir) {
     const entries = readDirectory(currentDir);
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
-      const relativeFilePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
       if (entry.isDirectory()) {
         if (entry.name !== ".git") {
-          visit(fullPath, relativeFilePath);
+          visit(fullPath);
         }
         continue;
       }
-      if (!entry.isFile() || !entry.name.endsWith(".json") || !isEligibleFile(relativeFilePath.replace(/\\/g, "/"))) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
         continue;
       }
       const raw = readFile(fullPath, "utf8");
@@ -175,7 +159,7 @@ function formatJSONFiles(dirPath, maxFileSize, isEligibleFile = () => true) {
     }
   }
 
-  visit(dirPath, "");
+  visit(dirPath);
   return formattedFiles;
 }
 
@@ -235,7 +219,6 @@ function memoryTreeDigest(dirPath) {
  *   memoryId?: string,
  *   kind: "repo" | "cache" | "drive",
  *   timeoutSeconds?: number,
- *   isEligibleFile?: (relativePath: string) => boolean,
  * }} options
  */
 function runCustomMemoryValidation(options) {
@@ -257,37 +240,10 @@ function runCustomMemoryValidation(options) {
   const timeoutSeconds = typeof rawTimeoutSeconds === "number" && Number.isFinite(rawTimeoutSeconds) && rawTimeoutSeconds > 0 ? Math.floor(rawTimeoutSeconds) : DEFAULT_VALIDATION_TIMEOUT_SECONDS;
   const timeoutMs = timeoutSeconds * 1000;
   const memoryId = options.memoryId || "default";
-  const validationDir = makeTempDirectory();
-  const validationMemoryDir = path.join(validationDir, "memory");
-  const scriptPath = path.join(validationDir, "validator.cjs");
-  try {
-    fs.cpSync(options.memoryDir, validationMemoryDir, {
-      recursive: true,
-      dereference: true,
-      filter: sourcePath => {
-        const relativePath = path.relative(options.memoryDir, sourcePath);
-        if (relativePath === "") return true;
-        if (relativePath.split(path.sep)[0] === ".git") return false;
-        return !options.isEligibleFile || fs.statSync(sourcePath).isDirectory() || options.isEligibleFile(relativePath.replace(/\\/g, "/"));
-      },
-    });
-    pruneEmptyDirectories(validationMemoryDir);
-  } catch (error) {
-    removePath(validationDir, { recursive: true, force: true });
-    return {
-      ok: false,
-      exitCode: null,
-      timedOut: false,
-      stdout: "",
-      stderr: `Unable to prepare memory for custom validation: ${getErrorMessage(error)}`,
-    };
-  }
-
   let beforeDigest;
   try {
-    beforeDigest = memoryTreeDigest(validationMemoryDir);
+    beforeDigest = memoryTreeDigest(options.memoryDir);
   } catch (error) {
-    removePath(validationDir, { recursive: true, force: true });
     return {
       ok: false,
       exitCode: null,
@@ -296,11 +252,12 @@ function runCustomMemoryValidation(options) {
       stderr: `Unable to snapshot memory before custom validation: ${getErrorMessage(error)}`,
     };
   }
-
+  const validationDir = makeTempDirectory();
+  const scriptPath = path.join(validationDir, "validator.cjs");
   const wrapper = `"use strict";
 const fs = require("fs");
 const path = require("path");
-const memoryRoot = ${JSON.stringify(validationMemoryDir)};
+const memoryRoot = ${JSON.stringify(options.memoryDir)};
 const memoryDir = memoryRoot;
 const memoryId = ${JSON.stringify(memoryId)};
 const memoryKind = ${JSON.stringify(options.kind)};
@@ -324,10 +281,10 @@ ${script}
     process.exit(1);
   });
 `;
+  writeFile(scriptPath, wrapper, { encoding: "utf8", mode: 0o600 });
   try {
-    writeFile(scriptPath, wrapper, { encoding: "utf8", mode: 0o600 });
     const result = childProcess.spawnSync(process.execPath, [scriptPath], {
-      cwd: validationMemoryDir,
+      cwd: options.memoryDir,
       encoding: "utf8",
       env: sanitizedValidationEnv(process.env),
       timeout: timeoutMs,
@@ -338,7 +295,7 @@ ${script}
     let memoryChanged = false;
     let snapshotError = "";
     try {
-      memoryChanged = beforeDigest !== memoryTreeDigest(validationMemoryDir);
+      memoryChanged = beforeDigest !== memoryTreeDigest(options.memoryDir);
     } catch (error) {
       snapshotError = `Unable to snapshot memory after custom validation: ${getErrorMessage(error)}`;
     }

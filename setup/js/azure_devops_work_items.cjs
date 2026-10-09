@@ -8,7 +8,6 @@ const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { matchesSimpleGlob } = require("./glob_pattern_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { appendConfiguredBodyFooter } = require("./body_footer.cjs");
-const { SAFE_OUTPUT_E001 } = require("./error_codes.cjs");
 
 const WORK_ITEM_RELATIONS = {
   parent: "System.LinkTypes.Hierarchy-Reverse",
@@ -35,10 +34,10 @@ function staged(message, extra = {}) {
 function normalizeAssignee(value) {
   const assignee = String(value || "").trim();
   if (!assignee) {
-    throw new Error(`${SAFE_OUTPUT_E001}: assignee must not be empty`);
+    throw new Error("assignee must not be empty");
   }
   if (RESERVED_ASSIGNEES.has(assignee.toLowerCase())) {
-    throw new Error(`${SAFE_OUTPUT_E001}: assignee '${assignee}' is a reserved identity`);
+    throw new Error(`assignee '${assignee}' is a reserved identity`);
   }
   return assignee;
 }
@@ -49,15 +48,15 @@ function matchesPattern(value, pattern) {
 
 function validateTags(tags) {
   if (!Array.isArray(tags)) {
-    throw new Error(`${SAFE_OUTPUT_E001}: tags must be an array`);
+    throw new Error("tags must be an array");
   }
   return tags.map(tag => {
     const value = String(tag).trim();
     if (!value) {
-      throw new Error(`${SAFE_OUTPUT_E001}: tags must not contain empty values`);
+      throw new Error("tags must not contain empty values");
     }
     if (value.includes(";")) {
-      throw new Error(`${SAFE_OUTPUT_E001}: tag '${value}' contains a semicolon`);
+      throw new Error(`tag '${value}' contains a semicolon`);
     }
     return value;
   });

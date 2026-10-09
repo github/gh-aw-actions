@@ -34,7 +34,6 @@
 const fs = require("fs");
 const path = require("path");
 const { collectInlineEndMarkers, unknownInlineEndMarkerError } = require("./inline_marker_helpers.cjs");
-const { inlineArtifactTarget } = require("./inline_artifact_target.cjs");
 
 // Regex for the start marker: ## agent: `name` (lowercase identifier)
 const START_MARKER_RE = /^##[ \t]+agent:[ \t]+`([a-z][a-z0-9_-]*)`[ \t]*$/gm;
@@ -262,8 +261,6 @@ function getEngineSubAgentTarget(engineId) {
       return { dir: ".codex/agents", ext: ".md" };
     case "gemini":
       return { dir: ".gemini/agents", ext: ".md" };
-    case "pi":
-      return { dir: ".pi/agents", ext: ".md" };
     default:
       return { dir: ".github/agents", ext: ".agent.md" };
   }
@@ -304,7 +301,7 @@ function writeInlineSubAgents(content, workspaceDir, agentsBaseDir, engineId) {
   }
 
   const baseDir = agentsBaseDir || workspaceDir;
-  const { dir, ext } = inlineArtifactTarget("SUB_AGENT", getEngineSubAgentTarget(engineId));
+  const { dir, ext } = getEngineSubAgentTarget(engineId);
   const agentsDir = path.join(baseDir, dir);
   core.info(`[extractInlineSubAgents] Engine: "${engineId || "(default)"}" → dir="${dir}" ext="${ext}"`);
   core.info(`[extractInlineSubAgents] Writing ${agents.length} sub-agent(s) to: ${agentsDir}`);

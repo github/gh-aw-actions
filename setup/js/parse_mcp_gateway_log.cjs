@@ -7,6 +7,7 @@ const { displayDirectories } = require("./display_file_helpers.cjs");
 const { ERR_PARSE, ERR_SYSTEM } = require("./error_codes.cjs");
 const { formatModelEmojiAlias } = require("./model_aliases.cjs");
 const { computeInferenceAIC, formatAIC } = require("./model_costs.cjs");
+const { generateUnifiedTimelineSummary } = require("./unified_timeline.cjs");
 const { parseUnknownModelAICreditsFromAuditLog } = require("./ai_credits_context.cjs");
 
 /**
@@ -414,6 +415,15 @@ async function writeStepSummaryWithTokenUsage(coreObj) {
         coreObj.info(`Ambient context: ${roundedAmbientContext}`);
       }
     }
+  }
+
+  // Append the unified event timeline (gateway + firewall audit + agent events)
+  // to the step summary immediately before flushing, so it appears as the last
+  // section regardless of which gateway log format was detected above.
+  const timelineMd = generateUnifiedTimelineSummary();
+  if (timelineMd) {
+    coreObj.info(`Appending unified event timeline to step summary`);
+    coreObj.summary.addRaw(timelineMd);
   }
 
   await coreObj.summary.write();

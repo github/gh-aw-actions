@@ -7,17 +7,15 @@ import * as __actionsExec from "@actions/exec";
 import * as __actionsGithub from "@actions/github";
 import * as __actionsGlob from "@actions/glob";
 import * as __actionsIo from "@actions/io";
+import type { Context } from "@actions/github/lib/context";
 import type { GitHub } from "@actions/github/lib/utils";
-
-type Context = typeof __actionsGithub.context;
 
 declare global {
   /**
    * GitHub API client instance provided by github-script action
    * This is an authenticated Octokit instance with pagination plugins
    */
-  // The setup shim publishes a mutable global so Claim effects can install a scoped facade.
-  var github: InstanceType<typeof GitHub>;
+  const github: InstanceType<typeof GitHub>;
 
   /**
    * Alternative name for the github client (same as github)
@@ -29,19 +27,19 @@ declare global {
    * GitHub Actions context object provided by github-script action
    * Contains information about the workflow run context
    */
-  var context: Context;
+  var context: any;
 
   /**
    * Actions core utilities provided by github-script action
    * For setting outputs, logging, and other workflow operations
    */
-  var core: typeof __actionsCore;
+  var core: any;
 
   /**
    * Actions exec utilities provided by github-script action
    * For executing shell commands and tools
    */
-  var exec: typeof __actionsExec;
+  const exec: typeof __actionsExec;
 
   /**
    * Actions glob utilities provided by github-script action
@@ -53,7 +51,7 @@ declare global {
    * Actions io utilities provided by github-script action
    * For file and directory operations
    */
-  var io: typeof __actionsIo;
+  const io: typeof __actionsIo;
 
   /**
    * Factory function to create an authenticated Octokit client with a specific token.

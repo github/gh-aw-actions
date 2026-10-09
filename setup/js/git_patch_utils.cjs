@@ -16,7 +16,6 @@ const fs = require("fs");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { execGitSync } = require("./git_helpers.cjs");
-const { scopedArtifactFilename } = require("./work_queue_claim_scope.cjs");
 
 /**
  * Debug logging helper - logs to stderr when DEBUG env var matches
@@ -70,7 +69,7 @@ function sanitizeRepoSlugForPatch(repoSlug) {
  */
 function getPatchPathForBranch(branchName) {
   const sanitized = sanitizeBranchNameForPatch(branchName);
-  return scopedArtifactFilename(`/tmp/gh-aw/aw-${sanitized}.patch`);
+  return `/tmp/gh-aw/aw-${sanitized}.patch`;
 }
 
 /**
@@ -83,7 +82,7 @@ function getPatchPathForBranch(branchName) {
 function getPatchPathForBranchInRepo(branchName, repoSlug) {
   const sanitizedBranch = sanitizeBranchNameForPatch(branchName);
   const sanitizedRepo = sanitizeRepoSlugForPatch(repoSlug);
-  return scopedArtifactFilename(`/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.patch`);
+  return `/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.patch`;
 }
 
 /**
@@ -166,18 +165,10 @@ function getPatchDiffSizeBytes(patchContent) {
  * @param {Object} options
  * @param {(args: string[], opts?: Record<string, any>) => string} options.execGitSyncFn
  * @param {string} [options.cwd]
- * @param {string[]} [options.pathspecs] - Optional pathspecs to limit the staged diff
  * @returns {number}
  */
-function getStagedPatchDiffSizeBytes({ execGitSyncFn, cwd, pathspecs }) {
-  if (Array.isArray(pathspecs) && pathspecs.length === 0) {
-    return 0;
-  }
-  const args = ["diff", "--cached", "--no-renames"];
-  if (Array.isArray(pathspecs)) {
-    args.push("--", ...pathspecs);
-  }
-  const patchContent = execGitSyncFn(args, { stdio: "pipe", cwd });
+function getStagedPatchDiffSizeBytes({ execGitSyncFn, cwd }) {
+  const patchContent = execGitSyncFn(["diff", "--cached"], { stdio: "pipe", cwd });
   return getPatchDiffSizeBytes(patchContent);
 }
 

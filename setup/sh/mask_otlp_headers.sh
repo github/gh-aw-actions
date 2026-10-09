@@ -28,8 +28,9 @@ set +o histexpand
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/mask_otlp_common.sh"
+# Ignore mask values shorter than 4 characters because GHES may over-mask
+# subsequent logs when receiving very short ::add-mask:: entries.
+MIN_MASK_LENGTH=4
 
 # emit_mask emits ::add-mask:: only for non-empty values at or above MIN_MASK_LENGTH.
 emit_mask() {

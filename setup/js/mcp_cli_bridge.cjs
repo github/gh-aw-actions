@@ -37,7 +37,6 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const { renderToolRecommendedExample, renderToolSignature, summarizeHelpText } = require("./mcp_cli_schema_docs.cjs");
-const { isBlankOptionalField, normalizeBlankOptionalFields } = require("./optional_field_normalizer.cjs");
 
 /** Directory for JSONL audit logs (writable inside AWF sandbox via /tmp mount) */
 const AUDIT_LOG_DIR = "/tmp/gh-aw/mcp-cli-audit";
@@ -651,35 +650,20 @@ const STDIN_MAX_BYTES = 10 * 1024 * 1024;
  * after bytes have already been collected (to prevent silently returning partial content).
  * Returns an empty string if stdin is empty or if an error occurs before any bytes are read.
  *
- * @param {boolean} [waitForData] - Whether stdin was explicitly requested
  * @returns {string}
  */
-function readStdinSync(waitForData = false) {
+function readStdinSync() {
   const STDIN_FD = 0;
   /** @type {Buffer[]} */
   const chunks = [];
   const bufSize = 65536;
   let totalBytes = 0;
-  let firstRead = true;
-  let idleSince = Date.now();
-  const retryWait = new Int32Array(new SharedArrayBuffer(4));
   while (true) {
     const buf = Buffer.alloc(bufSize);
     let bytesRead;
-    const isFirstRead = firstRead;
-    firstRead = false;
     try {
       bytesRead = fs.readSync(STDIN_FD, buf, 0, bufSize, null);
     } catch (err) {
-      if (err && typeof err === "object" && (err.code === "EAGAIN" || err.code === "EINTR")) {
-        if (err.code === "EAGAIN" && isFirstRead && !waitForData) return "";
-        if (Date.now() - idleSince >= 30000) {
-          throw new Error("timed out waiting for stdin input", { cause: err });
-        }
-        // Pipes may be nonblocking; a temporary lack of data is not EOF.
-        Atomics.wait(retryWait, 0, 0, 10);
-        continue;
-      }
       // If we have already read some bytes, rethrow so the caller doesn't
       // unknowingly use partial content. An error before any data is read
       // (e.g. stdin is not connected) is treated as empty input.
@@ -689,7 +673,6 @@ function readStdinSync(waitForData = false) {
       return "";
     }
     if (bytesRead === 0) break;
-    idleSince = Date.now();
     totalBytes += bytesRead;
     if (totalBytes > STDIN_MAX_BYTES) {
       throw new Error(`stdin input exceeds maximum allowed size of ${STDIN_MAX_BYTES} bytes`);
@@ -809,25 +792,14 @@ function findInlineJsonPayloadArg(args) {
  * @param {Record<string, {type?: string|string[]}>} [schemaProperties] - Tool input schema properties
  * @param {string | null} [stdinContent] - Pre-read stdin content; used in JSON payload mode
  *   (args empty or `['.']`) and per-field stdin mode (`--key .`).
- * @param {{rejectPositionalArguments?: boolean, omitBlankOptionalFields?: boolean, requiredFields?: string[]}} [options]
  * @returns {{args: Record<string, unknown>, json: boolean}}
  */
-function parseToolArgs(args, schemaProperties = {}, stdinContent = null, options = {}) {
+function parseToolArgs(args, schemaProperties = {}, stdinContent = null) {
   /** @type {Record<string, unknown>} */
   const result = {};
   let jsonOutput = false;
   const hasSchemaProperties = Object.keys(schemaProperties).length > 0;
   const { normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys } = buildNormalizedSchemaKeyMap(schemaProperties);
-  const normalizeArgs = values => (options.omitBlankOptionalFields ? normalizeBlankOptionalFields(values, schemaProperties, options.requiredFields) : values);
-  const assignFlagValue = (key, rawValue) => {
-    if (options.omitBlankOptionalFields && rawValue.trim() === "") {
-      if (!isBlankOptionalField(rawValue, schemaProperties[key], options.requiredFields?.includes(key), key)) {
-        result[key] = rawValue;
-      }
-      return;
-    }
-    result[key] = coerceToolArgValue(key, rawValue, schemaProperties[key], result[key], !hasSchemaProperties);
-  };
 
   // Inline JSON payload mode: the whole payload is passed as a single quoted
   // argument, e.g. `safeoutputs noop '{"message":"done"}'`.  This keeps the
@@ -849,7 +821,7 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null, options
       const canonicalKey = resolveSchemaPropertyKey(key, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
       result[canonicalKey] = value;
     }
-    return { args: normalizeArgs(result), json: resolveJsonFlag(args) };
+    return { args: result, json: resolveJsonFlag(args) };
   }
   // Trimmed stdin content used in both JSON payload mode and per-field stdin mode.
   const trimmedStdin = stdinContent !== null ? stdinContent.trim() : null;
@@ -873,7 +845,7 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null, options
           const canonicalKey = resolveSchemaPropertyKey(key, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
           result[canonicalKey] = value;
         }
-        return { args: normalizeArgs(result), json: false };
+        return { args: result, json: false };
       }
       throw new Error(`stdin JSON payload must be an object. JSON payload mode was requested ${isExplicitJsonSentinel ? "with '.'" : "from piped stdin with no flags"}. Pass --key value flags instead, or provide a JSON object.`);
     }
@@ -895,7 +867,7 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null, options
             const extracted = tryExtractJsonFieldFromStdin(trimmedStdin, canonicalKey, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
             result[canonicalKey] = extracted !== undefined ? extracted : trimmedStdin;
           } else {
-            assignFlagValue(canonicalKey, rawValue);
+            result[canonicalKey] = coerceToolArgValue(canonicalKey, rawValue, schemaProperties[canonicalKey], result[canonicalKey], !hasSchemaProperties);
           }
         }
       } else if (raw === "json") {
@@ -907,20 +879,18 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null, options
           const extracted = tryExtractJsonFieldFromStdin(trimmedStdin, canonicalKey, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
           result[canonicalKey] = extracted !== undefined ? extracted : trimmedStdin;
         } else {
-          assignFlagValue(canonicalKey, rawValue);
+          result[canonicalKey] = coerceToolArgValue(canonicalKey, rawValue, schemaProperties[canonicalKey], result[canonicalKey], !hasSchemaProperties);
         }
         i++;
       } else {
         const canonicalKey = resolveSchemaPropertyKey(raw, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
         result[canonicalKey] = true;
       }
-    } else if (options.rejectPositionalArguments) {
-      throw new Error("Unexpected positional argument. Pass a single quoted JSON object or use --key value flags.");
     }
     // Skip non-flag arguments
   }
 
-  return { args: normalizeArgs(result), json: jsonOutput };
+  return { args: result, json: jsonOutput };
 }
 
 /**
@@ -1714,7 +1684,7 @@ async function main() {
   const schemaProperties = matchedTool && matchedTool.inputSchema && matchedTool.inputSchema.properties ? matchedTool.inputSchema.properties : {};
 
   // Pre-read stdin when JSON payload mode is triggered ('.' sentinel or no args with piped stdin).
-  const stdinContent = shouldReadStdin ? readStdinSync(toolUserArgs.length > 0) : null;
+  const stdinContent = shouldReadStdin ? readStdinSync() : null;
   if (shouldReadStdin) {
     const stdinBytes = stdinContent !== null ? Buffer.byteLength(stdinContent, "utf8") : 0;
     core.info(`[${serverName}] Stdin captured: ${stdinBytes} bytes`);
@@ -1722,12 +1692,7 @@ async function main() {
   /** @type {{args: Record<string, unknown>, json: boolean}} */
   let parsedArgs;
   try {
-    // Other MCP bridges retain positional syntax; safeoutputs maps CLI arguments to a strict tool schema.
-    parsedArgs = parseToolArgs(toolUserArgs, schemaProperties, stdinContent, {
-      rejectPositionalArguments: serverName === SAFEOUTPUTS_SERVER_NAME,
-      omitBlankOptionalFields: serverName === SAFEOUTPUTS_SERVER_NAME,
-      requiredFields: matchedTool?.inputSchema?.required || [],
-    });
+    parsedArgs = parseToolArgs(toolUserArgs, schemaProperties, stdinContent);
   } catch (err) {
     const message = getErrorMessage(err);
     auditLog(serverName, { event: "parse_args_error", tool: toolName, error: message });
@@ -1736,6 +1701,20 @@ async function main() {
     return;
   }
   const { args: toolArgs, json: jsonOutput } = parsedArgs;
+
+  // Fail loudly when arguments were supplied but none of them were recognized
+  // (e.g. `safeoutputs noop 'no action needed'`).  Silently dropping them would
+  // leave the agent believing a safe output was emitted when none was.  Structured
+  // payload modes are exempt: an explicit `{}` payload legitimately yields no arguments.
+  const usedStructuredPayload = shouldReadStdin || findInlineJsonPayloadArg(toolUserArgs) !== null;
+  const hasUnrecognizedArguments = toolUserArgs.some(arg => !isJsonFlagToken(arg));
+  if (serverName === SAFEOUTPUTS_SERVER_NAME && Object.keys(toolArgs).length === 0 && hasUnrecognizedArguments && !usedStructuredPayload) {
+    const message = `no arguments were recognized for '${toolName}'. Pass a JSON object inline (${serverName} ${toolName} '{"key":"value"}'), use --key value flags, or pipe JSON on stdin with '.'.`;
+    auditLog(serverName, { event: "unrecognized_args", tool: toolName });
+    process.stderr.write(`Error: ${message}\n`);
+    core.setFailed(`[${serverName}] ${message}`);
+    return;
+  }
 
   if (shouldShowToolHelpForEmptyArgs(serverName, toolArgs, matchedTool)) {
     core.warning(`[${serverName}] No arguments provided for '${toolName}'; showing command help instead of calling the tool`);

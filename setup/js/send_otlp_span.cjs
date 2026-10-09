@@ -12,10 +12,6 @@ const { readExperimentAssignments, EXPERIMENT_ASSIGNMENTS_PATH } = require("./ex
 const { parseJsonlContent } = require("./jsonl_helpers.cjs");
 const { countSteeringEventsInApiProxyJsonl } = require("./steering_helpers.cjs");
 const { resolveAICreditsFailureState } = require("./ai_credits_context.cjs");
-const { collectCodexMixedRecords } = require("./parse_codex_log.cjs");
-const { normalizeCodexSession } = require("./codex_session.cjs");
-const { projectSessionResult, observedSessionModel } = require("./agent_session.cjs");
-const { getFallbackModel } = require("./model_attribution.cjs");
 
 /**
  * send_otlp_span.cjs
@@ -1974,10 +1970,9 @@ function readApiProxySteeringEventCount() {
 /**
  * Read turns, token usage, and warning volume from agent-stdio.log.
  *
- * @param {string} [engineId]
  * @returns {AgentRuntimeMetrics}
  */
-function readAgentRuntimeMetrics(engineId = "") {
+function readAgentRuntimeMetrics() {
   /** @type {AgentRuntimeMetrics} */
   const metrics = { turns: undefined, stopReason: undefined, resolvedModel: undefined, tokenUsage: undefined, warningCount: 0, permissionDeniedCount: 0, steeringEventCount: readApiProxySteeringEventCount() };
   let fallbackPermissionDeniedCount = 0;
@@ -1986,7 +1981,6 @@ function readAgentRuntimeMetrics(engineId = "") {
   try {
     const content = fs.readFileSync(AGENT_STDIO_LOG_PATH, "utf8");
     const lines = content.split("\n");
-    const codexRecords = engineId.toLowerCase() === "codex" ? collectCodexMixedRecords(content) : null;
 
     const applyRuntimeEntry = parsed => {
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -2037,7 +2031,6 @@ function readAgentRuntimeMetrics(engineId = "") {
       if (PERMISSION_DENIED_RE.test(line)) {
         fallbackPermissionDeniedCount += 1;
       }
-      if (codexRecords) continue;
 
       const jsonObjectStart = line.indexOf("{");
       const jsonArrayStart = line.indexOf("[{");
@@ -2065,13 +2058,6 @@ function readAgentRuntimeMetrics(engineId = "") {
       } catch {
         // Ignore non-JSON and truncated log lines.
       }
-    }
-    if (codexRecords) {
-      for (const record of codexRecords) applyRuntimeEntry(record);
-      const session = normalizeCodexSession(codexRecords);
-      applyRuntimeEntry(projectSessionResult(session));
-      const model = observedSessionModel(session);
-      if (model) metrics.resolvedModel = model;
     }
   } catch {
     return metrics;
@@ -2177,7 +2163,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
 
   const workflowName = awInfo.workflow_name || process.env.GH_AW_INFO_WORKFLOW_NAME || process.env.GITHUB_WORKFLOW || "";
   const engineId = resolveEngineId(awInfo);
-  const model = getFallbackModel("/tmp/gh-aw/aw_info.json", process.env.GH_AW_PHASE || "agent") || awInfo.model || "";
+  const model = awInfo.model || "";
   const staged = awInfo.staged === true;
   const itemType = typeof awInfo.context?.item_type === "string" ? awInfo.context.item_type : "";
   const itemNumber = typeof awInfo.context?.item_number === "string" ? awInfo.context.item_number : "";
@@ -2217,7 +2203,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // needs.detection.outputs.* in downstream jobs (conclusion, safe_outputs, etc.).
   const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || "";
   const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
-  const runtimeMetrics = readAgentRuntimeMetrics(engineId);
+  const runtimeMetrics = readAgentRuntimeMetrics();
   // Read once and reuse for both gh-aw.aic and gen_ai.usage.* attributes.
   const agentUsageFilePath = "/tmp/gh-aw/agent_usage.json";
   const agentUsageRaw = readJSONIfExists(agentUsageFilePath);

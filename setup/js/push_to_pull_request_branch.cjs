@@ -608,11 +608,7 @@ async function main(config = {}) {
       }
 
       if (!pullNumber) {
-        return {
-          success: false,
-          error:
-            "push-to-pull-request-branch with target \"triggering\" requires pull request context, which is unavailable for scheduled runs. Configure safe-outputs.push-to-pull-request-branch with target: '*' and supply pull_request_number in the safe output message to select a pull request.",
-        };
+        return { success: false, error: 'push-to-pull-request-branch with target "triggering" requires pull request context' };
       }
     } else if (target === "*") {
       if (message.pull_request_number) {
@@ -669,7 +665,7 @@ async function main(config = {}) {
         if (!checkoutResult.success) {
           return {
             success: false,
-            error: checkoutResult.error,
+            error: `Repository '${itemRepo}' not found in workspace. Check out the target repo with actions/checkout and set its 'path' input so the checkout can be located. If checking out multiple repositories, ensure each actions/checkout step uses the appropriate 'path' input.`,
           };
         }
         repoCwd = checkoutResult.path;
@@ -1339,7 +1335,6 @@ async function main(config = {}) {
           // a typed, actionable error instead of a bare git exit-1.
           // For fork-backed PRs, push to the head repo remote instead of origin.
           const reviewPushRemote = pushRemoteUrl || "origin";
-          await require("./work_queue_git_effects.cjs").assertGitPushAuthorized({ remote: reviewPushRemote, branch: reviewBranchName, cwd: baseGitOpts.cwd, gitAuthEnv });
           const reviewPushOutput = await withGitHubHostToken(
             pushRemoteUrl ? headGitHubToken : "",
             async () =>
@@ -1548,7 +1543,6 @@ async function main(config = {}) {
             // Use getExecOutput to capture stderr for 'workflows' scope diagnostics.
             // For fork-backed PRs, push to the head repo remote instead of origin.
             const fallbackPushRemote = pushRemoteUrl || "origin";
-            await require("./work_queue_git_effects.cjs").assertGitPushAuthorized({ remote: fallbackPushRemote, branch: fallbackBranchName, cwd: baseGitOpts.cwd, gitAuthEnv });
             const fallbackPushOutput = await withGitHubHostToken(
               pushRemoteUrl ? headGitHubToken : "",
               async () =>

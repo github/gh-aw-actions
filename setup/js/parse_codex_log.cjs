@@ -1,21 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const {
-  createEngineLogParser,
-  truncateString,
-  estimateTokens,
-  formatToolCallAsDetails,
-  buildStepSummaryDetailsSection,
-  parseLogEntries,
-  generateConversationMarkdown,
-  generateInformationSection,
-  formatInitializationSummary,
-  formatToolUse,
-} = require("./log_parser_shared.cjs");
-const { normalizeCodexSession, isCodexRecord } = require("./codex_session.cjs");
-const { projectSessionResult, createSessionEvent, sessionToolSuccess } = require("./agent_session.cjs");
-const { CODEX_LEGACY_OUTCOME, codexLegacyPayload, codexLegacyResultEnd } = require("./codex_log_framing.cjs");
+const { createEngineLogParser, truncateString, estimateTokens, formatToolCallAsDetails, buildStepSummaryDetailsSection, convertLegacyLogEntriesToCopilotEvents } = require("./log_parser_shared.cjs");
 
 const main = createEngineLogParser({
   parserName: "Codex",
@@ -173,6 +159,122 @@ function extractCodexErrorMessages(lines) {
 }
 
 /**
+ * Convert parsed Codex data to logEntries format for plain text rendering
+ * @param {Array<{type: string, content?: string, toolName?: string, params?: string, response?: string, statusIcon?: string}>} parsedData - Parsed Codex log data
+ * @returns {Array} logEntries array in the format expected by generatePlainTextSummary
+ */
+function convertToLogEntries(parsedData) {
+  const logEntries = [];
+
+  for (const item of parsedData) {
+    if (item.type === "thinking") {
+      // Add thinking as assistant reasoning content (distinct from regular text)
+      logEntries.push({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "thinking",
+              thinking: item.content,
+            },
+          ],
+        },
+      });
+    } else if (item.type === "text") {
+      // Add a plain agent message as assistant text content
+      logEntries.push({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "text",
+              text: item.content,
+            },
+          ],
+        },
+      });
+    } else if (item.type === "tool") {
+      // Add tool use as assistant content
+      const toolUseId = `tool_${logEntries.length}`;
+
+      // Parse params - it might be a plain JSON string or need parsing
+      /** @type {any} */
+      let inputObj = {};
+      if (item.params) {
+        try {
+          inputObj = JSON.parse(item.params);
+        } catch (e) {
+          // If parsing fails, wrap it as a string
+          inputObj = { params: item.params };
+        }
+      }
+
+      logEntries.push({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: toolUseId,
+              name: item.toolName, // Already in server__method format
+              input: inputObj,
+            },
+          ],
+        },
+      });
+
+      // Add tool result as user content
+      logEntries.push({
+        type: "user",
+        message: {
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: toolUseId,
+              content: item.response || "",
+              is_error: item.statusIcon === "❌",
+            },
+          ],
+        },
+      });
+    } else if (item.type === "bash") {
+      // Add bash command as tool use
+      const toolUseId = `bash_${logEntries.length}`;
+      logEntries.push({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: toolUseId,
+              name: "Bash",
+              input: { command: item.content },
+            },
+          ],
+        },
+      });
+
+      // Add bash result as user content
+      logEntries.push({
+        type: "user",
+        message: {
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: toolUseId,
+              content: item.response || "",
+              is_error: item.statusIcon === "❌",
+            },
+          ],
+        },
+      });
+    }
+  }
+
+  return logEntries;
+}
+
+/**
  * Extract the model name from Codex log header lines.
  * Codex logs include a line like "model: o4-mini" near the top.
  * @param {string} logContent - The raw log content
@@ -200,28 +302,197 @@ function extractCodexModel(logContent) {
  * `{"type":"item.completed","item":{"type":"agent_message",...}}` instead of the
  * legacy pretty-printed "thinking"/"tool server.method(...)" lines.
  * @param {string[]} lines - The log split into lines
- * @param {Array<any>} [entries] - Already parsed records, when available
  * @returns {boolean} True if at least one Codex JSONL event line is present
  */
-function isCodexJsonlFormat(lines, entries = parseLogEntries(lines.join("\n")) ?? []) {
-  return entries.some(entry => isCodexRecord(entry) || normalizeCodexSession([entry]).length > 0);
+function isCodexJsonlFormat(lines) {
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (event && typeof event === "object" && typeof event.type === "string" && /^(thread|turn|item)\./.test(event.type)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
  * Parse the Codex experimental JSONL event stream into the shared logEntries model.
- * Retains native item lifecycles, message snapshots and per-turn accounting.
+ * Maps `item.completed` items (agent_message, reasoning, mcp_tool_call,
+ * command_execution) and `turn.completed` usage onto the same `parsedData`
+ * structure used by the legacy parser, so the common renderer is reused.
  * @param {string} logContent - The raw log content
- * @param {Array<any>} [entries] - Already parsed records, when available
  * @returns {{markdown: string, logEntries: Array, mcpFailures: Array<string>, maxTurnsHit: boolean}} Parsed log data
  */
-function parseCodexJsonl(logContent, entries = parseLogEntries(logContent) ?? []) {
-  const canonicalLogEntries = normalizeCodexSession(collectCodexMixedRecords(logContent, entries), extractCodexModel(logContent));
-  const conversation = generateConversationMarkdown(canonicalLogEntries, {
-    includeInformation: false,
-    formatToolCallback: (toolUse, toolResult) => formatToolUse(toolUse, toolResult),
-    formatInitCallback: init => formatInitializationSummary(init),
+function parseCodexJsonl(logContent) {
+  const DEFAULT_STATUS_ICON = "🔧";
+
+  const lines = logContent.split("\n");
+  const parsedData = [];
+  /** @type {any} */
+  let usage = null;
+  let turnCount = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== "object") continue;
+
+    if (event.type === "turn.completed") {
+      turnCount++;
+      if (event.usage && typeof event.usage === "object") {
+        usage = event.usage;
+      }
+      continue;
+    }
+
+    // Only render completed items; `item.started` entries are interim duplicates.
+    if (event.type !== "item.completed" || !event.item || typeof event.item !== "object") {
+      continue;
+    }
+
+    const item = event.item;
+    switch (item.type) {
+      case "agent_message": {
+        if (typeof item.text === "string" && item.text.trim()) {
+          parsedData.push({ type: "text", content: item.text });
+        }
+        break;
+      }
+      case "reasoning": {
+        const reasoning = typeof item.text === "string" ? item.text : typeof item.summary === "string" ? item.summary : "";
+        if (reasoning.trim()) {
+          parsedData.push({ type: "thinking", content: reasoning });
+        }
+        break;
+      }
+      case "mcp_tool_call": {
+        const server = item.server || "mcp";
+        const toolName = item.tool || "tool";
+        const params = item.arguments != null ? JSON.stringify(item.arguments) : "";
+        let response = "";
+        if (item.error != null) {
+          response = typeof item.error === "string" ? item.error : JSON.stringify(item.error);
+        } else if (item.result != null) {
+          response = typeof item.result === "string" ? item.result : JSON.stringify(item.result);
+        }
+        const isError = item.status === "failed" || item.error != null;
+        parsedData.push({
+          type: "tool",
+          toolName: `${server}__${toolName}`,
+          params,
+          response,
+          statusIcon: isError ? "❌" : "✅",
+        });
+        break;
+      }
+      case "command_execution": {
+        const command = typeof item.command === "string" ? item.command : "";
+        const response = typeof item.aggregated_output === "string" ? item.aggregated_output : "";
+        const isError = item.status === "failed" || (typeof item.exit_code === "number" && item.exit_code !== 0);
+        parsedData.push({
+          type: "bash",
+          content: command,
+          response,
+          statusIcon: isError ? "❌" : "✅",
+        });
+        break;
+      }
+      case "error": {
+        const rawMessage = typeof item.message === "string" ? item.message : JSON.stringify(item);
+        const message = rawMessage.trim();
+        if (message) {
+          parsedData.push({ type: "error", content: message });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  const errorMessages = parsedData.filter(item => item.type === "error").map(item => item.content);
+
+  // Build markdown so the parser returns a truthy result and core.info has a
+  // readable fallback. The step summary itself is rendered from logEntries.
+  let markdown = "";
+  if (errorMessages.length > 0) {
+    markdown += "<details>\n<summary>Errors</summary>\n\n";
+    for (const message of errorMessages) {
+      markdown += `> ${message}\n\n`;
+    }
+    markdown += "</details>\n\n";
+  }
+  markdown += "<details>\n<summary>Reasoning</summary>\n\n";
+  for (const item of parsedData) {
+    if (item.type === "text") {
+      markdown += `${item.content}\n\n`;
+    } else if (item.type === "thinking") {
+      markdown += `<sub><em>${item.content}</em></sub>\n\n`;
+    }
+  }
+  markdown += "</details>\n\n<details>\n<summary>Commands and Tools</summary>\n\n";
+  for (const item of parsedData) {
+    if (item.type === "tool") {
+      const toolNameValue = item.toolName || "unknown-server__unknown-tool";
+      const [server, toolName] = toolNameValue.split("__", 2);
+      markdown += formatCodexToolCall(server, toolName, item.params || "", item.response || "", item.statusIcon || DEFAULT_STATUS_ICON);
+    } else if (item.type === "bash") {
+      markdown += formatCodexBashCall(item.content || "", item.response || "", item.statusIcon || DEFAULT_STATUS_ICON);
+    }
+  }
+  markdown += "</details>\n\n<details>\n<summary>Information</summary>\n\n";
+  if (usage) {
+    const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
+    const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
+    const totalTokens = inputTokens + outputTokens;
+    if (totalTokens > 0) {
+      markdown += `**Total Tokens Used:** ${totalTokens.toLocaleString()}\n\n`;
+    }
+  }
+  markdown += "</details>\n\n";
+
+  const logEntries = convertToLogEntries(parsedData);
+
+  // Prepend a system init entry so the session preview renders (matches the
+  // legacy path and the Claude/Copilot/Gemini parsers).
+  const model = extractCodexModel(logContent);
+  logEntries.unshift({
+    type: "system",
+    subtype: "init",
+    model: model || undefined,
   });
-  const markdown = conversation.markdown + generateInformationSection(projectSessionResult(canonicalLogEntries));
+
+  // Surface token usage, turn count, and error messages via a result entry so
+  // Statistics, the Information section's Errors list, and the OTEL telemetry
+  // enrichment (agent-stdio.log result line) are populated.
+  if (usage || errorMessages.length > 0) {
+    logEntries.push({
+      type: "result",
+      num_turns: turnCount > 0 ? turnCount : undefined,
+      usage: usage
+        ? {
+            input_tokens: typeof usage.input_tokens === "number" ? usage.input_tokens : undefined,
+            output_tokens: typeof usage.output_tokens === "number" ? usage.output_tokens : undefined,
+            cache_read_input_tokens: typeof usage.cached_input_tokens === "number" ? usage.cached_input_tokens : undefined,
+          }
+        : undefined,
+      errors: errorMessages.length > 0 ? errorMessages : undefined,
+    });
+  }
+
+  const canonicalLogEntries = convertLegacyLogEntriesToCopilotEvents(logEntries, { sourceEngine: "codex" });
 
   return {
     markdown,
@@ -232,191 +503,15 @@ function parseCodexJsonl(logContent, entries = parseLogEntries(logContent) ?? []
 }
 
 /**
- * Keep recognized text observations beside JSON records without splitting the
- * native normalizer's lifecycle/accounting state into independent sessions.
- * @param {string} logContent
- * @param {Array<any>} [entries]
- * @returns {Array<any>}
- */
-function collectCodexMixedRecords(logContent, entries = parseLogEntries(logContent) ?? []) {
-  try {
-    if (Array.isArray(JSON.parse(logContent))) return entries;
-  } catch {
-    // Mixed streams are not a single JSON document.
-  }
-  const records = [];
-  let text = [];
-  let hasFramedResult = false;
-  const accounting = { inlineTokens: 0, hasTokenSnapshot: false };
-  const flushText = () => {
-    const content = text.join("\n");
-    records.push(...parseCodexLegacySession(text, /^model:/m.test(content) ? extractCodexModel(content) : null, accounting));
-    text = [];
-  };
-  const lines = logContent.split("\n");
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index];
-    const resultEnd = codexLegacyResultEnd(lines, index);
-    if (resultEnd !== null) {
-      hasFramedResult = true;
-      text.push(...lines.slice(index, resultEnd + 1));
-      index = resultEnd;
-      continue;
-    }
-    const parsed = parseLogEntries(line);
-    if (parsed && isCodexJsonlFormat([], parsed)) {
-      flushText();
-      records.push(...parsed);
-    } else text.push(line);
-  }
-  flushText();
-  return records.length > 0 || hasFramedResult ? records : entries;
-}
-
-/** @param {string} line @returns {number|undefined} */
-function extractCodexLegacyTokens(line) {
-  const payload = codexLegacyPayload(line);
-  const totalMatch = payload.startsWith("total_tokens:") || payload.includes("TokenCount") ? payload.match(/\btotal_tokens:\s*([\d,]+)/) : null;
-  const match = payload.match(/^tokens\s+used:\s*([\d,]+)\s*$/i) ?? totalMatch;
-  if (!match) return undefined;
-  if (!/^\d+(?:,\d{3})*$/.test(match[1])) return undefined;
-  const count = Number(match[1].replace(/,/g, ""));
-  return Number.isSafeInteger(count) && count >= 0 ? count : undefined;
-}
-
-/**
- * Legacy presentation uses lookahead; canonical observations must instead remain
- * at their source positions, including orphan outcomes and dangling invocations.
- * @param {string[]} lines
- * @param {string|null} model
- * @param {{inlineTokens: number, hasTokenSnapshot: boolean}} [accounting]
- * @returns {import("./types/agent_session").AgentSession}
- */
-function parseCodexLegacySession(lines, model, accounting = { inlineTokens: 0, hasTokenSnapshot: false }) {
-  /** @type {import("./types/agent_session").AgentSession} */
-  const events = [];
-  const metadata = /^(?:OpenAI Codex|--------|workdir:|model:|provider:|approval:|sandbox:|reasoning effort:|reasoning summaries:|DEBUG codex|INFO codex|\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(?:DEBUG|INFO|WARN|ERROR))/;
-  const tool = /^tool\s+([\w-]+)\.([\w-]+)\((.*)\)$/;
-  const oldTool = /^ToolCall:\s+([\w-]+)__([\w-]+)\s+(.*)$/;
-  const exec = /^exec\s+(?:bash\s+-lc\s+'([^']*)'|(.+?)(?: in \/.*)?)$/;
-  const outcome = CODEX_LEGACY_OUTCOME;
-  const boundary = line => {
-    const payload = codexLegacyPayload(line);
-    return (
-      /^(?:thinking|codex|user|tokens used)$/.test(payload) ||
-      metadata.test(line) ||
-      tool.test(payload) ||
-      oldTool.test(payload) ||
-      exec.test(payload) ||
-      outcome.test(payload) ||
-      /^(?:ERROR:|Reconnecting\.\.\.)/.test(payload) ||
-      extractCodexLegacyTokens(line) !== undefined
-    );
-  };
-  const emit = (source, type, data) => events.push(createSessionEvent(source, type, data));
-  const cwd = lines.find(line => line.startsWith("workdir: "))?.slice("workdir: ".length);
-  if (model !== null || cwd !== undefined || lines.some(line => line.startsWith("OpenAI Codex"))) {
-    emit({}, "session.init", { sourceEngine: "codex", model: model ?? undefined, cwd });
-  }
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const payload = codexLegacyPayload(line);
-    const timestamp = line.match(/^\[([^\]]+)\]/)?.[1] ?? line.match(/^(\d{4}-\d{2}-\d{2}T\S+)/)?.[1];
-    const source = timestamp === undefined ? {} : { timestamp };
-    const tokens = extractCodexLegacyTokens(line);
-    if (tokens !== undefined) {
-      if (/^tokens\s+used:/i.test(payload)) {
-        accounting.inlineTokens += tokens;
-        if (!accounting.hasTokenSnapshot && Number.isSafeInteger(accounting.inlineTokens)) emit(source, "session.result", { usage: { total_tokens: accounting.inlineTokens } });
-      } else {
-        accounting.hasTokenSnapshot = true;
-        emit(source, "session.result", { usage: { total_tokens: tokens } });
-      }
-      continue;
-    }
-    if (
-      metadata.test(line) &&
-      !outcome.test(payload) &&
-      !tool.test(payload) &&
-      !oldTool.test(payload) &&
-      !exec.test(payload) &&
-      !["thinking", "codex", "user"].includes(payload) &&
-      !payload.startsWith("ERROR:") &&
-      !payload.startsWith("Reconnecting...")
-    )
-      continue;
-    if (["thinking", "codex", "user"].includes(payload)) {
-      const text = [];
-      while (i + 1 < lines.length && !boundary(lines[i + 1])) text.push(lines[++i]);
-      emit(source, payload === "thinking" ? "assistant.reasoning" : payload === "user" ? "user.message" : "assistant.message", { content: text.join("\n") });
-      continue;
-    }
-    const invocation = payload.match(tool) ?? payload.match(oldTool);
-    const command = payload.match(exec);
-    if (invocation) {
-      let input = invocation[3];
-      try {
-        input = JSON.parse(input);
-      } catch {
-        // Intentional recovery: preserve the original argument text when JSON is malformed or partial.
-      }
-      emit(source, "tool.execution_start", { toolName: invocation[2], mcpServerName: invocation[1], input });
-    } else if (command) {
-      const text = command[1] ?? command[2];
-      emit(source, "tool.execution_start", { toolName: "bash", input: { command: text }, command: text });
-    } else {
-      const completion = payload.match(outcome);
-      if (completion) {
-        const output = [];
-        const resultEnd = codexLegacyResultEnd(lines, i);
-        if (resultEnd !== null) {
-          output.push(...lines.slice(i + 1, resultEnd + 1));
-          i = resultEnd;
-        } else while (i + 1 < lines.length && !boundary(lines[i + 1])) output.push(lines[++i]);
-        const outputText = output.join("\n");
-        let resultFailed = false;
-        try {
-          resultFailed = sessionToolSuccess(JSON.parse(outputText)) === false;
-        } catch {
-          // Plain command output is not a structured MCP result.
-        }
-        emit(source, "tool.execution_complete", {
-          toolName: completion[3] !== undefined ? "bash" : completion[2],
-          mcpServerName: completion[1],
-          success: !["failed", "failure"].includes(completion[4]) && !resultFailed,
-          durationMs: Number(completion[5]) * (completion[6] === "s" ? 1000 : 1),
-          output: outputText,
-        });
-      } else if (payload.startsWith("ERROR:")) {
-        emit(source, "session.result", { errors: [payload.replace(/^ERROR: ?/, "")] });
-      } else {
-        const retry = payload.match(/^Reconnecting\.\.\.\s+(\d+)\/(\d+)\s*\((.*)\)$/);
-        if (retry) emit({ ...source, reconnectAttempt: Number(retry[1]), maxReconnects: Number(retry[2]) }, "session.result", { errors: [retry[3]] });
-        else if (payload === "tokens used") {
-          const count = extractCodexLegacyTokens(`tokens used: ${lines[i + 1] ?? ""}`);
-          if (count !== undefined) {
-            i++;
-            accounting.hasTokenSnapshot = true;
-            emit(source, "session.result", { usage: { total_tokens: count } });
-          }
-        }
-      }
-    }
-  }
-  return events;
-}
-
-/**
  * Parse codex log content and format as markdown
  * @param {string} logContent - The raw log content to parse
- * @param {Array<any>} [parsed] - Already parsed records, when available
  * @returns {{markdown: string, logEntries: Array, mcpFailures: Array<string>, maxTurnsHit: boolean}} Parsed log data
  */
-function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
+function parseCodexLog(logContent) {
   // Newer Codex CLI versions emit a structured JSONL event stream rather than the
   // legacy pretty-printed format. Route those to the dedicated JSONL parser.
-  if (logContent && isCodexJsonlFormat([], parsed)) {
-    return parseCodexJsonl(logContent, parsed);
+  if (logContent && isCodexJsonlFormat(logContent.split("\n"))) {
+    return parseCodexJsonl(logContent);
   }
   if (!logContent) {
     return {
@@ -428,6 +523,7 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
   }
 
   const lines = logContent.split("\n");
+  const parsedData = []; // Array to collect structured data for logEntries conversion
 
   // Look-ahead window size for finding tool results
   // New format has verbose debug logs, so requires larger window
@@ -458,6 +554,7 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
 
   // Second pass: process full conversation flow with interleaved reasoning and tools
   let inThinkingSection = false;
+  let thinkingContent = []; // Collect thinking content in chunks
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -483,6 +580,14 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
 
     // Thinking section starts with standalone "thinking" line
     if (line.trim() === "thinking") {
+      // Save previous thinking content if any
+      if (thinkingContent.length > 0) {
+        parsedData.push({
+          type: "thinking",
+          content: thinkingContent.join("\n"),
+        });
+        thinkingContent = [];
+      }
       inThinkingSection = true;
       continue;
     }
@@ -490,6 +595,14 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
     // Tool call line "tool github.list_pull_requests(...)" (new Codex format without timestamp prefix)
     const toolMatch = line.match(/^tool\s+(\w+)\.(\w+)\((.*)\)$/);
     if (toolMatch) {
+      // Save previous thinking content if any
+      if (inThinkingSection && thinkingContent.length > 0) {
+        parsedData.push({
+          type: "thinking",
+          content: thinkingContent.join("\n"),
+        });
+        thinkingContent = [];
+      }
       inThinkingSection = false;
 
       const server = toolMatch[1];
@@ -542,6 +655,15 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
         }
       }
 
+      // Add to parsedData so this tool call appears in logEntries for the common renderer
+      parsedData.push({
+        type: "tool",
+        toolName: `${server}__${toolName}`,
+        params,
+        response,
+        statusIcon,
+      });
+
       markdown += `${statusIcon} ${server}::${toolName}(...)\n\n`;
       continue;
     }
@@ -549,9 +671,18 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
     // Process thinking content (filter out timestamp lines and very short lines)
     if (inThinkingSection && line.trim().length > 20 && !line.match(/^\d{4}-\d{2}-\d{2}T/)) {
       const trimmed = line.trim();
+      thinkingContent.push(trimmed);
       // Add thinking content directly to markdown with open circle icon and italic styling
       markdown += `<sub><em>${trimmed}</em></sub>\n\n`;
     }
+  }
+
+  // Save any remaining thinking content
+  if (thinkingContent.length > 0) {
+    parsedData.push({
+      type: "thinking",
+      content: thinkingContent.join("\n"),
+    });
   }
 
   markdown += "</details>\n\n<details>\n<summary>Commands and Tools</summary>\n\n";
@@ -621,6 +752,15 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
         }
       }
 
+      // Collect data for logEntries conversion
+      parsedData.push({
+        type: "tool",
+        toolName: `${server}__${toolName}`,
+        params,
+        response,
+        statusIcon,
+      });
+
       // Format the tool call with HTML details
       markdown += formatCodexToolCall(server, toolName, params, response, statusIcon);
     } else if (bashMatch) {
@@ -653,10 +793,18 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
             responseLines.push(respLine);
           }
 
-          response = responseLines.join("\n");
+          response = responseLines.join("\n").trim();
           break;
         }
       }
+
+      // Collect data for logEntries conversion
+      parsedData.push({
+        type: "bash",
+        content: command,
+        response,
+        statusIcon,
+      });
 
       // Format the bash command with HTML details
       markdown += formatCodexBashCall(command, response, statusIcon);
@@ -667,11 +815,23 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
   markdown += "</details>\n\n<details>\n<summary>Information</summary>\n\n";
 
   // Extract metadata from Codex logs
-  const model = extractCodexModel(logContent);
-  const canonicalLogEntries = parseCodexLegacySession(lines, model);
-  const totalTokens = projectSessionResult(canonicalLogEntries)?.usage?.total_tokens;
+  let totalTokens = 0;
 
-  if (totalTokens !== undefined) {
+  // TokenCount(TokenCountEvent { ... total_tokens: 13281 ...
+  const tokenCountMatches = logContent.matchAll(/total_tokens:\s*(\d+)/g);
+  for (const match of tokenCountMatches) {
+    const tokens = parseInt(match[1], 10);
+    totalTokens = Math.max(totalTokens, tokens); // Use the highest value (final total)
+  }
+
+  // Also check for "tokens used\n<number>" at the end (number may have commas)
+  const finalTokensMatch = logContent.match(/tokens used\n([\d,]+)/);
+  if (finalTokensMatch) {
+    // Remove commas before parsing
+    totalTokens = parseInt(finalTokensMatch[1].replace(/,/g, ""), 10);
+  }
+
+  if (totalTokens > 0) {
     markdown += `**Total Tokens Used:** ${totalTokens.toLocaleString()}\n\n`;
   }
 
@@ -683,8 +843,44 @@ function parseCodexLog(logContent, parsed = parseLogEntries(logContent) ?? []) {
   }
   markdown += "</details>\n\n";
 
+  // Convert parsed data to logEntries format
+  const logEntries = convertToLogEntries(parsedData);
+
+  // Always prepend a system init entry so the session preview is shown even for
+  // failed or sparse runs (matches behaviour of Claude, Copilot, and Gemini parsers).
+  const model = extractCodexModel(logContent);
+  logEntries.unshift({
+    type: "system",
+    subtype: "init",
+    model: model || undefined,
+  });
+
+  // When there are no tool calls or thinking entries, surface error messages in the
+  // preview so users can see why the session failed.
+  const hasConversationEntries = logEntries.some(e => e.type !== "system");
+  if (!hasConversationEntries && errorInfo.hasErrors) {
+    for (const message of errorInfo.messages) {
+      logEntries.push({
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: message }],
+        },
+      });
+    }
+    if (errorInfo.reconnectCount > 0) {
+      logEntries.push({
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: `Reconnect attempts: ${errorInfo.reconnectCount}/${errorInfo.maxReconnects}` }],
+        },
+      });
+    }
+  }
+
   // Check for MCP failures
   const mcpFailures = mcpInfo.servers.filter(server => server.status === "failed").map(server => server.name);
+
+  const canonicalLogEntries = convertLegacyLogEntriesToCopilotEvents(logEntries, { sourceEngine: "codex" });
 
   return {
     markdown,
@@ -799,6 +995,5 @@ if (typeof module !== "undefined" && module.exports) {
     extractMCPInitialization,
     extractCodexErrorMessages,
     extractCodexModel,
-    collectCodexMixedRecords,
   };
 }

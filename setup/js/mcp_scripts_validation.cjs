@@ -165,7 +165,7 @@ function validateSchemaNode(value, schema, path, options = {}) {
     /** @type {Array<{path: string, message: string, expected?: string, received?: string}>} */
     const errors = [];
     for (const subSchema of schema.oneOf) {
-      const error = validateSchemaNode(value, subSchema, path, { ...options, skipRequiredAtRoot: false });
+      const error = validateSchemaNode(value, subSchema, path, options);
       if (!error) {
         successCount += 1;
         continue;
@@ -186,7 +186,7 @@ function validateSchemaNode(value, schema, path, options = {}) {
     /** @type {Array<{path: string, message: string, expected?: string, received?: string}>} */
     const errors = [];
     for (const subSchema of schema.anyOf) {
-      const error = validateSchemaNode(value, subSchema, path, { ...options, skipRequiredAtRoot: false });
+      const error = validateSchemaNode(value, subSchema, path, options);
       if (!error) {
         return null;
       }
@@ -228,7 +228,7 @@ function validateSchemaNode(value, schema, path, options = {}) {
     if (!options.skipRequiredAtRoot || path !== "") {
       const required = Array.isArray(schema.required) ? schema.required : [];
       for (const field of required) {
-        if (!Object.prototype.hasOwnProperty.call(value, field)) {
+        if (!(field in value)) {
           return {
             path: formatPath(path, field),
             message: "is required",
@@ -237,13 +237,10 @@ function validateSchemaNode(value, schema, path, options = {}) {
       }
     }
 
-    const properties = Object.create(null);
-    if (isPlainObject(schema.properties)) {
-      Object.assign(properties, schema.properties);
-    }
+    const properties = isPlainObject(schema.properties) ? schema.properties : {};
     if (schema.additionalProperties === false) {
       for (const key of Object.keys(value)) {
-        if (!Object.prototype.hasOwnProperty.call(properties, key)) {
+        if (!(key in properties)) {
           return {
             path: formatPath(path, key),
             message: "is not allowed by the schema",
@@ -253,7 +250,7 @@ function validateSchemaNode(value, schema, path, options = {}) {
     }
 
     for (const [key, propertySchema] of Object.entries(properties)) {
-      if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      if (!(key in value)) {
         continue;
       }
       const nestedError = validateSchemaNode(value[key], propertySchema, formatPath(path, key), options);
