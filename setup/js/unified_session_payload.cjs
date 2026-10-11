@@ -7,7 +7,25 @@ const { COPILOT_WORKFLOW_EVENT_FIELDS } = require("./copilot_workflow_events.cjs
 const { DYNAMIC_WORKFLOW_EVENT_TYPES } = require("./dynamic_workflow_session.cjs");
 const { sessionContext } = require("./agent_session.cjs");
 
-const SCOPED_AGENT_TYPES = new Set(["session.init", "session.start", "user.message", "assistant.message", "assistant.reasoning", "assistant.refusal", "tool.execution_start", "tool.execution_complete", "session.result"]);
+const SCOPED_AGENT_TYPES = new Set([
+  "session.init",
+  "session.start",
+  "session.error",
+  "session.info",
+  "session.shutdown",
+  "session.task_complete",
+  "user.message",
+  "assistant.message",
+  "assistant.reasoning",
+  "assistant.message_update",
+  "assistant.refusal",
+  "tool.execution_start",
+  "tool.execution_update",
+  "tool.execution_complete",
+  "usage.report",
+  "session.result",
+  "model.call_final_result",
+]);
 
 /** @type {Fields} */
 const USAGE_FIELDS = {
@@ -27,6 +45,8 @@ const TOOL_FIELDS = {
   toolCallId: ["toolCallId", "tool_call_id", "tool_use_id"],
   toolName: ["toolName", "tool_name"],
   mcpServerName: ["mcpServerName"],
+  parentToolCallId: ["parentToolCallId"],
+  stepIndex: ["stepIndex", "step_index"],
 };
 /** @type {Fields} */
 const RUNTIME_FIELDS = {
@@ -37,6 +57,10 @@ const RUNTIME_FIELDS = {
   reason: ["reason"],
   requestId: ["requestId", "request_id", "rid"],
 };
+/** @type {Fields} */
+const STEERING_FIELDS = { type: ["type"], threshold: ["threshold"] };
+const STEERING_TYPES = new Set(["ai_credit", "timeout", "token"]);
+const STEERING_THRESHOLDS = new Set([80, 90, 95, 99]);
 /** @type {Fields} */
 const MCP_FIELDS = {
   serverName: ["serverName", "server_name", "server_id"],
@@ -65,6 +89,38 @@ const GRADER_FIELDS = {
   direction: ["direction"],
   threshold: ["threshold"],
   error: ["error"],
+  source: ["source"],
+  enabled: ["enabled"],
+  min: ["min"],
+  max: ["max"],
+  digest: ["digest"],
+  severity: ["severity"],
+  message: ["message"],
+};
+const MODEL_ROUTING_FIELDS = {
+  status: ["status"],
+  source: ["source"],
+  provider: ["provider"],
+  wireModel: ["wire_model", "wireModel"],
+  model: ["model"],
+  effort: ["effort"],
+  appliedEffort: ["applied_effort", "appliedEffort"],
+  effectiveEndpoint: ["effective_endpoint", "effectiveEndpoint", "endpoint"],
+  selectedEndpoint: ["selected_endpoint", "selectedEndpoint"],
+  mode: ["mode"],
+  selectedId: ["selected_id", "selectedId"],
+  routerVersion: ["router_version", "routerVersion"],
+  failureCode: ["failure_code", "failureCode"],
+};
+/** @type {Fields} */
+const EPISODE_LINEAGE_FIELDS = {
+  episodeId: ["episodeId", "episode_id"],
+  hopId: ["hopId", "hop_id"],
+  parentHopId: ["parentHopId", "parent_hop_id"],
+  originEvent: ["originEvent", "origin_event"],
+  rootRepo: ["rootRepo", "root_repo"],
+  rootWorkflowId: ["rootWorkflowId", "root_workflow_id"],
+  rootRunId: ["rootRunId", "root_run_id"],
 };
 /** @type {Fields} */
 const SAFE_OUTPUT_FIELDS = {
@@ -115,17 +171,45 @@ const EVENT_FIELDS = {
   "session.format": { version: ["version"] },
   "agent.execution": { categories: ["categories"], errorCodes: ["errorCodes"], errorTypes: ["errorTypes"], exitCode: ["exitCode", "exit_code"] },
   "session.init": { sourceEngine: ["sourceEngine"], model: ["model", "selectedModel"], sessionId: ["sessionId", "session_id"], cwd: ["cwd"], reasoningEffort: ["reasoningEffort"] },
+  "session.shutdown": {
+    shutdownType: ["shutdownType"],
+    errorReason: ["errorReason"],
+    premiumRequests: ["premiumRequests", "totalPremiumRequests"],
+    totalNanoAiu: ["totalNanoAiu"],
+    totalApiDurationMs: ["totalApiDurationMs"],
+    sessionStartTime: ["sessionStartTime"],
+    currentModel: ["currentModel"],
+  },
+  "session.task_complete": { success: ["success"] },
   "user.message": MESSAGE_FIELDS,
   "prompt.system": { content: ["content"] },
   "prompt.user": { content: ["content"] },
   "assistant.message": MESSAGE_FIELDS,
-  "assistant.refusal": { reason: ["reason"], content: ["content"], policyCategory: ["policyCategory"], explanation: ["explanation"], partial: ["partial"] },
+  "assistant.refusal": { ...MESSAGE_FIELDS, reason: ["reason"], policyCategory: ["policyCategory"], explanation: ["explanation"] },
   "assistant.reasoning": MESSAGE_FIELDS,
-  "tool.execution_start": { ...TOOL_FIELDS, input: ["input", "parameters", "arguments"], command: ["command"] },
+  "assistant.message_update": { ...MESSAGE_FIELDS, sourceType: ["sourceType"], type: ["type"], usageSnapshot: ["usageSnapshot", "usage"] },
+  "tool.execution_start": { ...TOOL_FIELDS, input: ["input", "parameters", "arguments", "argumentText"], inputTruncated: ["inputTruncated"], command: ["command"] },
+  "tool.execution_update": {
+    ...TOOL_FIELDS,
+    input: ["input", "parameters", "arguments"],
+    output: ["output", "partialResult"],
+    partial: ["partial"],
+    delta: ["delta"],
+    contentIndex: ["contentIndex"],
+    sourceType: ["sourceType"],
+    usageSnapshot: ["usageSnapshot"],
+    durationMs: ["durationMs"],
+    status: ["status"],
+    command: ["command"],
+    taskId: ["taskId", "task_id"],
+    taskType: ["taskType", "task_type"],
+    error: ["error"],
+  },
   "tool.execution_complete": {
     ...TOOL_FIELDS,
     success: ["success"],
-    output: ["output", "result"],
+    output: ["output"],
+    result: ["result"],
     error: ["error"],
     durationMs: ["durationMs", "duration_ms"],
     exitCode: ["exitCode", "exit_code"],
@@ -147,12 +231,45 @@ const EVENT_FIELDS = {
     permissionDenials: ["permissionDenials", "permission_denials"],
     agentMetrics: ["agentMetrics"],
   },
+  "session.error": {
+    error: ["error"],
+    message: ["message"],
+    content: ["content"],
+    code: ["code"],
+    statusCode: ["statusCode"],
+    errorType: ["errorType"],
+    model: ["model"],
+    severity: ["severity"],
+    status: ["status"],
+    sourceType: ["sourceType"],
+    exitCode: ["exitCode", "exit_code"],
+  },
+  "session.info": {
+    message: ["message"],
+    content: ["content"],
+    model: ["model"],
+    status: ["status"],
+    sourceType: ["sourceType"],
+    role: ["role"],
+    messageId: ["messageId"],
+    toolCallId: ["toolCallId"],
+    toolName: ["toolName"],
+    usageSnapshot: ["usageSnapshot"],
+    estimatedTokens: ["estimatedTokens"],
+    estimatedTokensDelta: ["estimatedTokensDelta"],
+    cwd: ["cwd"],
+    branch: ["branch"],
+    kind: ["kind"],
+    rateLimitInfo: ["rateLimitInfo", "rate_limit_info"],
+    isAuthenticating: ["isAuthenticating", "is_authenticating"],
+    output: ["output"],
+  },
   "mcp.rpc.request": MCP_FIELDS,
   "mcp.rpc.response": MCP_FIELDS,
   "mcp.difc.filtered": MCP_FIELDS,
   "mcp.guard.blocked": MCP_FIELDS,
   "mcp.tool_call": MCP_FIELDS,
-  "mcp.event": RUNTIME_FIELDS,
+  "mcp.event": { ...RUNTIME_FIELDS, serverName: ["serverName", "server_name"] },
   "firewall.http_access": {
     host: ["host", "domain"],
     method: ["method"],
@@ -161,27 +278,59 @@ const EVENT_FIELDS = {
     bytes: ["bytes"],
     durationMs: ["durationMs", "duration_ms"],
   },
-  "firewall.steering": RUNTIME_FIELDS,
+  "firewall.steering": { ...RUNTIME_FIELDS, threshold: ["threshold"] },
   "firewall.event": RUNTIME_FIELDS,
   "firewall.token_usage": {
     provider: ["provider"],
     model: ["model"],
     purpose: ["purpose"],
     path: ["path", "endpoint"],
+    xInitiator: ["x_initiator", "xInitiator"],
     requestId: ["requestId", "request_id"],
     status: ["status"],
     aic: ["aic", "ai_credits_this_response", "aiCreditsThisResponse"],
     totalAic: ["totalAic", "aiCreditsTotal", "ai_credits_total", "ai_credits", "aiCredits"],
     premiumRequests: ["premiumRequests", "premium_requests"],
     durationMs: ["durationMs", "duration_ms"],
+    steering: ["steering"],
+  },
+  "firewall.model_routing": {
+    schema: ["_schema", "schema"],
+    stage: ["stage"],
+    purpose: ["purpose"],
+    attempt: ["attempt"],
+    classifierModel: ["classifier_model", "classifierModel"],
+    classifierEffort: ["classifier_effort", "classifierEffort"],
+    objective: ["objective"],
+    provider: ["provider"],
+    labels: ["labels"],
+    mode: ["mode"],
+    classifierAttempts: ["classifier_attempts", "classifierAttempts"],
+    degradedClassification: ["degraded_classification", "degradedClassification"],
+    degradedReason: ["degraded_reason", "degradedReason"],
+    selectedId: ["selected_id", "selectedId"],
+    selectedProvider: ["selected_provider", "selectedProvider"],
+    selectedModel: ["selected_model", "selectedModel"],
+    selectedEffort: ["selected_effort", "selectedEffort"],
+    wireModel: ["wire_model", "wireModel"],
+    endpoint: ["endpoint"],
+    router: ["router"],
+    latencyMs: ["latency_ms", "latencyMs"],
+    code: ["code"],
+    requestId: ["request_id", "requestId"],
+    routed: ["routed"],
+    deviations: ["deviations"],
+    requestedModel: ["requested_model", "requestedModel"],
+    requestedEffort: ["requested_effort", "requestedEffort"],
+    outcome: ["outcome"],
   },
   "safe_output.request": SAFE_OUTPUT_FIELDS,
   "safe_output.result": SAFE_OUTPUT_FIELDS,
   "safe_output.error": SAFE_OUTPUT_FIELDS,
   "experiment.state": { runId: ["runId", "run_id"], assignments: ["assignments"], counts: ["counts"] },
-  "grader.manifest": {},
+  "grader.manifest": { version: ["version"] },
   "grader.result": GRADER_FIELDS,
-  "eval.result": { id: ["id"], answer: ["answer"], model: ["model"], error: ["error"] },
+  "eval.result": { id: ["id"], answer: ["answer"], model: ["model"], error: ["error"], runId: ["runId", "runid", "run_id"], assignments: ["assignments", "experiments"] },
   "github_api.rate_limit": {
     source: ["source"],
     credentialSource: ["credentialSource", "credential_source"],
@@ -218,15 +367,27 @@ const EVENT_FIELDS = {
     cliVersion: ["cliVersion", "cli_version"],
     awfVersion: ["awfVersion", "awf_version"],
     mcpgVersion: ["mcpgVersion", "mcpg_version", "awmg_version"],
-    requestedModel: ["requestedModel", "model"],
+    model: ["model"],
+    requestedModel: ["requested_model", "requestedModel", "model"],
+    modelRouting: ["modelRouting", "model_routing"],
     triggerType: ["triggerType", "event_name"],
     workflow: ["workflow", "workflow_name"],
     repository: ["repository"],
     runId: ["runId", "run_id"],
+    episode: ["episode"],
+  },
+  "model_routing.outcome": {
+    status: ["status"],
+    wireModel: ["wire_model", "wireModel"],
+    effectiveEndpoint: ["effective_endpoint", "effectiveEndpoint", "endpoint"],
+    selectedEndpoint: ["selected_endpoint", "selectedEndpoint"],
+    effort: ["effort"],
+    appliedEffort: ["applied_effort", "appliedEffort"],
+    failureCode: ["failure_code", "failureCode"],
   },
 };
 EVENT_FIELDS["session.start"] = EVENT_FIELDS["session.init"];
-EVENT_FIELDS["usage.report"] = EVENT_FIELDS["firewall.token_usage"];
+EVENT_FIELDS["usage.report"] = { ...EVENT_FIELDS["firewall.token_usage"], stepIndex: ["stepIndex", "step_index"] };
 for (const type of Object.values(DYNAMIC_WORKFLOW_EVENT_TYPES)) {
   EVENT_FIELDS[type] = TASK_FIELDS;
 }
@@ -244,6 +405,11 @@ function selectFields(value, fields) {
     if (alias !== undefined) result[key] = structuredClone(value[alias]);
   }
   return result;
+}
+
+/** @param {Record<string, any>} record @returns {any} */
+function evalResultRunId(record) {
+  return EVENT_FIELDS["eval.result"].runId.reduce((runId, alias) => runId ?? record[alias], undefined);
 }
 
 /** @param {any} source @param {Record<string, any>} data @param {Record<string, any>} usage */
@@ -279,9 +445,27 @@ function normalizeUnifiedSessionEvent(event, phase) {
   const source = event.data;
   const known = Object.hasOwn(EVENT_FIELDS, event.type);
   const data = known ? selectFields(source, EVENT_FIELDS[event.type]) : structuredClone(source);
-  if (SCOPED_AGENT_TYPES.has(event.type) || (Object.hasOwn(COPILOT_WORKFLOW_EVENT_FIELDS, event.type) && event.type.startsWith("subagent."))) {
-    for (const [key, value] of Object.entries(sessionContext(event))) if (!Object.hasOwn(data, key)) data[key] = value;
+  if (event.type === "workflow.info") {
+    const modelRouting = source.modelRouting ?? source.model_routing;
+    if (modelRouting && typeof modelRouting === "object" && !Array.isArray(modelRouting)) {
+      data.modelRouting = selectFields(modelRouting, MODEL_ROUTING_FIELDS);
+    }
+    const episode = Object.hasOwn(source, "episode") ? source.episode : source.context;
+    if (episode && typeof episode === "object" && !Array.isArray(episode)) {
+      const lineage = selectFields(episode, EPISODE_LINEAGE_FIELDS);
+      if (Object.keys(lineage).length || Object.hasOwn(source, "episode")) data.episode = lineage;
+    }
   }
+  if (SCOPED_AGENT_TYPES.has(event.type) || (Object.hasOwn(COPILOT_WORKFLOW_EVENT_FIELDS, event.type) && event.type.startsWith("subagent."))) {
+    const parentToolCallId = Object.hasOwn(source, "parentToolCallId") ? source.parentToolCallId : event.parentToolCallId;
+    const hasParentToolUseId = ["parentToolUseId", "parent_tool_use_id"].some(key => Object.hasOwn(source, key) || Object.hasOwn(event, key));
+    for (const [key, value] of Object.entries(sessionContext(event))) {
+      if (key === "parentToolUseId" && parentToolCallId !== undefined && !hasParentToolUseId) continue;
+      if (!Object.hasOwn(data, key)) data[key] = value;
+    }
+    if (parentToolCallId !== undefined && !Object.hasOwn(data, "parentToolCallId")) data.parentToolCallId = structuredClone(parentToolCallId);
+  }
+  if (event.type === "session.task_complete" && Object.hasOwn(source, "summary") && typeof source.summary !== "string") data.summary = structuredClone(source.summary);
   if (known && event.type.startsWith("dynamicWorkflows.")) {
     if (!Object.hasOwn(data, "status") && source.patch?.status !== undefined) data.status = structuredClone(source.patch.status);
     const usage = selectFields(source.usage, { totalTokens: ["totalTokens", "total_tokens"], toolUses: ["toolUses", "tool_uses"], durationMs: ["durationMs", "duration_ms"] });
@@ -305,7 +489,7 @@ function normalizeUnifiedSessionEvent(event, phase) {
       );
     }
   }
-  if (event.type === "user.message" || event.type === "assistant.message" || event.type === "assistant.reasoning") {
+  if (event.type === "user.message" || event.type === "assistant.message" || event.type === "assistant.reasoning" || event.type === "assistant.refusal") {
     const metadata = selectFields(event, MESSAGE_FIELDS);
     delete metadata.content;
     for (const [key, value] of Object.entries(metadata)) if (!Object.hasOwn(data, key)) data[key] = value;
@@ -335,6 +519,12 @@ function normalizeUnifiedSessionEvent(event, phase) {
       }
     }
     if (event.type === "usage.report" && phase !== undefined && AIC_RESOLVABLE_PHASES.has(phase)) resolveUsageAic(source, data, usage);
+    if (Object.hasOwn(data, "steering")) {
+      // Keep only the AWF steering notice type and threshold; drop unrecognized notices.
+      const steering = data.steering && typeof data.steering === "object" && !Array.isArray(data.steering) ? selectFields(data.steering, STEERING_FIELDS) : {};
+      if (STEERING_TYPES.has(steering.type) && STEERING_THRESHOLDS.has(steering.threshold)) data.steering = steering;
+      else delete data.steering;
+    }
   }
   if (event.type === "tool.execution_complete" && (source.is_error === true || source.result?.isError === true || source.result?.is_error === true)) data.isError = true;
   if (event.type === "experiment.assignment") {
@@ -342,7 +532,17 @@ function normalizeUnifiedSessionEvent(event, phase) {
     data.assignments = structuredClone(source.assignments ?? source);
   }
   if (event.type === "grader.manifest" && Array.isArray(source.graders)) data.graders = source.graders.map(grader => selectFields(grader, GRADER_FIELDS));
-  if (event.type === "grader.result" && Array.isArray(source.results)) data.results = source.results.map(result => selectFields(result, GRADER_FIELDS));
+  if (event.type === "grader.result") {
+    if (source.version !== undefined) data.version = structuredClone(source.version);
+    if (source.run !== undefined) data.run = source.run === null ? null : selectFields(source.run, { id: ["id"], attempt: ["attempt"], graderCount: ["graderCount"], passed: ["passed"], failed: ["failed"], errors: ["errors"] });
+    const projectResult = result => ({
+      ...selectFields(result, GRADER_FIELDS),
+      ...(result?.implementation !== undefined ? { implementation: result.implementation === null ? null : selectFields(result.implementation, { id: ["id"], version: ["version"], digest: ["digest"] }) } : {}),
+      ...(Array.isArray(result?.metrics) ? { metrics: result.metrics.map(metric => selectFields(metric, { id: ["id"], value: ["value"] })) } : {}),
+    });
+    Object.assign(data, projectResult(source));
+    if (Array.isArray(source.results)) data.results = source.results.map(projectResult);
+  }
   if (event.type === "safe_output.error") {
     const errors = source.errors ?? source.failures;
     if (Array.isArray(errors)) data.errors = errors.map(error => (error && typeof error === "object" && !Array.isArray(error) ? selectFields(error, SAFE_OUTPUT_FIELDS) : structuredClone(error)));
@@ -358,4 +558,4 @@ function normalizeUnifiedSessionEvent(event, phase) {
   };
 }
 
-module.exports = { normalizeUnifiedSessionEvent };
+module.exports = { normalizeUnifiedSessionEvent, evalResultRunId };

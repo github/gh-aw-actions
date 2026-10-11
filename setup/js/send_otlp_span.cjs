@@ -4,7 +4,7 @@
 const childProcess = require("child_process");
 const { randomBytes } = require("crypto");
 const fs = require("fs");
-const { buildWorkflowCallId } = require("./aw_context.cjs");
+const { buildWorkflowCallId, resolveParentHopId } = require("./aw_context.cjs");
 const path = require("path");
 const { nowMs } = require("./performance_now.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
@@ -15,7 +15,7 @@ const { resolveAICreditsFailureState } = require("./ai_credits_context.cjs");
 const { collectCodexMixedRecords } = require("./parse_codex_log.cjs");
 const { normalizeCodexSession } = require("./codex_session.cjs");
 const { projectSessionResult, observedSessionModel } = require("./agent_session.cjs");
-const { resolveEffectiveModel } = require("./model_attribution.cjs");
+const { resolveEffectiveModel, resolveModelRoutingSummary } = require("./model_attribution.cjs");
 
 function getGhAwPath(relativePath) {
   const root = (process.env.GH_AW_TMP_DIR || "").trim() || "/tmp/gh-aw";
@@ -244,7 +244,7 @@ function buildEpisodeAttributesFromContext(awInfo, runId, runAttempt) {
   const currentHopId = buildCurrentWorkflowCallId(runId, runAttempt);
   const inheritedHopId = readContextString(awInfo.context?.hop_id) || readContextString(awInfo.context?.workflow_call_id);
   const episodeId = readContextString(awInfo.context?.episode_id) || inheritedHopId || currentHopId;
-  const parentHopId = readContextString(awInfo.context?.parent_hop_id) || (inheritedHopId && inheritedHopId !== currentHopId ? inheritedHopId : "");
+  const parentHopId = resolveParentHopId(awInfo.context, currentHopId);
   const originEvent = readContextString(awInfo.context?.origin_event) || readContextString(awInfo.context?.event_type);
   const rootRepo = readContextString(awInfo.context?.root_repo) || readContextString(awInfo.context?.repo);
   const rootWorkflowId = readContextString(awInfo.context?.root_workflow_id) || readContextString(awInfo.context?.workflow_id);
@@ -2196,6 +2196,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const bodyModified = typeof awInfo.body_modified === "boolean" ? awInfo.body_modified : parseBooleanEnv(process.env.GH_AW_INFO_BODY_MODIFIED);
   const trackerId = process.env.GH_AW_TRACKER_ID || awInfo.tracker_id || "";
   const jobName = resolveConclusionJobName(spanName);
+  const modelRoutingSummary = jobName === "agent" ? resolveModelRoutingSummary({ infoPath: getGhAwPath("aw_info.json"), ghAwDir: getGhAwPath("") }) : null;
   const jobEmitsOwnTokenUsage = jobName === "agent" || jobName === "detection" || (!!engineId && jobName === engineId);
   const runId = process.env.GITHUB_RUN_ID || "";
   const runAttempt = awInfo.run_attempt || process.env.GITHUB_RUN_ATTEMPT || "1";
@@ -2362,9 +2363,19 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   if (modelAttribution.routing) {
     if (modelAttribution.requestedModel) attributes.push(buildAttr("gh-aw.model.requested", modelAttribution.requestedModel));
     if (modelAttribution.effort) attributes.push(buildAttr("gh-aw.model.effort", modelAttribution.effort));
-    attributes.push(buildAttr("gh-aw.model_routing.status", modelAttribution.routing.status));
-    if (modelAttribution.routing.mode) attributes.push(buildAttr("gh-aw.model_routing.mode", modelAttribution.routing.mode));
-    if (modelAttribution.routing.router_version) attributes.push(buildAttr("gh-aw.model_routing.router_version", modelAttribution.routing.router_version));
+  }
+  if (modelRoutingSummary) {
+    attributes.push(buildAttr("gh-aw.model_routing.status", modelRoutingSummary.status));
+    if (modelRoutingSummary.mode) attributes.push(buildAttr("gh-aw.model_routing.mode", modelRoutingSummary.mode));
+    if (modelRoutingSummary.router_version) attributes.push(buildAttr("gh-aw.model_routing.router_version", modelRoutingSummary.router_version));
+    if (modelRoutingSummary.failure_code) attributes.push(buildAttr("gh-aw.model_routing.failure_code", modelRoutingSummary.failure_code));
+    if (modelRoutingSummary.objective) attributes.push(buildAttr("gh-aw.model_routing.objective", modelRoutingSummary.objective));
+    if (modelRoutingSummary.task_type) attributes.push(buildAttr("gh-aw.model_routing.task_type", modelRoutingSummary.task_type));
+    if (modelRoutingSummary.scope) attributes.push(buildAttr("gh-aw.model_routing.scope", modelRoutingSummary.scope));
+    if (modelRoutingSummary.complexity) attributes.push(buildAttr("gh-aw.model_routing.complexity", modelRoutingSummary.complexity));
+    if (typeof modelRoutingSummary.degraded === "boolean") attributes.push(buildAttr("gh-aw.model_routing.degraded", modelRoutingSummary.degraded));
+    if (typeof modelRoutingSummary.classifier_aic === "number") attributes.push(buildDoubleAttr("gh-aw.model_routing.classifier_aic", modelRoutingSummary.classifier_aic));
+    if (typeof modelRoutingSummary.deviated_requests === "number") attributes.push(buildAttr("gh-aw.model_routing.deviated_requests", modelRoutingSummary.deviated_requests));
   }
   if (trackerId) attributes.push(buildAttr("gh-aw.tracker.id", trackerId));
   if (eventName) attributes.push(buildAttr("gh-aw.event_name", eventName));

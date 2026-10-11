@@ -3,17 +3,20 @@
 const log = require("./work_queue_logging.cjs").createWorkQueueLogger("replay");
 
 const { createHash } = require("node:crypto");
-const { canonical, canonicalBytes, closed, fingerprint, identity, integer, parseStrictJSON, queueError, utf8Compare, validateReason } = require("./work_queue_codec.cjs");
+const { deflateRawSync, inflateRawSync } = require("node:zlib");
+const { canonical, canonicalBytes, closed, digest, fingerprint, identity, integer, parseStrictJSON, queueError, utf8Compare, validateReason } = require("./work_queue_codec.cjs");
 const { boundedBytes, checkLedgerBudget } = require("./work_queue_limits.cjs");
 const { indexesFor, trackState, untrackState, updateIndexes } = require("./work_queue_indexes.cjs");
 const { validateEffectResourceAuthority } = require("./work_queue_resource_scope.cjs");
 const { applyIssueBinding } = require("./work_queue_issue_contract.cjs");
+const { initializeDeployments, validateDeployment, applyDeployment, admissionProfile, serializeDeployments, restoreDeployments } = require("./work_queue_deployment.cjs");
 const {
   actorFromContext,
   bindingAuthority,
   claimAuthority,
   decimal,
   defaultPolicy,
+  dispatchPrincipal,
   freshClocks,
   normalizeTrustedContext,
   poolPolicy,
@@ -41,10 +44,11 @@ const {
 
 const OP_FIELDS = {
   Policy: [["kind", "epoch", "policy"], []],
+  Deployment: [["kind", "pool", "worker_profile", "expected_ref", "expected_contract", "profile", "available", "reason"], ["activate"]],
   Control: [["kind", "control", "value", "reason"], []],
   Work: [
     ["kind", "work_id", "graph_id", "node_key", "pool", "priority", "fairness_key", "worker_profile", "batch_trust_domain", "payload", "depends_on", "enqueued"],
-    ["subject", "backing_issue", "replacement_of"],
+    ["subject", "backing_issue", "replacement_of", "logical_contract", "execution_ref"],
   ],
   Claim: [["kind", "work_id", "claim_id", "dispatch_id", "handle", "observations"], []],
   Completion: [["kind", "work_id", "claim_id", "dispatch_id", "claim_handle", "run_id", "run_attempt"], []],
@@ -59,9 +63,10 @@ const OP_FIELDS = {
   WorkPriority: [["kind", "work_id", "priority", "expected_priority", "reason"], []],
   Dispatch: [
     ["kind", "dispatch_id", "state"],
-    ["sender", "run", "evidence", "reason"],
+    ["sender", "run", "evidence", "reason", "credential_principal"],
   ],
   Release: [["kind", "dispatch_id", "evidence"], []],
+  Checkpoint: [["kind", "prior_git_sha", "prior_tip", "history_sha256", "state_sha256", "state"], []],
   IssueLink: [["kind", "work_id", "resource", "projector_ref"], ["claim_id"]],
   IssueComment: [
     ["kind", "work_id", "comment_id", "projector_ref"],
@@ -71,8 +76,9 @@ const OP_FIELDS = {
 
 const REQUEST_KINDS = {
   policy: ["Policy"],
+  deployment: ["Deployment"],
   control: ["Control", "WorkPriority"],
-  submit: ["Work"],
+  submit: ["Policy", "Work"],
   dispatch_next: ["Observation", "Claim"],
   finish: ["Completion", "ClaimCancellation", "WorkCancellation"],
   observe: ["Observation"],
@@ -82,11 +88,13 @@ const REQUEST_KINDS = {
   delivery_failure: ["DeliveryFailure"],
   cancel_work: ["WorkCancellation"],
   cancel_claim: ["ClaimCancellation", "WorkCancellation"],
+  checkpoint: ["Checkpoint"],
   issue_link: ["IssueLink", "IssueComment"],
 };
 
 const OP_ROLES = {
-  Policy: ["administrator"],
+  Policy: ["administrator", "producer", "dispatcher"],
+  Deployment: ["administrator", "producer", "dispatcher"],
   Control: ["administrator"],
   Work: ["producer", "dispatcher", "worker", "administrator"],
   Claim: ["dispatcher", "administrator", "worker"],
@@ -99,6 +107,7 @@ const OP_ROLES = {
   WorkPriority: ["administrator"],
   Dispatch: ["dispatcher", "worker", "reconciler"],
   Release: ["reconciler"],
+  Checkpoint: ["administrator"],
   IssueLink: ["projector"],
   IssueComment: ["projector"],
 };
@@ -136,6 +145,10 @@ function validateOperation(operation) {
   if (Object.hasOwn(operation, "evidence")) validateEvidence(operation.evidence);
   if (Object.hasOwn(operation, "run")) validateRunBinding(operation.run);
   if (Object.hasOwn(operation, "sender")) validateActor(operation.sender);
+  if (Object.hasOwn(operation, "credential_principal")) {
+    decimal(operation.credential_principal, "dispatch credential principal", "run_binding_conflict");
+    if (operation.state !== "started") throw queueError("run_binding_conflict", "dispatch credential principal is immutable after launch");
+  }
   if (["IssueLink", "IssueComment"].includes(operation.kind)) {
     if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(operation.projector_ref)) throw queueError("projection_unauthorized", "projection requires an immutable revision");
     if (operation.kind === "IssueLink") validateResource(operation.resource);
@@ -143,6 +156,21 @@ function validateOperation(operation) {
     if (operation.authority_claim_id !== undefined) identity(operation.authority_claim_id, "authority Claim");
   }
   if (operation.kind === "Policy") validatePolicy(operation.policy);
+  if (operation.kind === "Deployment") validateDeployment(operation);
+  if (operation.logical_contract !== undefined && !/^[a-f0-9]{64}$/.test(operation.logical_contract)) throw queueError("work_invalid", "invalid Work logical contract");
+  if (operation.execution_ref !== undefined && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(operation.execution_ref)) throw queueError("work_invalid", "Work execution pin must be immutable");
+  if (operation.kind === "Checkpoint") {
+    identity(operation.prior_tip, "prior tip");
+    if (
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(operation.prior_git_sha) ||
+      !/^[a-f0-9]{64}$/.test(operation.history_sha256) ||
+      !/^[a-f0-9]{64}$/.test(operation.state_sha256) ||
+      !operation.state ||
+      typeof operation.state !== "object" ||
+      Array.isArray(operation.state)
+    )
+      throw queueError("checkpoint_invalid", "checkpoint requires bounded state, history digest and prior Git commit SHA");
+  }
   if (operation.kind === "WorkPriority") {
     integer(operation.priority, 1, 5, "priority");
     integer(operation.expected_priority, 1, 5, "expected priority");
@@ -191,7 +219,12 @@ function validateRequest(request, actor) {
     if (!Array.isArray(request.parameters.nodes) || !request.parameters.nodes.length || request.parameters.nodes.length > 256) throw queueError("request_invalid", "submit requires 1..256 immutable Work nodes");
     for (const node of request.parameters.nodes) validateOperation(node);
   } else if (request.kind === "dispatch_next") {
-    closed(request.parameters, ["pool", "max_claims", "max_dispatches", "max_bytes"], [], "dispatch parameters");
+    closed(request.parameters, ["pool", "max_claims", "max_dispatches", "max_bytes"], ["worker_profiles"], "dispatch parameters");
+    if (request.parameters.worker_profiles !== undefined) {
+      if (!Array.isArray(request.parameters.worker_profiles) || request.parameters.worker_profiles.length > 256 || new Set(request.parameters.worker_profiles).size !== request.parameters.worker_profiles.length)
+        throw queueError("request_invalid", "dispatch worker allowlist requires bounded unique profiles");
+      for (const name of request.parameters.worker_profiles) identity(name, "worker profile");
+    }
     identity(request.parameters.pool, "pool");
     integer(request.parameters.max_claims, 1, 256, "max_claims");
     integer(request.parameters.max_dispatches, 1, 256, "max_dispatches");
@@ -201,6 +234,11 @@ function validateRequest(request, actor) {
     identity(request.parameters.dispatch_id, "dispatch ID");
     identity(request.parameters.claim_handle, "Claim handle");
     if (!["completed", "cancelled"].includes(request.parameters.outcome)) throw queueError("request_invalid", "finish outcome must be completed or cancelled");
+  } else if (request.kind === "checkpoint") {
+    closed(request.parameters, ["prior_git_sha", "prior_tip", "history_sha256", "state_sha256"], [], "checkpoint parameters", "checkpoint_invalid");
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(request.parameters.prior_git_sha) || !/^[a-f0-9]{64}$/.test(request.parameters.history_sha256) || !/^[a-f0-9]{64}$/.test(request.parameters.state_sha256))
+      throw queueError("checkpoint_invalid", "invalid prior Git SHA or state/history digest");
+    identity(request.parameters.prior_tip, "prior tip");
   } else {
     closed(request.parameters, ["operations"], [], "operation parameters");
     if (!Array.isArray(request.parameters.operations) || !request.parameters.operations.length || request.parameters.operations.length > 256) throw queueError("request_invalid", "request requires bounded nonempty operations");
@@ -241,8 +279,25 @@ function validateCommit(commit) {
     if (!REQUEST_KINDS[commit.request.kind].includes(operation.kind) || !OP_ROLES[operation.kind].includes(commit.actor.role))
       throw queueError("unauthorized_operation", `${commit.actor.role} cannot publish ${operation.kind} through ${commit.request.kind}`);
   }
-  if (commit.request.kind === "submit" && canonical(commit.request.parameters.nodes) !== canonical(commit.operations)) throw queueError("request_invalid", "submission differs from validated stable semantics");
-  if (!["submit", "dispatch_next", "finish"].includes(commit.request.kind) && canonical(commit.request.parameters.operations) !== canonical(commit.operations))
+  if (commit.request.kind === "submit") {
+    const ordinary = canonical(commit.request.parameters.nodes) === canonical(commit.operations);
+    const bootstrap = commit.operations[0]?.kind === "Policy" && commit.operations.slice(1).every(operation => operation.kind === "Work") && canonical(commit.request.parameters.nodes) === canonical(commit.operations.slice(1));
+    if (!ordinary && !bootstrap) throw queueError("request_invalid", "submission differs from validated stable semantics");
+  }
+  if (
+    commit.request.kind === "checkpoint" &&
+    (commit.operations.length !== 1 ||
+      commit.operations[0].kind !== "Checkpoint" ||
+      canonical(commit.request.parameters) !==
+        canonical({
+          prior_git_sha: commit.operations[0].prior_git_sha,
+          prior_tip: commit.operations[0].prior_tip,
+          history_sha256: commit.operations[0].history_sha256,
+          state_sha256: commit.operations[0].state_sha256,
+        }))
+  )
+    throw queueError("checkpoint_invalid", "checkpoint archive differs from stable request");
+  if (!["submit", "dispatch_next", "finish", "checkpoint"].includes(commit.request.kind) && canonical(commit.request.parameters.operations) !== canonical(commit.operations))
     throw queueError("request_invalid", "operations differ from validated stable semantics");
   if (canonicalBytes(commit) > 8 * 1024 * 1024) throw queueError("resource_limit", "QueueCommit exceeds parser bound");
   return commit;
@@ -292,9 +347,12 @@ function newState() {
     works: new Map(),
     claims: new Map(),
     dispatches: new Map(),
+    deployments: new Map(),
     observations: new Map(),
     observationsById: new Map(),
     requests: new Map(),
+    workCreators: new Map(),
+    claimExplanations: new Map(),
     clocks: new Map(),
     admission_paused: false,
     grants_paused: false,
@@ -339,8 +397,17 @@ function validateWorkerContinuation(state, context) {
 function assertEvidence(state, dispatch, evidence, at, kind) {
   validateEvidence(evidence);
   boundedBytes(evidence, state.policy.limits.evidence_bytes, "lifecycle evidence");
-  const profile = poolPolicy(state, dispatch.pool).profiles[dispatch.worker_profile];
-  if (evidence.kind !== kind || evidence.checked_at > at || evidence.repository !== dispatchRepository(state, dispatch) || evidence.workflow !== profile.workflow || evidence.ref !== profile.ref || evidence.principal !== profile.principal)
+  const profile = dispatch.profile;
+  const principal = dispatchPrincipal(dispatch);
+  if (
+    evidence.kind !== kind ||
+    evidence.checked_at > at ||
+    evidence.repository !== dispatchRepository(state, dispatch) ||
+    evidence.workflow !== profile.workflow ||
+    evidence.ref !== profile.ref ||
+    (principal !== undefined && evidence.principal !== principal) ||
+    (principal === undefined && (state.policy.authorization !== "aw" || dispatch.state !== "reserved" || kind !== "prelaunch"))
+  )
     throw queueError("evidence_invalid", "evidence scope or timestamp does not match reservation");
   if (kind === "terminal_run" || kind === "delivery") {
     if (!dispatch.run || evidence.run_id !== dispatch.run.run_id || evidence.run_attempt !== 1) throw queueError("evidence_invalid", "evidence does not name the exact bound native attempt");
@@ -442,7 +509,7 @@ function applyLifecycle(state, operation, commit) {
         )
           throw queueError("claim_scope_invalid", "selected Claim is no longer this Work's current owner; refresh state");
       }
-      if (commit.actor.role === "producer") {
+      if (commit.actor.role === "producer" && state.policy.authorization !== "aw") {
         const rule = state.policy.producers[commit.actor.principal];
         if (!rule || !rule.pools.includes(work.pool) || !rule.priorities.includes(work.priority) || !rule.fairness_keys.includes(work.fairness_key))
           throw queueError("admission_unauthorized", "producer cannot cancel another accounting scope");
@@ -508,7 +575,7 @@ function applyLifecycle(state, operation, commit) {
     }
     case "Dispatch": {
       if (!dispatch || dispatch.released) throw queueError("dispatch_invalid", "dispatch reservation is absent or released");
-      const profile = poolPolicy(state, dispatch.pool).profiles[dispatch.worker_profile];
+      const profile = dispatch.profile;
       const writes = (state.lifecycleWrites.get(dispatch.dispatch_id) ?? 0) + 1;
       if (writes > poolPolicy(state, dispatch.pool).reconciliation.max_attempts + 4) throw queueError("resource_limit", "dispatch reconciliation write budget exhausted");
       if (operation.state === "started") {
@@ -526,11 +593,17 @@ function applyLifecycle(state, operation, commit) {
         )
           throw queueError("dispatch_invalid", "start marker must select exactly one authenticated approved sender");
         dispatch.sender = operation.sender;
+        if (profile.principal === undefined) {
+          if (state.policy.authorization !== "aw" || !operation.credential_principal) throw queueError("run_binding_conflict", "AW launch requires the selected credential principal");
+        } else if (operation.credential_principal !== undefined && operation.credential_principal !== profile.principal) {
+          throw queueError("run_binding_conflict", "selected credential principal differs from approved profile");
+        }
+        if (operation.credential_principal !== undefined) dispatch.credential_principal = operation.credential_principal;
       } else if (operation.state === "bound") {
         if (!["started", "uncertain", "unresolved", "bound"].includes(dispatch.state) || !operation.run || operation.sender || !operation.evidence)
           throw queueError("dispatch_invalid", "binding requires a committed start marker and exact authenticated native run evidence");
         const run = operation.run;
-        if (run.repository !== dispatchRepository(state, dispatch) || run.workflow !== profile.workflow || run.ref !== profile.ref || run.principal !== profile.principal)
+        if (run.repository !== dispatchRepository(state, dispatch) || run.workflow !== profile.workflow || run.ref !== profile.ref || run.principal !== dispatchPrincipal(dispatch))
           throw queueError("run_binding_conflict", "native run scope differs from approved profile");
         const evidence = operation.evidence;
         assertEvidence(state, dispatch, evidence, commit.at, evidence.kind);
@@ -557,6 +630,7 @@ function applyLifecycle(state, operation, commit) {
         if (operation.state === "unresolved") {
           if (!operation.evidence || operation.evidence.kind !== "reconciliation" || (operation.evidence.attempts ?? 0) < poolPolicy(state, dispatch.pool).reconciliation.max_attempts)
             throw queueError("reconciliation_pending", "unresolved requires bounded reconciliation evidence");
+          assertEvidence(state, dispatch, operation.evidence, commit.at, "reconciliation");
         }
       }
       dispatch.state = operation.state;
@@ -618,31 +692,443 @@ function replayTransactions(transactions) {
   return replayOrdered(causalChain(transactions));
 }
 
+function checkpointSnapshot(state, lastAt) {
+  const projection = serializeProjection(state);
+  projection.clocks = Object.fromEntries(
+    Object.entries(projection.clocks).filter(([, clocks]) => clocks.classes.v !== "0" || Object.keys(clocks.classes.pass).length > 0 || Object.values(clocks.keys).some(clock => clock.v !== "0" || Object.keys(clock.pass).length > 0))
+  );
+  const object = map => Object.fromEntries(map);
+  const receipts = [...state.requests.values()].map(commit => {
+    const claims = commit.operations.filter(operation => operation.kind === "Claim");
+    const checkpointPriorTip = commit.checkpoint_prior_tip ?? commit.operations.find(operation => operation.kind === "Checkpoint")?.prior_tip;
+    const events =
+      commit.checkpoint_events ??
+      commit.operations.map(operation => {
+        if (operation.kind === "Deployment") return structuredClone(operation);
+        const fields = [
+          "kind",
+          "work_id",
+          "logical_contract",
+          "execution_ref",
+          "claim_id",
+          "dispatch_id",
+          "credential_principal",
+          "claim_handle",
+          "completion_id",
+          "state",
+          "reason",
+          "disposition",
+          "control",
+          "value",
+          "observation_id",
+          "observations",
+          "run",
+          "run_id",
+          "run_attempt",
+          "evidence",
+          "trace",
+        ];
+        const event = Object.fromEntries(Object.entries(operation).filter(([field, value]) => fields.includes(field) && (field !== "state" || typeof value === "string") && (field !== "observations" || value.length > 0)));
+        if (event.evidence) {
+          const { receipt, ...evidence } = event.evidence;
+          event.evidence = evidence;
+        }
+        return event;
+      });
+    return {
+      id: commit.id,
+      previous: commit.previous,
+      request_id: commit.request.id,
+      kind: commit.request.kind,
+      ...(commit.request.kind === "checkpoint" ? { prior_tip: checkpointPriorTip } : {}),
+      fingerprint: commit.request.fingerprint,
+      parameters_digest: commit.compacted_parameters_digest ?? digest(commit.request.parameters),
+      ...(commit.request.kind === "dispatch_next" ? { dispatch_parameters: commit.request.parameters } : {}),
+      actor: commit.actor,
+      policy_epoch: commit.policy_epoch,
+      at: commit.at,
+      events,
+      claim_explanations: claims.map(claim => {
+        const explanation = state.claimExplanations.get(claim.claim_id);
+        if (!explanation) throw queueError("checkpoint_invalid", "claim inspection provenance is missing");
+        return explanation;
+      }),
+    };
+  });
+  const completionTimes = Object.fromEntries([...state.works].filter(([, work]) => work.state === "completed").map(([id, work]) => [id, work.completion_at]));
+  return {
+    ...projection,
+    requests: receipts,
+    seen_epochs: object([...state.seen_epochs].map(epoch => [epoch, true])),
+    seen_generations: object([...state.seen_generations].map(generation => [generation, true])),
+    observation_ids: object(state.observationsById),
+    terminal_barriers: object(state.terminalBarriers),
+    cancellations: object(state.cancellations),
+    completion_times: completionTimes,
+    last_at: lastAt,
+  };
+}
+
+function restoreCheckpointState(checkpoint) {
+  const op = checkpoint.operations[0];
+  const invalid = () => queueError("checkpoint_invalid", "checkpoint state does not bind a valid prior projection");
+  if (checkpoint.previous !== null || checkpoint.actor.role !== "administrator" || checkpoint.request.kind !== "checkpoint") throw invalid();
+  const wire = op.state;
+  const snapshot = expandCheckpointSnapshot(wire);
+  closed(
+    snapshot,
+    [
+      "repository",
+      "tip",
+      "policy_epoch",
+      "policy",
+      "works",
+      "claims",
+      "dispatches",
+      "observations",
+      "requests",
+      "clocks",
+      "admission_paused",
+      "grants_paused",
+      "credential_generation",
+      "stats",
+      "ledger_bytes",
+      "observation_writes",
+      "seen_epochs",
+      "seen_generations",
+      "observation_ids",
+      "terminal_barriers",
+      "cancellations",
+      "completion_times",
+      "last_at",
+    ],
+    ["deployments"],
+    "checkpoint state",
+    "checkpoint_invalid"
+  );
+  if (digest(snapshot) !== op.state_sha256 || snapshot.tip !== op.prior_tip || snapshot.repository !== checkpoint.actor.repository || snapshot.policy_epoch !== checkpoint.policy_epoch || checkpoint.at < snapshot.last_at) {
+    throw invalid();
+  }
+  validatePolicy(snapshot.policy);
+  const object = value => value && typeof value === "object" && !Array.isArray(value);
+  for (const key of ["works", "claims", "dispatches", "observations", "clocks", "observation_writes", "seen_epochs", "seen_generations", "observation_ids", "terminal_barriers", "cancellations", "completion_times"])
+    if (!object(snapshot[key])) throw invalid();
+  if (
+    !Array.isArray(snapshot.requests) ||
+    snapshot.requests.length !== snapshot.stats?.transactions ||
+    Object.keys(snapshot.works).length !== snapshot.stats.work ||
+    Object.keys(snapshot.claims).length !== snapshot.stats.claims ||
+    snapshot.seen_epochs[snapshot.policy_epoch] !== true ||
+    snapshot.seen_generations[snapshot.credential_generation] !== true
+  )
+    throw invalid();
+  const state = newState();
+  state.repository = snapshot.repository;
+  state.policy_epoch = snapshot.policy_epoch;
+  state.policy = snapshot.policy;
+  state.tip = checkpoint.id;
+  state.admission_paused = snapshot.admission_paused;
+  state.grants_paused = snapshot.grants_paused;
+  state.credential_generation = snapshot.credential_generation;
+  state.works = new Map(Object.entries(snapshot.works).map(([id, work]) => [id, { ...work, ...(Object.hasOwn(snapshot.completion_times, id) ? { completion_at: snapshot.completion_times[id] } : {}) }]));
+  state.claims = new Map(Object.entries(snapshot.claims));
+  state.dispatches = new Map(Object.entries(snapshot.dispatches));
+  restoreDeployments(state, snapshot.deployments);
+  const deploymentState = { policy: state.policy, deployments: new Map() };
+  initializeDeployments(deploymentState);
+  for (const receipt of snapshot.requests) {
+    if (receipt.policy_epoch !== state.policy_epoch) continue;
+    for (const operation of receipt.events ?? []) {
+      if (operation.kind !== "Deployment") continue;
+      if (receipt.kind !== "deployment" || !["administrator", "producer", "dispatcher"].includes(receipt.actor.role)) throw invalid();
+      applyDeployment(deploymentState, operation);
+    }
+  }
+  if (canonical(serializeDeployments(deploymentState)) !== canonical(serializeDeployments(state))) throw invalid();
+  state.observations = new Map(Object.entries(snapshot.observations));
+  state.workCreators = new Map();
+  state.observationsById = new Map(Object.entries(snapshot.observation_ids));
+  state.observation_writes = new Map(Object.entries(snapshot.observation_writes));
+  state.terminalBarriers = new Map(Object.entries(snapshot.terminal_barriers));
+  state.cancellations = new Map(Object.entries(snapshot.cancellations));
+  state.lifecycleWrites = new Map([...state.dispatches].map(([id, dispatch]) => [id, dispatch.lifecycle_writes]));
+  state.clocks = new Map(
+    Object.entries(snapshot.clocks).map(([pool, clocks]) => {
+      const decodeClock = (clock, numeric = false) => {
+        if (!clock || !/^(?:0|[1-9][0-9]*)$/.test(clock.v) || !object(clock.pass) || !object(clock.active)) throw invalid();
+        for (const pass of Object.values(clock.pass)) if (!/^(?:0|[1-9][0-9]*)$/.test(pass)) throw invalid();
+        return {
+          virtual: BigInt(clock.v),
+          passes: new Map(Object.entries(clock.pass).map(([key, pass]) => [numeric ? Number(key) : key, BigInt(pass)])),
+          active: new Set(Object.keys(clock.active).map(key => (numeric ? Number(key) : key))),
+        };
+      };
+      return [pool, { classes: decodeClock(clocks.classes, true), keys: new Map(Object.entries(clocks.keys).map(([key, clock]) => [Number(key), decodeClock(clock)])) }];
+    })
+  );
+  state.requests = new Map();
+  state.historicalTransactions = [];
+  state.claimExplanations = new Map();
+  const commitIDs = new Set();
+  for (const receipt of snapshot.requests) {
+    closed(
+      receipt,
+      ["id", "previous", "request_id", "kind", "fingerprint", "parameters_digest", "actor", "policy_epoch", "at", "events", "claim_explanations"],
+      ["prior_tip", "dispatch_parameters"],
+      "checkpoint receipt",
+      "checkpoint_invalid"
+    );
+    identity(receipt.id, "checkpoint receipt commit");
+    if (receipt.previous !== null) identity(receipt.previous, "checkpoint receipt predecessor");
+    identity(receipt.request_id, "checkpoint receipt request");
+    validateActor(receipt.actor);
+    validateRequestRole(receipt.actor, receipt.kind);
+    if (
+      state.requests.has(receipt.request_id) ||
+      commitIDs.has(receipt.id) ||
+      receipt.actor.repository !== state.repository ||
+      (receipt.kind === "checkpoint") !== Object.hasOwn(receipt, "prior_tip") ||
+      !/^[a-f0-9]{64}$/.test(receipt.fingerprint) ||
+      !/^[a-f0-9]{64}$/.test(receipt.parameters_digest) ||
+      (receipt.kind === "dispatch_next") !== Object.hasOwn(receipt, "dispatch_parameters") ||
+      !Number.isSafeInteger(receipt.at) ||
+      receipt.at < 0 ||
+      !Array.isArray(receipt.events) ||
+      !Array.isArray(receipt.claim_explanations) ||
+      receipt.events.some(operation => !operation || typeof operation.kind !== "string")
+    )
+      throw invalid();
+    const claims = receipt.events.filter(operation => operation.kind === "Claim");
+    if (receipt.claim_explanations.length !== claims.length) throw invalid();
+    for (const operation of receipt.events) {
+      if (operation.kind === "Work") {
+        if (!Object.hasOwn(snapshot.works, operation.work_id) || state.workCreators.has(operation.work_id)) throw invalid();
+        state.workCreators.set(operation.work_id, receipt.actor);
+      }
+    }
+    commitIDs.add(receipt.id);
+    const prior = {
+      version: 3,
+      id: receipt.id,
+      previous: receipt.previous,
+      request: { id: receipt.request_id, kind: receipt.kind, fingerprint: receipt.fingerprint, parameters: receipt.dispatch_parameters ?? null },
+      compacted_parameters_digest: receipt.parameters_digest,
+      checkpoint_prior_tip: receipt.prior_tip,
+      actor: receipt.actor,
+      policy_epoch: receipt.policy_epoch,
+      at: receipt.at,
+      operations: receipt.events,
+      checkpoint_events: receipt.events,
+    };
+    for (const [index, claim] of claims.entries()) {
+      const explanation = receipt.claim_explanations[index];
+      if (explanation.claim_id !== claim.claim_id || explanation.commit_id !== receipt.id || explanation.request_id !== receipt.request_id || explanation.work_id !== claim.work_id) throw invalid();
+      state.claimExplanations.set(claim.claim_id, { ...explanation });
+    }
+    state.requests.set(receipt.request_id, prior);
+    state.historicalTransactions.push(prior);
+  }
+  const nodeFields = [
+    "kind",
+    "work_id",
+    "graph_id",
+    "node_key",
+    "pool",
+    "priority",
+    "fairness_key",
+    "worker_profile",
+    "batch_trust_domain",
+    "payload",
+    "depends_on",
+    "enqueued",
+    "subject",
+    "backing_issue",
+    "replacement_of",
+    "logical_contract",
+    "execution_ref",
+  ];
+  for (const [index, receipt] of snapshot.requests.entries()) {
+    const prior = state.requests.get(receipt.request_id);
+    if (receipt.kind === "submit") {
+      const nodes = [...state.works.values()].filter(work => work.position?.commit === index).sort((a, b) => a.position.operation - b.position.operation);
+      const firstOperation = index === 0 && receipt.previous === null && receipt.events[0]?.kind === "Policy" ? 1 : 0;
+      if (!nodes.length || nodes.some((node, offset) => node.position.operation !== offset + firstOperation)) throw invalid();
+      prior.request.parameters = { nodes: nodes.map(work => Object.fromEntries(nodeFields.filter(field => Object.hasOwn(work, field)).map(field => [field, work[field]]))) };
+    }
+    if (["submit", "dispatch_next"].includes(receipt.kind) && (digest(prior.request.parameters) !== receipt.parameters_digest || fingerprint(receipt.actor, receipt.kind, prior.request.parameters) !== receipt.fingerprint)) throw invalid();
+  }
+  const installedPolicy = state.policy;
+  if (!installedPolicy) throw invalid();
+  if (state.workCreators.size !== state.works.size) throw invalid();
+  for (const [id, work] of state.works) {
+    if (
+      work.work_id !== id ||
+      !Number.isSafeInteger(work.position?.commit) ||
+      work.position.commit < 0 ||
+      work.position.commit >= snapshot.requests.length ||
+      snapshot.requests[work.position.commit].kind !== "submit" ||
+      !Number.isSafeInteger(work.attempts) ||
+      work.attempts < 0 ||
+      (work.state === "claimed" && (!work.claim_id || state.claims.get(work.claim_id)?.state !== "open")) ||
+      (work.state === "completed" && !Object.hasOwn(snapshot.completion_times, id))
+    )
+      throw invalid();
+    if (work.state !== "completed" && work.state !== "cancelled") {
+      const pool = installedPolicy.pools[work.pool];
+      if (!pool?.profiles[work.worker_profile] || work.attempts > pool.retry.max_attempts) throw invalid();
+      const deployment = state.deployments.get(work.pool)?.get(work.worker_profile);
+      if (
+        deployment &&
+        (!Object.entries(deployment.revisions).some(([ref, revision]) => revision.profile.logical_contract === work.admission_contract && (!work.execution_ref || work.execution_ref === ref)) ||
+          (work.logical_contract && work.logical_contract !== work.admission_contract))
+      )
+        throw invalid();
+    }
+  }
+  for (const [id, claim] of state.claims) if (claim.claim_id !== id || !state.works.has(claim.work_id) || !state.dispatches.has(claim.dispatch_id)) throw invalid();
+  const checkpointStarts = new Map();
+  for (const receipt of snapshot.requests)
+    for (const event of receipt.events)
+      if (event.kind === "Dispatch" && event.state === "started" && event.credential_principal !== undefined) {
+        if (checkpointStarts.has(event.dispatch_id)) throw invalid();
+        checkpointStarts.set(event.dispatch_id, { receipt, event });
+      }
+  for (const [id, dispatch] of state.dispatches) {
+    if (dispatch.dispatch_id !== id || state.requests.get(dispatch.request_id)?.id !== dispatch.commit_id) throw invalid();
+    if (dispatch.profile.logical_contract) {
+      const deployment = state.deployments.get(dispatch.pool)?.get(dispatch.worker_profile);
+      const revision = deployment?.revisions[dispatch.profile.ref];
+      if (!dispatch.released && (!revision || canonical(revision.profile) !== canonical(dispatch.profile))) throw invalid();
+      for (const member of dispatch.claims) if (state.works.get(member.work_id)?.admission_contract !== dispatch.profile.logical_contract) throw invalid();
+    }
+    if (dispatch.profile.principal !== undefined && dispatch.credential_principal === undefined) continue;
+    if (dispatch.profile.principal !== undefined) decimal(dispatch.profile.principal, "checkpoint profile principal", "checkpoint_invalid");
+    if (dispatch.credential_principal !== undefined) decimal(dispatch.credential_principal, "checkpoint credential principal", "checkpoint_invalid");
+    if (dispatch.profile.principal !== undefined && dispatch.credential_principal !== undefined && dispatch.profile.principal !== dispatch.credential_principal) throw invalid();
+    if (dispatch.run && dispatch.run.principal !== dispatchPrincipal(dispatch)) throw invalid();
+    if (dispatch.state === "reserved") {
+      if (dispatch.sender || dispatch.run || dispatch.credential_principal !== undefined) throw invalid();
+      continue;
+    }
+    decimal(dispatchPrincipal(dispatch), "checkpoint launch principal", "checkpoint_invalid");
+    if (!dispatch.sender) throw invalid();
+    const start = checkpointStarts.get(id);
+    if (!start || start.event.credential_principal !== dispatch.credential_principal || canonical(start.receipt.actor) !== canonical(dispatch.sender)) throw invalid();
+  }
+  if (state.requests.has(checkpoint.request.id)) throw invalid();
+  state.seen_epochs = new Set(Object.keys(snapshot.seen_epochs));
+  state.seen_generations = new Set(Object.keys(snapshot.seen_generations));
+  state.requests.set(checkpoint.request.id, checkpoint);
+  state.transactions = [checkpoint];
+  state.ledgerBytes = canonicalBytes(checkpoint) + 1;
+  const policy = state.policy;
+  if (!policy || state.ledgerBytes + require("./work_queue_limits.cjs").recoveryHeadroom(state) > policy.limits.ledger_bytes + policy.limits.recovery_bytes) throw invalid();
+  return state;
+}
+
+function expandCheckpointSnapshot(wire) {
+  const invalid = () => queueError("checkpoint_invalid", "checkpoint state does not bind a valid prior projection");
+  closed(
+    wire,
+    [
+      "repository",
+      "tip",
+      "policy_epoch",
+      "policy",
+      "works",
+      "claims",
+      "dispatches",
+      "observations",
+      "requests_compressed",
+      "clocks",
+      "admission_paused",
+      "grants_paused",
+      "credential_generation",
+      "stats",
+      "ledger_bytes",
+      "observation_writes",
+      "seen_epochs",
+      "seen_generations",
+      "observation_ids",
+      "terminal_barriers",
+      "cancellations",
+      "completion_times",
+      "last_at",
+    ],
+    ["deployments"],
+    "checkpoint state",
+    "checkpoint_invalid"
+  );
+  if (typeof wire.requests_compressed !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(wire.requests_compressed)) throw invalid();
+  try {
+    const requestsText = inflateRawSync(Buffer.from(wire.requests_compressed, "base64"), { maxOutputLength: 64 << 20 }).toString("utf8");
+    const requests = parseStrictJSON(requestsText);
+    if (!Array.isArray(requests) || canonical(requests) !== requestsText) throw invalid();
+    const { requests_compressed: _, ...projection } = wire;
+    return { ...projection, requests };
+  } catch {
+    throw invalid();
+  }
+}
+
 function replayOrdered(ordered) {
   if (!ordered.length) throw queueError("policy_missing", "existing queue has no policy genesis");
-  const state = newState();
+  let state = newState();
   trackState(state);
-  const epochs = new Set();
-  const generations = new Set(["initial"]);
+  let epochs = new Set();
+  let generations = new Set(["initial"]);
+  let offset = 0;
+  if (ordered[0].operations[0]?.kind === "Checkpoint") {
+    untrackState(state);
+    state = restoreCheckpointState(ordered[0]);
+    trackState(state);
+    offset = state.historicalTransactions.length + 1;
+    epochs = new Set(state.seen_epochs);
+    generations = new Set(state.seen_generations);
+    ordered = ordered.slice(1);
+  }
   for (let ordinal = 0; ordinal < ordered.length; ordinal++) {
     const commit = ordered[ordinal];
-    if (ordinal === 0) state.repository = commit.actor.repository;
+    if (ordinal === 0 && !offset) state.repository = commit.actor.repository;
     const priorRequest = state.requests.get(commit.request.id);
     if (priorRequest) throw queueError("request_reused", priorRequest.request.fingerprint === commit.request.fingerprint ? "committed request cannot appear in another commit" : "request identity has different semantics");
-    if (ordinal === 0 && (commit.operations.length !== 1 || commit.operations[0].kind !== "Policy" || commit.request.kind !== "policy" || commit.actor.role !== "administrator"))
+    const bootstrap =
+      ordinal === 0 &&
+      !offset &&
+      commit.request.kind === "submit" &&
+      ["producer", "dispatcher"].includes(commit.actor.role) &&
+      commit.operations[0]?.kind === "Policy" &&
+      commit.operations.length > 1 &&
+      commit.operations.slice(1).every(operation => operation.kind === "Work") &&
+      canonical(commit.request.parameters.nodes) === canonical(commit.operations.slice(1));
+    if (ordinal === 0 && !offset && !bootstrap && (commit.operations.length !== 1 || commit.operations[0].kind !== "Policy" || commit.request.kind !== "policy" || commit.actor.role !== "administrator"))
       throw queueError("policy_missing", "genesis must install exactly one mandatory Policy");
-    if (state.policy && commit.actor.repository !== ordered[0].actor.repository) throw queueError("actor_unauthorized", "foreign queue repository origin");
+    if (state.policy && commit.actor.repository !== state.repository) throw queueError("actor_unauthorized", "foreign queue repository origin");
     const policies = commit.operations.filter(operation => operation.kind === "Policy");
     if (policies.length) {
-      if (policies.length !== 1 || commit.operations.length !== 1 || commit.policy_epoch !== policies[0].epoch || epochs.has(policies[0].epoch) || (state.policy && !quiescent(state)))
+      if (
+        policies.length !== 1 ||
+        (!bootstrap && commit.operations.length !== 1) ||
+        (bootstrap && (commit.operations[0] !== policies[0] || commit.actor.role === "administrator")) ||
+        (!bootstrap && state.policy && commit.actor.role !== "administrator") ||
+        commit.policy_epoch !== policies[0].epoch ||
+        epochs.has(policies[0].epoch) ||
+        (state.policy && !quiescent(state))
+      )
         throw queueError("policy_not_quiescent", "Policy epoch changes require a drained queue and new immutable identity");
       epochs.add(policies[0].epoch);
       state.policy = policies[0].policy;
+      if (state.policy?.authorization === "aw") {
+        for (const pool of Object.values(state.policy.pools))
+          for (const profile of Object.values(pool.profiles)) if (profile.effect_scope !== commit.actor.repository) throw queueError("policy_invalid", "AW-managed effect scope must be the queue repository");
+      }
       state.policy_epoch = policies[0].epoch;
+      initializeDeployments(state);
       state.clocks = freshClocks(state.policy);
       state.observation_writes = new Map();
     } else if (!state.policy || commit.policy_epoch !== state.policy_epoch) throw queueError("policy_invalid", "commit does not bind authoritative installed epoch");
     if (!state.policy) throw queueError("policy_missing", "existing queue has no policy genesis");
+    state.scheduling_profiles = commit.request.kind === "dispatch_next" ? commit.request.parameters.worker_profiles : undefined;
     if (commit.operations.length > state.policy.limits.operations) throw queueError("resource_limit", "operation count exceeds installed policy");
     workerControlScope(state, commit);
     if (commit.request.kind === "finish" && canonical(finishOperations(state, commit.request, commit.actor, commit.at)) !== canonical(commit.operations)) throw queueError("request_invalid", "finish differs from exact scoped outcome");
@@ -653,7 +1139,12 @@ function replayOrdered(ordered) {
     for (let index = 0; index < commit.operations.length; index++) {
       const operation = commit.operations[index];
       switch (operation.kind) {
+        case "Checkpoint":
+          throw queueError("checkpoint_invalid", "checkpoint must be the sole root transaction");
         case "Policy":
+          break;
+        case "Deployment":
+          applyDeployment(state, operation);
           break;
         case "Control":
           if (operation.control === "admission_paused") state.admission_paused = operation.value;
@@ -666,7 +1157,19 @@ function replayOrdered(ordered) {
           boundedBytes(operation, state.policy.limits.evidence_bytes, "Control");
           break;
         case "Work":
-          if (!state.works.has(operation.work_id)) state.works.set(operation.work_id, { ...operation, state: "available", position: { commit: ordinal, operation: index }, attempts: 0, retry_not_before: 0, barrier: "none" });
+          if (!state.works.has(operation.work_id)) {
+            const contract = admissionProfile(state, operation).logical_contract;
+            state.works.set(operation.work_id, {
+              ...operation,
+              ...(contract ? { admission_contract: contract } : {}),
+              state: "available",
+              position: { commit: ordinal + offset, operation: index },
+              attempts: 0,
+              retry_not_before: 0,
+              barrier: "none",
+            });
+            state.workCreators.set(operation.work_id, commit.actor);
+          }
           break;
         case "IssueLink":
         case "IssueComment":
@@ -690,8 +1193,44 @@ function replayOrdered(ordered) {
             expected = planDispatch(state, commit.request.parameters, { requestId: commit.request.id, commitId: commit.id, at: commit.at, precedingOperations: index });
           }
           if (canonical(operation) !== canonical(expected.operations[claimIndex])) throw queueError("selection_invalid", "Claim/order/group/handle does not match deterministic fair packing");
+          const work = state.works.get(operation.work_id);
           const selection = planNext(state, commit.request.parameters.pool, commit.at);
+          const priority = work.effective_priority ?? work.priority;
+          const clocks = state.clocks.get(work.pool);
+          const classPassPrior = clocks?.classes.passes.get(priority)?.toString() ?? "0";
+          const keyPassPrior = clocks?.keys.get(priority)?.passes.get(work.fairness_key)?.toString() ?? "0";
+          const capacityBefore = reservationCounts(state, work.pool, work.fairness_key);
+          const position = { commit: ordinal + offset, operation: index };
           applyScheduledClaim(state, operation, selection, commit);
+          state.claimExplanations.set(operation.claim_id, {
+            tip: state.tip,
+            at: commit.at,
+            status: "committed_claim_prefix",
+            before_tip: state.tip,
+            position,
+            request_id: commit.request.id,
+            commit_id: commit.id,
+            policy_epoch: commit.policy_epoch,
+            claim_id: operation.claim_id,
+            dispatch_id: operation.dispatch_id,
+            claim_handle: operation.handle,
+            work_id: work.work_id,
+            pool: work.pool,
+            priority,
+            fairness_key: work.fairness_key,
+            work_position: work.position,
+            selection: {
+              work_id: selection.work_id,
+              reason: "selected",
+              observations: selection.observations,
+              class_pass: selection.class_pass,
+              key_pass: selection.key_pass,
+            },
+            class_pass_prior: classPassPrior,
+            key_pass_prior: keyPassPrior,
+            capacity_before: { logical: capacityBefore.logical, native: capacityBefore.native, account: capacityBefore.account },
+            capacity_after: reservationCounts(state, work.pool, work.fairness_key),
+          });
           claimIndex++;
           break;
         }
@@ -719,9 +1258,13 @@ function replayOrdered(ordered) {
       commit.operations.some(operation => ["Observation", "IssueLink", "IssueComment"].includes(operation.kind))
     );
     state.ledgerBytes += bytes;
+    state.scheduling_profiles = undefined;
   }
   if (!state.policy) throw queueError("policy_missing", "existing queue has no policy genesis");
   projectViews(state);
+  state.seen_epochs = epochs;
+  state.seen_generations = generations;
+  for (const explanation of state.claimExplanations.values()) explanation.tip = state.tip;
   untrackState(state);
   return Object.assign(state, { policy: state.policy });
 }
@@ -742,7 +1285,7 @@ function projectViews(state) {
     cancelled: ordered.filter(work => work.state === "cancelled").length,
     claims: state.claims.size,
     dispatches: [...state.dispatches.values()].filter(dispatch => !dispatch.released).length,
-    transactions: state.transactions.length,
+    transactions: state.transactions.length + (state.historicalTransactions?.length ?? 0),
     nodes: vertices.size,
   };
 }
@@ -754,6 +1297,7 @@ function serializeProjection(state) {
     tip: state.tip,
     policy_epoch: state.policy_epoch,
     policy: state.policy,
+    ...(state.deployments?.size ? { deployments: serializeDeployments(state) } : {}),
     works: Object.fromEntries(
       [...state.works].map(([id, work]) => {
         const { completion_at, ...wire } = work;
@@ -799,8 +1343,43 @@ function serializeTransactionLog(transactions) {
   return ordered.length ? ordered.map(commit => canonical(commit)).join("\n") + "\n" : "";
 }
 
-function compactTransactions(transactions) {
-  return replayTransactions(transactions).transactions;
+function compactTransactions(transactions, priorGitSHA, actor, at = Date.now()) {
+  const validated = replayTransactions(transactions);
+  if (priorGitSHA === undefined) return validated.transactions;
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(priorGitSHA) || actor?.role !== "administrator" || actor.repository !== validated.repository || !Number.isSafeInteger(at) || at < 0 || at > Number.MAX_SAFE_INTEGER)
+    throw queueError("checkpoint_invalid", "checkpoint requires an administrator, valid time and prior Git commit SHA");
+  const history = serializeTransactionLog(validated.transactions);
+  const history_sha256 = createHash("sha256").update(history, "utf8").digest("hex");
+  const state = checkpointSnapshot(validated, validated.transactions.at(-1).at);
+  const state_sha256 = digest(state);
+  const requests_compressed = deflateRawSync(Buffer.from(canonical(state.requests), "utf8")).toString("base64");
+  const { requests: _, ...projection } = state;
+  const compressedState = { ...projection, requests_compressed };
+  const parameters = { prior_git_sha: priorGitSHA, prior_tip: validated.tip, history_sha256, state_sha256 };
+  const operation = { kind: "Checkpoint", ...parameters, state: compressedState };
+  const requestId = `checkpoint_${createHash("sha256").update(`${validated.tip}\n${priorGitSHA}`, "utf8").digest("hex")}`;
+  const request = newRequest(requestId, "checkpoint", actor, parameters);
+  const checkpoint = {
+    version: 3,
+    id: `q_${createHash("sha256").update(requestId, "utf8").digest("hex")}`,
+    previous: null,
+    request,
+    actor,
+    policy_epoch: validated.policy_epoch,
+    at,
+    operations: [operation],
+  };
+  replayTransactions([checkpoint]);
+  return [checkpoint];
+}
+
+function prepareCheckpoint(source, priorGitSHA, actor, at) {
+  const transactions = Array.isArray(source) ? source : source?.transactions;
+  if (!Array.isArray(transactions) || !transactions.length) throw queueError("checkpoint_invalid", "checkpoint requires a validated nonempty queue");
+  const ordered = causalChain(transactions);
+  const root = ordered[0];
+  const administrator = actor ?? { role: "administrator", principal: root.actor.principal, repository: root.actor.repository };
+  return compactTransactions(transactions, priorGitSHA, administrator, at ?? ordered.at(-1).at);
 }
 
 function appendCommit(transactions, commit) {
@@ -827,7 +1406,15 @@ function generateRequestOperations(state, request, actor, at, commitId, observat
   if (request.kind === "dispatch_next") return observations.length ? planDispatchWithObservations(state, request, actor, at, commitId, observations) : planDispatch(state, request.parameters, { requestId: request.id, commitId, at });
   if (request.kind === "submit") {
     const nodes = request.parameters.nodes;
-    if (nodes.every(node => state.works.has(node.work_id))) return { operations: [], idempotent: true, reason: "already_submitted", commit: state.transactions[state.works.get(nodes[0].work_id).position.commit] };
+    if (nodes.every(node => state.works.has(node.work_id))) {
+      const index = state.works.get(nodes[0].work_id).position.commit;
+      return {
+        operations: [],
+        idempotent: true,
+        reason: "already_submitted",
+        commit: index < (state.historicalTransactions?.length ?? 0) ? state.historicalTransactions[index] : state.transactions[index - (state.historicalTransactions?.length ?? 0)],
+      };
+    }
     return { operations: nodes };
   }
   if (request.kind === "finish") {
@@ -891,6 +1478,7 @@ module.exports = {
   oldestAvailableWork: unsupportedDirectClaim,
   parseTransactionLog,
   planDispatchWithObservations,
+  prepareCheckpoint,
   proposedCommitId,
   planNext,
   quiescent,

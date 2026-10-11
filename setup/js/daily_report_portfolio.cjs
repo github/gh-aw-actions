@@ -1,8 +1,7 @@
 // @ts-check
 "use strict";
 
-const { DEFAULT_LIMITS } = require("./work_queue_limits.cjs");
-const { validatePolicy } = require("./work_queue_policy.cjs");
+const { buildAWPolicy } = require("./work_queue_settings.cjs");
 const { validateDeliveryContract } = require("./work_queue_delivery.cjs");
 
 const DAILY_REPORTS = Object.freeze([
@@ -19,6 +18,10 @@ const DAILY_REPORTS = Object.freeze([
 ]);
 const REPORTS_PER_DAY = 3;
 const REPORT_POOL = "daily-reports";
+const FIXED_DAILY_REPORTS = Object.freeze(["deep-report"]);
+// Report dates precede activation dates: Saturday/Sunday run on Sunday/Monday.
+const WEEKLY_REPORTS = Object.freeze([Object.freeze({ profile: "artifacts-summary", reportWeekday: 6 }), Object.freeze({ profile: "repo-tree-map", reportWeekday: 0 })]);
+const REPORT_PROFILES = Object.freeze([...DAILY_REPORTS, ...FIXED_DAILY_REPORTS, ...WEEKLY_REPORTS.map(report => report.profile)]);
 
 /** @param {string} date */
 function reportDay(date) {
@@ -30,8 +33,15 @@ function reportDay(date) {
 
 /** @param {string} date */
 function reportsForDay(date) {
-  const offset = (reportDay(date) * REPORTS_PER_DAY) % DAILY_REPORTS.length;
-  return Array.from({ length: REPORTS_PER_DAY }, (_, index) => DAILY_REPORTS[(offset + index) % DAILY_REPORTS.length]);
+  const day = reportDay(date);
+  const weekly = WEEKLY_REPORTS.filter(report => report.reportWeekday === (day + 4) % 7).map(report => report.profile);
+  const priorWeeklySlots = WEEKLY_REPORTS.reduce((count, report) => {
+    const firstDay = (report.reportWeekday - 4 + 7) % 7;
+    return count + Math.floor((day + 6 - firstDay) / 7);
+  }, 0);
+  const rotatingSlots = REPORTS_PER_DAY - FIXED_DAILY_REPORTS.length;
+  const offset = (day * rotatingSlots - priorWeeklySlots) % DAILY_REPORTS.length;
+  return [...Array.from({ length: rotatingSlots - weekly.length }, (_, index) => DAILY_REPORTS[(offset + index) % DAILY_REPORTS.length]), ...weekly, ...FIXED_DAILY_REPORTS];
 }
 
 /** @param {string} repository */
@@ -44,6 +54,7 @@ function reportContract(profile) {
   const outputs = [{ type: "create_discussion", min: 1, max: 1 }, ...["noop", "report_incomplete", "missing_tool", "missing_data"].map(type => ({ type, min: 0, max: 1 }))];
   if (["daily-firewall-report", "daily-repo-chronicle"].includes(profile)) outputs.push({ type: "upload_asset", min: 0, max: 3 });
   if (profile === "daily-regulatory") outputs.push({ type: "close_discussion", min: 0, max: 1 });
+  if (profile === "deep-report") outputs.push({ type: "create_issue", min: 0, max: 7 }, { type: "add_comment", min: 0, max: 3 }, { type: "upload_artifact", min: 0, max: 3 });
   return validateDeliveryContract({ version: 1, outputs });
 }
 
@@ -76,42 +87,17 @@ function buildDailyReportPlan({ date, repository, repositoryId }) {
   };
 }
 
-/** @param {{repository: string, ref: string, producerPrincipal: string, workerPrincipal: string}} options */
-function buildDailyReportPolicy({ repository, ref, producerPrincipal, workerPrincipal }) {
+/** @param {{repository: string, ref: string, settings?: object}} options */
+function buildDailyReportPolicy({ repository, ref, settings }) {
   assertRepository(repository);
-  const policy = {
-    mode: "weighted-priority",
-    class_weights: [8, 4, 2, 1, 1],
-    accounting_weights: Object.fromEntries([["", 1], ...DAILY_REPORTS.map(profile => [profile, 1])]),
-    producers: { [producerPrincipal]: { pools: [REPORT_POOL], priorities: [3], fairness_keys: [...DAILY_REPORTS] } },
-    pools: {
-      [REPORT_POOL]: {
-        default_profile: DAILY_REPORTS[0],
-        profiles: Object.fromEntries(
-          DAILY_REPORTS.map(profile => [
-            profile,
-            { workflow: `.github/workflows/${profile}.lock.yml`, ref, principal: workerPrincipal, trust_domain: profile, credential_scope: "repository", effect_scope: repository, max_claims: 1, share_keys: false },
-          ])
-        ),
-        logical_limit: REPORTS_PER_DAY,
-        native_limit: REPORTS_PER_DAY,
-        per_account_limit: 1,
-        allowed_repositories: [repository],
-        max_observation_age_ms: 60000,
-        retry: { max_attempts: 1, backoff_ms: 1000 },
-        reconciliation: { max_attempts: 5, deadline_ms: 300000 },
-      },
-    },
-    limits: { ...DEFAULT_LIMITS, graph_nodes: REPORTS_PER_DAY, pending_nodes: 30, operations: 32, payload_bytes: 8192 },
-  };
-  validatePolicy(policy);
-  return policy;
+  return buildAWPolicy({ repository, ref, workflows: [...REPORT_PROFILES], settings });
 }
 
-module.exports = { DAILY_REPORTS, REPORTS_PER_DAY, REPORT_POOL, reportsForDay, buildDailyReportPlan, buildDailyReportPolicy };
+module.exports = { DAILY_REPORTS, FIXED_DAILY_REPORTS, WEEKLY_REPORTS, REPORT_PROFILES, REPORTS_PER_DAY, REPORT_POOL, reportsForDay, buildDailyReportPlan, buildDailyReportPolicy };
 
 if (require.main === module) {
-  const [command, repository, ref, producerPrincipal, workerPrincipal, ...extra] = process.argv.slice(2);
-  if (command !== "policy" || extra.length || !repository || !ref || !producerPrincipal || !workerPrincipal) throw new Error("Usage: node daily_report_portfolio.cjs policy OWNER/REPO IMMUTABLE_SHA VERIFIED_PRODUCER_ID VERIFIED_WORKER_ID");
-  process.stdout.write(JSON.stringify(buildDailyReportPolicy({ repository, ref, producerPrincipal, workerPrincipal }), null, 2) + "\n");
+  const [command, repository, ref, ...extra] = process.argv.slice(2);
+  if (command !== "policy" || extra.length || !repository || !ref) throw new Error("Usage: node daily_report_portfolio.cjs policy OWNER/REPO IMMUTABLE_SHA");
+  const { readPortfolioSettings } = require("./work_queue_portfolio_config.cjs");
+  process.stdout.write(JSON.stringify(buildDailyReportPolicy({ repository, ref, settings: readPortfolioSettings() }), null, 2) + "\n");
 }

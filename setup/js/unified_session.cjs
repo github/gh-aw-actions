@@ -3,39 +3,38 @@
 const fs = require("fs");
 const path = require("path");
 const { isSessionEvent } = require("./agent_session.cjs");
-const { hasCopilotConversation, normalizeCopilotSession } = require("./copilot_session.cjs");
+const { hasCopilotConversation, deduplicateCopilotFallback, normalizeCopilotSession } = require("./copilot_session.cjs");
 const { collectAddMaskedValues, writeSessionArtifact, removeFailedSessionArtifacts } = require("./session_artifact.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { normalizeUnifiedSessionEvent } = require("./unified_session_payload.cjs");
+const { normalizeUnifiedSessionEvent, evalResultRunId } = require("./unified_session_payload.cjs");
 const { ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
 const { collectAgentExecution, parseAgentExitCode, validateAgentExitCode, isAgentExecutionEvent } = require("./agent_execution.cjs");
-const { normalizeEngineLogEntries } = require("./engine_log_parser.cjs");
+const { normalizeEngineLogEntries, normalizeEngineSessionEvents, parseEngineLog } = require("./engine_log_parser.cjs");
+const { sessionTimestamp, orderSessionSources } = require("./unified_session_order.cjs");
+const { normalizeOtelEvents } = require("./unified_session_otel.cjs");
 
 const SESSION_FILE_FORMAT_VERSION = 1;
 
+/** @param {any} data @returns {boolean} */
+function isModelEndpointMismatchData(data) {
+  return (
+    data !== null &&
+    typeof data === "object" &&
+    !Array.isArray(data) &&
+    data.category === "model_endpoint_mismatch" &&
+    ["startup", "runtime"].includes(data.phase) &&
+    ["configured_model", "resolved_model", "wire_api", "wire_api_source", "detail", "fix"].every(key => typeof data[key] === "string") &&
+    Array.isArray(data.supported_endpoints) &&
+    data.supported_endpoints.every(endpoint => typeof endpoint === "string") &&
+    ["model", "endpoint"].every(key => !Object.hasOwn(data, key) || typeof data[key] === "string")
+  );
+}
+
 /** @typedef {import("./types/agent_session").SessionEvent} SessionEvent */
-/** @typedef {{component: string, phase: string, path: string, events: SessionEvent[], timestampUnit?: "seconds" | "milliseconds"}} SessionSource */
+/** @typedef {{component: string, phase: string, path: string, events: SessionEvent[], indices?: number[], timestampUnit?: import("./unified_session_order.cjs").TimestampUnit}} SessionSource */
 
 /** @param {unknown} value @returns {boolean} */
 const isNativePath = value => typeof value === "string" && /^sandbox\/agent\/logs\/copilot-session-state\/[A-Za-z0-9_-]+\/events\.jsonl$/.test(value);
-
-/**
- * Timestamp units come from the source schema, never from the value's magnitude.
- * Native timestamps stay unchanged; this value is only an ordering key.
- * @param {any} record
- * @param {"seconds" | "milliseconds"} [unit]
- * @returns {number | undefined}
- */
-function sessionTimestamp(record, unit = "milliseconds") {
-  const value = record.timestamp ?? record.ts ?? record.time ?? record.created_at ?? record.message?.timestamp;
-  if (typeof value === "number") {
-    const ms = unit === "seconds" ? value * 1000 : value;
-    return Number.isFinite(ms) && Math.abs(ms) <= 8640000000000000 ? ms : undefined;
-  }
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) return undefined;
-  const ms = Date.parse(value);
-  return Number.isFinite(ms) ? ms : undefined;
-}
 
 /**
  * Source-local positions disambiguate repeated native IDs and expanded records.
@@ -44,47 +43,44 @@ function sessionTimestamp(record, unit = "milliseconds") {
  * @returns {import("./types/unified_session").UnifiedSession}
  */
 function mergeSessionSources(sources) {
-  const events = sources.flatMap(source =>
-    source.events.map((event, index) => {
-      const timestampMs = sessionTimestamp(event, source.timestampUnit);
-      const normalized = normalizeUnifiedSessionEvent(event, source.phase);
-      const native = event.provenance;
-      const sourceIndex =
-        source.component === "agent" &&
-        isNativePath(source.path) &&
-        native &&
-        typeof native === "object" &&
-        "path" in native &&
-        native.path === source.path &&
-        (!("phase" in native) || native.phase === source.phase) &&
-        "index" in native &&
-        typeof native.index === "number" &&
-        Number.isSafeInteger(native.index) &&
-        native.index >= 0
-          ? native.index
-          : index;
-      if (event.type === "detection.result" && source.path !== "usage/detection/detection_result.json") {
-        delete normalized.data.reason;
-      }
-      return {
-        ...normalized,
-        provenance: {
-          component: source.component,
-          phase: source.phase,
-          path: source.path,
-          index: sourceIndex,
-          ...(timestampMs !== undefined ? { timestampMs } : {}),
-          ...(Object.hasOwn(event, "provenance") ? { native: structuredClone(event.provenance) } : {}),
-        },
-      };
-    })
+  return orderSessionSources(
+    sources.map(source => ({
+      ...source,
+      events: source.events.map((event, index) => {
+        const timestampMs = sessionTimestamp(event, source.timestampUnit);
+        const normalized = normalizeUnifiedSessionEvent(event, source.phase);
+        const native = event.provenance;
+        const sourceIndex =
+          source.component === "agent" &&
+          isNativePath(source.path) &&
+          native &&
+          typeof native === "object" &&
+          "path" in native &&
+          native.path === source.path &&
+          (!("phase" in native) || native.phase === source.phase) &&
+          "index" in native &&
+          typeof native.index === "number" &&
+          Number.isSafeInteger(native.index) &&
+          native.index >= 0
+            ? native.index
+            : (source.indices?.[index] ?? index);
+        if (event.type === "detection.result" && source.path !== "usage/detection/detection_result.json") {
+          delete normalized.data.reason;
+        }
+        return {
+          ...normalized,
+          provenance: {
+            component: source.component,
+            phase: source.phase,
+            path: source.path,
+            index: sourceIndex,
+            ...(timestampMs !== undefined ? { timestampMs } : {}),
+            ...(Object.hasOwn(event, "provenance") ? { native: structuredClone(event.provenance) } : {}),
+          },
+        };
+      }),
+    }))
   );
-  events.sort((left, right) => {
-    const leftTime = left.provenance.timestampMs ?? Infinity;
-    const rightTime = right.provenance.timestampMs ?? Infinity;
-    return leftTime === rightTime ? 0 : leftTime < rightTime ? -1 : 1;
-  });
-  return events;
 }
 
 /** @param {"mcp" | "firewall"} component @param {any} record @returns {SessionEvent} */
@@ -110,7 +106,7 @@ function normalizeRuntimeEvent(component, record) {
     if (kind === "http_access" || record.decision !== undefined) type = "firewall.http_access";
     else if (kind === "token_usage") type = "firewall.token_usage";
     else if (kind === "model_routing") type = "firewall.model_routing";
-    else if (["token_steering", "timeout_steering"].includes(kind)) type = "firewall.steering";
+    else if (["ai_credit_steering", "token_steering", "timeout_steering"].includes(kind)) type = "firewall.steering";
   }
   return {
     type,
@@ -118,6 +114,7 @@ function normalizeRuntimeEvent(component, record) {
     ...(record.timestamp !== undefined ? { timestamp: record.timestamp } : {}),
     ...(record.ts !== undefined ? { ts: record.ts } : {}),
     ...(record.time !== undefined ? { time: record.time } : {}),
+    ...(record.created_at !== undefined ? { created_at: record.created_at } : {}),
   };
 }
 
@@ -127,26 +124,11 @@ function normalizeRuntimeEvent(component, record) {
  * @returns {SessionEvent[]}
  */
 function parseEngineSession(content, engine) {
-  const parsers = {
-    agy: ["parse_agy_log.cjs", "parseAgyLog"],
-    claude: ["parse_claude_log.cjs", "parseClaudeLog"],
-    copilot: ["parse_copilot_log.cjs", "parseCopilotLog"],
-    codex: ["parse_codex_log.cjs", "parseCodexLog"],
-    gemini: ["parse_gemini_log.cjs", "parseGeminiLog"],
-    pi: ["parse_pi_log.cjs", "parsePiLog"],
-    kiro: ["parse_kiro_log.cjs", "parseKiroLog"],
-    "deepseek-harness": ["parse_deepseek_log.cjs", "parseDeepSeekLog"],
-    "pydantic-ai": ["parse_pydantic_log.cjs", "parsePydanticLog"],
-    opencode: ["parse_opencode_log.cjs", "parseOpenCodeLog"],
-    goose: ["parse_goose_log.cjs", "parseGooseLog"],
-    custom: ["parse_custom_log.cjs", "parseCustomLog"],
-  };
-  const [moduleName, functionName] = Object.hasOwn(parsers, engine) ? parsers[engine] : parsers.custom;
-  const parsed = Object.hasOwn(parsers, engine) ? require(`./${moduleName}`)[functionName](content) : require(`./${moduleName}`)[functionName](content, engine);
+  const parsed = parseEngineLog(content, engine);
   const events = parsed.logEntries ?? [];
   const observations = events.filter(isAgentExecutionEvent).map(event => event.data);
   if (observations.length) return events;
-  const execution = collectAgentExecution({ content, events, observations });
+  const execution = collectAgentExecution({ content, events, observations, ...(engine === "aider" ? { rawSourceEngine: "aider" } : {}) });
   return [...events.filter(event => event.type !== "agent.execution"), ...(execution ? [execution] : [])];
 }
 
@@ -157,6 +139,8 @@ function parseEngineSession(content, engine) {
  * @returns {{events: import("./types/unified_session").UnifiedSession, maskedValues: string[]}}
  */
 function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message => console.warn(message), dailyAIC = process.env } = {}) {
+  let currentRunId = dailyAIC.GITHUB_RUN_ID;
+  let currentRunAttempt = dailyAIC.GITHUB_RUN_ATTEMPT;
   /** @type {SessionSource[]} */
   const sources = [];
   const masks = new Set();
@@ -189,27 +173,38 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
       throw new Error(`${ERR_SYSTEM}: Failed to read unified session source ${path.relative(rootDir, file)}: ${getErrorMessage(error)}`, { cause: error });
     }
   };
+  const recordCache = new Map();
+  /** @type {Map<string, number[]>} */
+  const recordLines = new Map();
   const records = file => {
+    if (recordCache.has(file)) return recordCache.get(file);
     const content = read(file);
     if (file.endsWith(".json")) {
       try {
         const value = JSON.parse(content);
-        return Array.isArray(value) ? value : [value];
+        const values = Array.isArray(value) ? value : [value];
+        recordCache.set(file, values);
+        return values;
       } catch {
         report(file, "malformed_json", undefined);
+        recordCache.set(file, []);
         return [];
       }
     }
     const values = [];
+    const lines = [];
     for (const [index, raw] of content.split(/\r?\n/).entries()) {
       if (!raw.trim()) continue;
       try {
         values.push(JSON.parse(raw));
+        lines.push(index + 1);
       } catch {
         incompleteSources.add(file);
         report(file, "malformed_jsonl", index + 1);
       }
     }
+    recordCache.set(file, values);
+    recordLines.set(file, lines);
     return values;
   };
   /**
@@ -217,28 +212,50 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
    * @param {string} component
    * @param {string} phase
    * @param {`${string}.${string}` | undefined} type
-   * @param {"seconds" | "milliseconds"} [timestampUnit]
+   * @param {import("./unified_session_order.cjs").TimestampUnit} [timestampUnit]
    */
   const add = (file, component, phase, type, timestampUnit = "milliseconds") => {
     if (!exists(file)) return 0;
     const events = [];
-    const input = records(file);
+    const indices = [];
+    // These result types imply run-scoped files; do not reuse them for unscoped sources.
+    const isRunResult = type === "grader.result" || type === "eval.result";
+    const input = component === "agent" ? normalizeEngineSessionEvents(records(file), engine ?? "custom") : records(file);
     const normalized = component === "agent" ? normalizeEngineLogEntries(input, engine ?? "custom") : [];
     const hasLegacyContent = normalized.some(event => ["assistant.message", "assistant.reasoning", "assistant.refusal", "user.message", "tool.execution_start", "tool.execution_complete"].includes(event.type));
-    for (const record of input) {
+    for (const [index, record] of input.entries()) {
       if (!record || typeof record !== "object" || Array.isArray(record)) {
         incompleteSources.add(file);
         report(file, "non_object_record", undefined);
         continue;
       }
-      if (component === "agent") {
+      if (isRunResult) {
+        const line = recordLines.get(file)?.[index];
+        const runId = type === "grader.result" ? record.run?.id : evalResultRunId(record);
+        if (!currentRunId || runId === undefined || runId === null || String(runId) === "") {
+          report(file, "unattributed_run_result", line);
+          continue;
+        }
+        if (String(runId) !== String(currentRunId)) continue;
+        const attempt = type === "grader.result" ? record.run?.attempt : (record.runAttempt ?? record.run_attempt);
+        if (currentRunAttempt && attempt !== undefined && String(attempt) !== String(currentRunAttempt)) continue;
+        indices.push(line === undefined ? index : line - 1);
+      }
+      if (component === "otel") {
+        events.push(
+          ...normalizeOtelEvents(record, code => {
+            incompleteSources.add(file);
+            report(file, code, undefined);
+          })
+        );
+      } else if (component === "agent") {
         if (isSessionEvent(record)) events.push(record);
         else if (!hasLegacyContent || normalizeEngineLogEntries([record], engine ?? "custom").length === 0) {
           incompleteSources.add(file);
           report(file, "non_canonical_agent_event", undefined);
         }
       } else if (type) {
-        events.push({ type, data: record, ...(record.timestamp !== undefined ? { timestamp: record.timestamp } : {}), ...(record.created_at !== undefined ? { created_at: record.created_at } : {}) });
+        events.push({ type, data: record, ...Object.fromEntries(["timestamp", "ts", "time", "created_at"].filter(key => record[key] !== undefined).map(key => [key, record[key]])) });
       } else if (component === "mcp" || component === "firewall") events.push(normalizeRuntimeEvent(component, record));
       else throw new Error(`${ERR_VALIDATION}: Missing event mapping for ${component}`);
     }
@@ -251,7 +268,7 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
         if (canonicalRecords.has(JSON.stringify(event)) || !canonicalKeys.has(key)) events.push(event);
       }
     }
-    sources.push({ component, phase, path: path.relative(rootDir, file), events, timestampUnit });
+    sources.push({ component, phase, path: path.relative(rootDir, file), events, ...(isRunResult ? { indices } : {}), timestampUnit });
     return events.filter(event => event.type !== "agent.execution").length;
   };
   const walk = (directory, depth = 0) => {
@@ -284,11 +301,17 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
     return files;
   };
   const choose = candidates => candidates.map(file => path.join(rootDir, file)).find(exists);
-  const metadata = choose(["aw_info.json", "usage/aw_info.json"]);
+  const metadata = choose(["aw_info.json", "activation/aw_info.json", "usage/aw_info.json"]);
   if (metadata) {
-    add(metadata, "workflow", "activation", "workflow.info");
-    const observedEngine = sources.at(-1)?.events[0]?.data.engine_id;
+    const phase = metadata === path.join(rootDir, "agent/aw_info.json") ? "agent" : metadata === path.join(rootDir, "usage/aw_info.json") ? "conclusion" : "activation";
+    add(metadata, "workflow", phase, "workflow.info");
+    const info = sources.at(-1)?.events[0]?.data;
+    const observedEngine = info?.engine_id;
     if (engine === undefined && typeof observedEngine === "string") engine = observedEngine;
+    if (info?.run_id !== undefined && info.run_id !== null && String(info.run_id) !== "") {
+      currentRunId = String(info.run_id);
+      currentRunAttempt = info.run_attempt !== undefined && info.run_attempt !== null ? String(info.run_attempt) : undefined;
+    }
   }
   /** @type {Array<[string, `${string}.${string}`]>} */
   const prompts = [
@@ -381,9 +404,8 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
     const events = normalizeCopilotSession(snapshot.records);
     const source = { component: "agent", phase: "agent", path: path.relative(rootDir, snapshot.file), events };
     sources.push(source);
-    if (incompleteSources.has(snapshot.file) || !hasCopilotConversation(events)) {
+    if (!hasCopilotConversation(events)) {
       if (!incompleteSources.has(snapshot.file)) report(snapshot.file, "native_session_unusable", undefined);
-      source.events = [];
       continue;
     }
     copilotSources.set(source, { id, start: snapshot.start });
@@ -400,11 +422,10 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
       const source = sources.at(-1);
       if (source?.path === path.relative(rootDir, file)) {
         source.events = normalizeCopilotSession(source.events);
-        if (!incompleteSources.has(file) && hasCopilotConversation(source.events)) {
+        if (hasCopilotConversation(source.events)) {
           agentEvents += source.events.length;
         } else {
           if (!incompleteSources.has(file)) report(file, "native_session_unusable", undefined);
-          source.events = [];
         }
       }
     }
@@ -413,8 +434,15 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
     const file = choose(["pi-streaming.jsonl", "agent-stdio.log"]);
     if (file) {
       const content = read(file);
-      const events = parseEngineSession(content, engine ?? (file.endsWith("pi-streaming.jsonl") ? "pi" : "custom"));
-      if (!events.length && content.trim()) report(file, "unrecognized_engine_log", undefined);
+      const parsed = parseEngineSession(content, engine ?? (file.endsWith("pi-streaming.jsonl") ? "pi" : "custom"));
+      const events =
+        engine === "copilot" || native.length
+          ? deduplicateCopilotFallback(
+              parsed,
+              sources.filter(source => source.component === "agent").map(source => source.events)
+            )
+          : parsed;
+      if (!parsed.length && content.trim()) report(file, "unrecognized_engine_log", undefined);
       sources.push({ component: "agent", phase: "agent", path: path.relative(rootDir, file), events });
     }
   }
@@ -422,6 +450,8 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
     ["", "agent"],
     ["threat-detection/", "detection"],
   ]) {
+    const otel = choose([`${prefix}otel.jsonl`, `usage/${prefix}otel.jsonl`]);
+    if (otel) add(otel, "otel", phase, undefined, "nanoseconds");
     for (const file of walk(path.join(rootDir, prefix, "mcp-logs"))) add(file, "mcp", phase, undefined);
     const seen = new Set();
     for (const layout of ["sandbox/firewall/logs", "sandbox/firewall/audit", "sandbox/firewall-audit-logs", "firewall-logs", "firewall-audit-logs"]) {
@@ -437,6 +467,7 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
   }
   /** @type {Array<[string[], string, string, `${string}.${string}`]>} */
   const observations = [
+    [["agent/awf-routing-outcome.json"], "agent", "agent", "model_routing.outcome"],
     [["safeoutputs.jsonl"], "safe_output", "agent", "safe_output.request"],
     [["safe-output-items.jsonl"], "safe_output", "safe_outputs", "safe_output.result"],
     [["safe-output-errors.json"], "safe_output", "safe_outputs", "safe_output.error"],
@@ -445,19 +476,49 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
     [["experiments/assignments.json", "usage/experiment/assignments.json"], "experiment", "activation", "experiment.assignment"],
     [["agent/graders/grader_manifest.json", "usage/graders/grader_manifest.json"], "grader", "agent", "grader.manifest"],
     [["agent/graders/grader_results.json", "usage/graders/grader_results.json"], "grader", "agent", "grader.result"],
-    [["evals/evals.jsonl", "usage/evals.jsonl"], "eval", "evals", "eval.result"],
+    [["evals/evals.jsonl", "evals.jsonl", "usage/evals.jsonl"], "eval", "evals", "eval.result"],
     [["agent_usage.jsonl", "usage/agent_usage.jsonl"], "usage", "agent", "usage.report"],
     [["github_rate_limits.jsonl", "usage/github_rate_limits.jsonl"], "github_api", "workflow", "github_api.rate_limit"],
     [["threat-detection/detection_usage.jsonl", "detection_usage.jsonl", "usage/detection_usage.jsonl"], "usage", "detection", "usage.report"],
-    [["evals/evals_token_usage.jsonl", "usage/evals/token_usage.jsonl"], "usage", "evals", "usage.report"],
+    [["evals/evals_token_usage.jsonl", "evals_token_usage.jsonl", "usage/evals/token_usage.jsonl"], "usage", "evals", "usage.report"],
     [["agent_execution.json", "usage/agent/execution.json"], "execution", "agent", "execution.result"],
     [["threat-detection/execution.json", "usage/detection/execution.json"], "execution", "detection", "execution.result"],
     [["evals/evals/execution.json", "evals/execution.json", "usage/evals/execution.json"], "execution", "evals", "execution.result"],
     // The sanitized conclusion result includes job outcomes as well as structured or inline verdicts.
     [["usage/detection/detection_result.json", "threat-detection/detection_result.json"], "detection", "detection", "detection.result"],
   ];
+  const mismatchFile = path.join(rootDir, "agent/model-endpoint-mismatch.json");
+  if (exists(mismatchFile)) {
+    try {
+      const record = JSON.parse(read(mismatchFile));
+      if (!isModelEndpointMismatchData(record)) {
+        report(mismatchFile, "invalid_model_endpoint_mismatch", undefined);
+      } else {
+        const keys = ["category", "phase", "configured_model", "resolved_model", "wire_api", "wire_api_source", "supported_endpoints", "detail", "fix", "model", "endpoint"];
+        const data = Object.fromEntries(keys.filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]));
+        sources.push({ component: "model_endpoint", phase: record.phase, path: "agent/model-endpoint-mismatch.json", events: [{ type: "model_endpoint.mismatch", data }] });
+      }
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      report(mismatchFile, "malformed_json", undefined);
+    }
+  }
   for (const [candidates, component, phase, type] of observations) {
     const file = choose(candidates);
+    if (type === "model_routing.outcome" && file) {
+      /** @type {SessionEvent[]} */
+      const events = records(file).flatMap(record => {
+        if (!record || typeof record !== "object" || Array.isArray(record)) {
+          incompleteSources.add(file);
+          report(file, "non_object_record", undefined);
+          return [];
+        }
+
+        return [/** @type {SessionEvent} */ { type, data: record, ...(record.timestamp !== undefined ? { timestamp: record.timestamp } : {}) }];
+      });
+      sources.push({ component, phase, path: path.relative(rootDir, file), events });
+      continue;
+    }
     if (file) add(file, component, phase, type);
   }
   const executionFile = path.join(rootDir, "agent-errors.jsonl");
@@ -482,6 +543,7 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
   const exitCode = observedExit ?? nativeExit?.exitCode ?? nativeExit?.exit_code;
   const execution = collectAgentExecution({
     content: stdioContent,
+    ...(engine === "aider" ? { rawSourceEngine: "aider" } : {}),
     events: executionAgentSources.flatMap(source => source.events),
     observations: executionObservations,
     ...(exists(exitFile) ? { exitCode: parseAgentExitCode(read(exitFile)) } : exitCode !== undefined ? { exitCode: validateAgentExitCode(exitCode) } : {}),
@@ -512,14 +574,21 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
     }
     sources.push({ component: "guardrail", phase: "activation", path: "usage/aw_session.jsonl", events: [{ type: "guardrail.daily_aic", data }] });
   }
+  const persistedWarnings = sources.flatMap(source => source.events.filter(event => event.type === "session.collection_warning"));
+  const coverageWarnings = [...warnings];
+  for (const event of persistedWarnings) {
+    const data = event.data;
+    const matching = warnings.filter(warning => warning.data.path === data.path && warning.data.code === data.code);
+    if (!matching.some(warning => data.line === undefined || warning.data.line === data.line)) coverageWarnings.push(event);
+  }
   /** @type {SessionEvent} */
   const summary = {
     type: "session.collection",
     data: {
-      sources: sources.map(({ events, ...source }) => ({ ...source, events: events.length })),
-      warnings: warnings.length,
+      sources: sources.map(({ events, indices: _indices, ...source }) => ({ ...source, events: events.length })),
+      warnings: coverageWarnings.length,
       untimedEvents: sources.reduce((total, source) => total + source.events.filter(event => sessionTimestamp(event, source.timestampUnit) === undefined).length, 0),
-      absentComponents: ["agent", "mcp", "firewall", "safe_output", "experiment", "grader", "eval"].filter(component => !sources.some(source => source.component === component)),
+      absentComponents: ["agent", "mcp", "firewall", "safe_output", "experiment", "grader", "eval", "workflow"].filter(component => !sources.some(source => source.component === component)),
     },
   };
   /** @type {import("./types/agent_session").SessionFileFormatEvent} */
@@ -563,4 +632,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { SESSION_FILE_FORMAT_VERSION, sessionTimestamp, mergeSessionSources, normalizeRuntimeEvent, parseEngineSession, collectUnifiedSession, writeUnifiedSession, main };
+module.exports = { SESSION_FILE_FORMAT_VERSION, sessionTimestamp, mergeSessionSources, normalizeRuntimeEvent, parseEngineSession, collectUnifiedSession, isModelEndpointMismatchData, writeUnifiedSession, main };

@@ -18,12 +18,15 @@ function fakeGitHub(initial = []) {
   const trees = new Map();
   const commits = new Map();
   const refs = new Map();
-  /** @type {{calls: string[], beforeUpdate: ((snapshot: {log: ReturnType<typeof log>, candidate: ReturnType<typeof log>, install: typeof install}) => Promise<unknown>) | null, ambiguousOnce: boolean, visibility: boolean, defaultRevision: string, workerContent: string | null, workerWorkflow: {id: number, path: string, state: string} | null, missingLog: boolean, truncated: boolean, badBlob: {encoding: string, content: string} | null, emptyLog: boolean, updates: number}} */
+  /** @type {{calls: string[], beforeUpdate: ((snapshot: {log: ReturnType<typeof log>, candidate: ReturnType<typeof log>, install: typeof install}) => Promise<unknown>) | null, ambiguousOnce: boolean, visibility: boolean, emptyRepository: boolean, bootstrapAmbiguous: boolean, bootstrapWrites: number, defaultRevision: string, workerContent: string | null, workerWorkflow: {id: number, path: string, state: string} | null, missingLog: boolean, truncated: boolean, badBlob: {encoding: string, content: string} | null, emptyLog: boolean, updates: number}} */
   const state = {
     calls: [],
     beforeUpdate: null,
     ambiguousOnce: false,
     visibility: true,
+    emptyRepository: false,
+    bootstrapAmbiguous: false,
+    bootstrapWrites: 0,
     defaultRevision: "a".repeat(40),
     workerContent: "on:\n  workflow_dispatch:\n    inputs:\n      work_queue_assignment:\n        type: string\n        required: true\n",
     workerWorkflow: { id: 42, path: ".github/workflows/worker.lock.yml", state: "active" },
@@ -51,12 +54,22 @@ function fakeGitHub(initial = []) {
     return head ? parseTransactionLog(blobs.get(trees.get(commits.get(head).tree))) : [];
   };
   const githubClient = {
+    graphql: async () => ({ repository: { nameWithOwner: "owner/repo", isEmpty: state.emptyRepository && !refs.has("main") } }),
     rest: {
       repos: {
         get: async () => {
           state.calls.push("repos.get");
           if (!state.visibility) throw missing();
-          return { data: { full_name: "owner/repo", default_branch: "main", size: 1 } };
+          return { data: { full_name: "owner/repo", default_branch: "main", size: state.emptyRepository && !refs.has("main") ? 0 : 1 } };
+        },
+        createOrUpdateFileContents: async ({ path, content }) => {
+          assert.equal(path, ".gh-aw/work-queue-bootstrap");
+          assert.ok(Buffer.from(content, "base64").toString("utf8").includes("authoritative queue ledger"));
+          state.bootstrapWrites++;
+          if (refs.has("main")) throw Object.assign(new Error("Already initialized"), { status: 422 });
+          refs.set("main", state.defaultRevision);
+          if (state.bootstrapAmbiguous) throw Object.assign(new Error("Transport response lost"), { status: 502 });
+          return { data: {} };
         },
         getContent: async ({ owner, repo, path, ref }) => {
           assert.equal(`${owner}/${repo}`, "owner/repo");
@@ -81,16 +94,20 @@ function fakeGitHub(initial = []) {
         getRef: async ({ ref }) => {
           state.calls.push(`getRef:${ref}`);
           if (ref === "heads/main") {
+            if (state.emptyRepository && !refs.has("main")) throw Object.assign(new Error("Git Repository is empty"), { status: 409 });
             if (!state.defaultRevision) throw missing();
             return { data: { object: { sha: state.defaultRevision } } };
           }
           const sha = refs.get(ref.slice("heads/".length));
-          if (!sha) throw missing();
+          if (!sha) {
+            if (state.emptyRepository && !refs.has("main")) throw Object.assign(new Error("Git Repository is empty"), { status: 409 });
+            throw missing();
+          }
           return { data: { object: { sha } } };
         },
         getCommit: async ({ commit_sha }) => {
           if (!commits.has(commit_sha)) throw missing();
-          return { data: { tree: { sha: commits.get(commit_sha).tree } } };
+          return { data: { tree: { sha: commits.get(commit_sha).tree }, parents: commits.get(commit_sha).parents.map(sha => ({ sha })) } };
         },
         getTree: async ({ tree_sha }) => ({ data: { truncated: state.truncated, tree: state.missingLog ? [] : [{ path: "work-queue.jsonl", type: "blob", mode: "100644", sha: trees.get(tree_sha) }] } }),
         getBlob: async ({ file_sha }) => {
@@ -119,6 +136,7 @@ function fakeGitHub(initial = []) {
         },
         createRef: async ({ ref, sha }) => {
           const branch = ref.slice("refs/heads/".length);
+          if (state.emptyRepository && !refs.has("main")) throw Object.assign(new Error("Git Repository is empty"), { status: 422 });
           if (refs.has(branch)) throw Object.assign(new Error("Reference already exists"), { status: 422 });
           refs.set(branch, sha);
           return { data: {} };
@@ -330,7 +348,7 @@ function registerTests({ describe, it }) {
       assert.deepEqual(fake.state.calls, []);
       assert.equal(fake.state.updates, 0);
     });
-    it("exposes administrator-only racing genesis installation without overwriting installed or malformed histories", async () => {
+    it("rejects standalone administrator seeding without repository reads or writes", async () => {
       const fake = fakeGitHub();
       const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
       const input = {
@@ -342,40 +360,33 @@ function registerTests({ describe, it }) {
         maxRetries: 0,
         now: () => 100,
       };
-      await assert.rejects(initializeWorkQueue({ ...input, context: context(dispatcher) }), error => error instanceof Error && "code" in error && error.code === "actor_unauthorized");
-      assert.equal(fake.log().length, 0);
-      const installed = await Promise.all([initializeWorkQueue(input), initializeWorkQueue(input)]);
-      assert.equal(installed.filter(result => result.publishedNow).length, 1);
-      assert.equal(installed.filter(result => result.recovered).length, 1);
-      for (const result of installed) {
-        assert.equal(result.transactions.length, 1);
-        assert.equal(result.state.policy_epoch, "initial");
-        assert.equal(canonical(result.state.policy), canonical(policy));
-        assert.equal(typeof result.sha, "string");
+      for (const participant of [administrator, dispatcher, producer]) {
+        await assert.rejects(initializeWorkQueue({ ...input, context: context(participant) }), { code: "unsupported_protocol" });
       }
-      const blobCount = fake.blobs.size;
-      const anotherOrigin = await initializeWorkQueue({
-        ...input,
-        context: context({ ...administrator, workflow: ".github/workflows/bootstrap.lock.yml", run_id: "101", run_attempt: 1 }),
-      });
-      assert.equal(anotherOrigin.publishedNow, false);
-      assert.equal(canonical(anotherOrigin.state.policy), canonical(policy));
-      assert.equal(fake.blobs.size, blobCount);
-      const existing = await initializeWorkQueue({ ...input, policyProposal: { ...policy, mode: "strict-priority" } });
-      assert.equal(existing.publishedNow, false);
-      assert.equal(canonical(existing.state.policy), canonical(policy));
-      assert.equal(fake.blobs.size, blobCount);
-      fake.state.defaultRevision = "not-an-immutable-revision";
-      fake.state.workerContent = null;
-      fake.state.workerWorkflow = null;
-      const existingWithoutProposal = await initializeWorkQueue({ ...input, policyProposal: undefined });
-      assert.equal(existingWithoutProposal.publishedNow, false);
-      assert.equal(canonical(existingWithoutProposal.state.policy), canonical(policy));
-      assert.equal(fake.blobs.size, blobCount);
-      fake.state.missingLog = true;
-      await assert.rejects(initializeWorkQueue(input), error => error instanceof Error && "code" in error && error.code === "ledger_invalid");
-      assert.equal(fake.blobs.size, blobCount);
+      assert.deepEqual(fake.state.calls, []);
+      const operation = { kind: "Policy", epoch: "standalone", policy };
+      const request = newRequest("standalone-policy", "policy", administrator, { operations: [operation] });
+      await assert.rejects(publishWorkQueueRequest(options(fake, request, administrator)), { code: "queue_missing" });
+      assert.equal(fake.blobs.size, 0);
+      assert.equal(fake.refs.has("work-queue"), false);
       assert.equal(fake.state.updates, 0);
+    });
+    it("recovers racing first submissions as one Policy-and-Work genesis without administrator context", async () => {
+      const fake = fakeGitHub();
+      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+      const nodes = submission([genesis(policy)], ["racing-first-work"]).operations;
+      const request = newRequest("racing-first-submit", "submit", producer, { nodes });
+      const input = options(fake, request, producer, { policyProposal: policy, maxRetries: 0 });
+      const results = await Promise.all([publishWorkQueueRequest(input), publishWorkQueueRequest(input)]);
+      assert.equal(results.filter(result => result.publishedNow).length, 1);
+      assert.equal(results.filter(result => result.recovered).length, 1);
+      assert.equal(fake.log().length, 1);
+      assert.equal(fake.log()[0].request.id, request.id);
+      assert.equal(fake.log()[0].actor.role, "producer");
+      assert.deepEqual(
+        fake.log()[0].operations.map(operation => operation.kind),
+        ["Policy", "Work"]
+      );
     });
     it("requires private remediation proof for uncertain effects and revalidates it on every stale CAS", async () => {
       const fixture = require("../../../specs/work-queue/fixtures/canonical-prefix.json");
@@ -890,32 +901,141 @@ function registerTests({ describe, it }) {
       }
       assert.equal(fake.state.updates, 0);
     });
+    it("provisions an absent queue branch from the compiled Policy on the first producer submission", async () => {
+      const fake = fakeGitHub();
+      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+      const nodes = [newWork({ task: "first safe-output submission" }, "bootstrap-graph", "root", "default", policy, 100)];
+      const request = newRequest("producer-bootstrap", "submit", producer, { nodes });
+      const result = await publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy, maxRetries: 0 }));
+      assert.equal(result.publishedNow, true);
+      assert.equal(fake.refs.has("work-queue"), true);
+      assert.equal(result.transactions.length, 1);
+      assert.equal(result.commit.actor.role, "producer");
+      assert.deepEqual(
+        result.commit.operations.map(operation => operation.kind),
+        ["Policy", "Work"]
+      );
+      assert.deepEqual(result.state.policy, policy);
+      assert.ok(fake.state.calls.includes(`getContent:.github/workflows/worker.lock.yml@${fake.state.defaultRevision}`));
+      assert.ok(fake.state.calls.includes("getWorkflow:worker.lock.yml"));
+      await publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy, maxRetries: 0 }));
+      assert.equal(fake.log().length, 1);
+    });
+    it("automatically bootstraps for workflow participants without protection checks or administrator APIs", async () => {
+      for (const participant of [producer, dispatcher]) {
+        const fake = fakeGitHub();
+        const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+        const originalGraphql = fake.githubClient.graphql;
+        fake.githubClient.graphql = async (query = "") => {
+          assert.doesNotMatch(query, /branchProtectionRules|rulesets/);
+          return originalGraphql();
+        };
+        const originalRepos = fake.githubClient.rest.repos;
+        fake.githubClient.rest.repos = new Proxy(originalRepos, {
+          get(target, name, receiver) {
+            if (typeof name === "string" && /ruleset|protection|collaborator/i.test(name)) throw new Error(`unexpected administration API: ${name}`);
+            return Reflect.get(target, name, receiver);
+          },
+        });
+        const nodes = [newWork({ task: "automatic first use" }, `first-use-${participant.role}`, "root", "default", policy, 100)];
+        const request = newRequest(`unprotected-bootstrap-${participant.role}`, "submit", participant, { nodes });
+        const published = await publishWorkQueueRequest(options(fake, request, participant, { policyProposal: policy, maxRetries: 0 }));
+        assert.equal(published.publishedNow, true);
+        assert.equal(fake.refs.get("work-queue"), published.sha);
+        assert.equal(published.commit.actor.role, participant.role);
+        assert.deepEqual(
+          published.commit.operations.map(operation => operation.kind),
+          ["Policy", "Work"]
+        );
+        assert.equal(fake.log().length, 1);
+        const replayed = await publishWorkQueueRequest(options(fake, request, participant, { policyProposal: policy, maxRetries: 0 }));
+        assert.equal(replayed.publishedNow, false);
+        assert.equal(fake.log().length, 1);
+      }
+    });
+    it("initializes a branchless repository only after validating the first Policy and Work", async () => {
+      for (const ambiguous of [false, true]) {
+        const fake = fakeGitHub();
+        fake.state.emptyRepository = true;
+        fake.state.bootstrapAmbiguous = ambiguous;
+        const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+        const nodes = [newWork({ task: "first work" }, "bootstrap-graph", "root", "default", policy, 100)];
+        const request = newRequest("empty-repository-bootstrap", "submit", producer, { nodes });
+        const empty = await readWorkQueueLog({ githubClient: fake.githubClient, owner: "owner", repo: "repo" });
+        assert.equal(empty.sha, null);
+        assert.equal(fake.state.bootstrapWrites, 0);
+        const result = await publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy, maxRetries: 0 }));
+        assert.equal(result.publishedNow, true);
+        assert.equal(fake.state.bootstrapWrites, 1);
+        assert.equal(fake.refs.get("work-queue"), result.sha);
+        assert.deepEqual(
+          result.transactions[0].operations.map(operation => operation.kind),
+          ["Policy", "Work"]
+        );
+        await publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy, maxRetries: 0 }));
+        assert.equal(fake.state.bootstrapWrites, 1);
+      }
+      const fake = fakeGitHub();
+      fake.state.emptyRepository = true;
+      fake.state.workerContent = null;
+      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+      const request = newRequest("unverified-route", "submit", producer, { nodes: [newWork({ task: "first work" }, "graph", "root", "default", policy, 100)] });
+      await assert.rejects(publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy, maxRetries: 0 })), /policy_missing/);
+      assert.equal(fake.state.bootstrapWrites, 1);
+      assert.equal(fake.refs.has("work-queue"), false);
+      fake.state.workerContent = "on:\n  workflow_dispatch:\n    inputs:\n      work_queue_assignment:\n        type: string\n        required: true\n";
+      const result = await publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy, maxRetries: 0 }));
+      assert.equal(result.publishedNow, true);
+      assert.equal(fake.state.bootstrapWrites, 1);
+    });
+    it("never initializes an empty repository on the queue branch itself", async () => {
+      const fake = fakeGitHub();
+      fake.state.emptyRepository = true;
+      const originalGet = fake.githubClient.rest.repos.get;
+      fake.githubClient.rest.repos.get = async () => {
+        const response = await originalGet();
+        return { data: { ...response.data, default_branch: "work-queue" } };
+      };
+      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+      const request = newRequest("same-default-branch", "submit", producer, { nodes: [newWork({ task: "first work" }, "graph", "root", "default", policy, 100)] });
+      await assert.rejects(publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy })), /branch_invalid/);
+      assert.equal(fake.state.bootstrapWrites, 0);
+      assert.equal(fake.refs.has("work-queue"), false);
+    });
+    it("does not mistake a generic Git conflict for an absent queue branch", async () => {
+      const fake = fakeGitHub();
+      fake.githubClient.rest.git.getRef = async () => {
+        throw Object.assign(new Error("Conflict"), { status: 409 });
+      };
+      await assert.rejects(readWorkQueueLog({ githubClient: fake.githubClient, owner: "owner", repo: "repo" }), { status: 409 });
+      assert.equal(fake.state.bootstrapWrites, 0);
+    });
     it("installs mandatory defaults only on genuine genesis and does not overlay authoritative installed Policy", async () => {
       const fake = fakeGitHub();
-      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001" });
+      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
       const root = genesis(policy);
       const add = submission([root], ["a"]);
       const request = newRequest("submit-first", "submit", producer, { nodes: add.operations });
-      await publishWorkQueueRequest(options(fake, request, producer, { initializationContext: context(administrator), context: context(producer, { ref: "b".repeat(40) }), maxRetries: 0 }));
+      await publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy, context: context(producer, { ref: "b".repeat(40) }), maxRetries: 0 }));
       const state = replayTransactions(fake.log());
       assert.equal(state.transactions[0].operations[0].kind, "Policy");
       assert.equal(state.policy.pools.default.profiles.default.max_claims, 1);
       assert.equal(state.policy.pools.default.profiles.default.ref, "a".repeat(40));
       const seed = createHash("sha256").update(request.id, "utf8").digest("hex");
-      assert.equal(state.transactions[0].request.id, `init_${seed}`);
+      assert.equal(state.transactions[0].request.id, request.id);
       assert.equal(state.policy_epoch, `epoch_${seed}`);
       const proposal = structuredClone(policy);
       proposal.mode = "strict-priority";
       const later = submission(fake.log(), ["b"], { id: "second" });
       await publishWorkQueueRequest(options(fake, later.request, producer, { policyProposal: proposal }));
       assert.equal(replayTransactions(fake.log()).policy.mode, "weighted-priority");
-      assert.equal(replayTransactions(fake.log()).transactions.filter(commit => commit.request.kind === "policy").length, 1);
+      assert.equal(replayTransactions(fake.log()).transactions.filter(commit => commit.request.kind === "policy").length, 0);
     });
-    it("never elevates a dispatcher context to initialize Policy without explicit administrator context", async () => {
+    it("requires a compiled proposal rather than administrator elevation for first submission", async () => {
       const fake = fakeGitHub();
       const root = genesis();
       const nodes = submission([root], ["a"]).operations;
-      const request = newRequest("explicit-administrator-required", "submit", dispatcher, { nodes });
+      const request = newRequest("compiled-proposal-required", "submit", dispatcher, { nodes });
       await assert.rejects(
         publishWorkQueueRequest(options(fake, request, dispatcher, { context: context(dispatcher, { roles: ["dispatcher", "administrator"] }) })),
         error => error instanceof Error && "code" in error && error.code === "policy_missing"
@@ -923,14 +1043,14 @@ function registerTests({ describe, it }) {
       assert.equal(fake.log().length, 0);
       assert.equal(fake.blobs.size, 0);
     });
-    it("fails default genesis routing closed without a verified immutable repository revision", async () => {
+    it("rejects explicit administrator contexts instead of using them to seed a queue", async () => {
       const policy = defaultPolicy({ repository: "owner/repo", principal: "1001" });
       const add = submission([genesis(policy)], ["a"]);
       const request = newRequest("default-revision-required", "submit", producer, { nodes: add.operations });
       for (const revision of ["refs/heads/main", "A".repeat(40), "abc"]) {
         const fake = fakeGitHub();
         fake.state.defaultRevision = revision;
-        await assert.rejects(publishWorkQueueRequest(options(fake, request, producer, { initializationContext: context(administrator) })), /immutable verified/);
+        await assert.rejects(publishWorkQueueRequest(options(fake, request, producer, { initializationContext: context(administrator) })), /unsupported_protocol/);
         assert.equal(fake.refs.has("work-queue"), false);
         assert.equal(fake.state.updates, 0);
       }
@@ -949,7 +1069,8 @@ function registerTests({ describe, it }) {
       ]) {
         const fake = fakeGitHub();
         change(fake.state);
-        await assert.rejects(publishWorkQueueRequest(options(fake, request, producer, { initializationContext: context(administrator) })));
+        const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+        await assert.rejects(publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy })), /policy_missing/);
         assert.equal(fake.refs.has("work-queue"), false);
         assert.equal(fake.blobs.size, 0);
         assert.equal(fake.state.updates, 0);
@@ -960,20 +1081,21 @@ function registerTests({ describe, it }) {
       fake.state.workerContent = "on:\n  workflow_dispatch:\n    inputs:\n      work_queue_assignment:\n        type: string\n        required: false\n";
       const nodes = submission([genesis()], ["a"]).operations;
       const request = newRequest("optional-default-worker-input", "submit", producer, { nodes });
-      await publishWorkQueueRequest(options(fake, request, producer, { initializationContext: context(administrator) }));
-      assert.equal(fake.log().length, 2);
+      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+      await publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy }));
+      assert.equal(fake.log().length, 1);
       assert.equal(fake.log()[0].operations[0].policy.pools.default.profiles.default.ref, fake.state.defaultRevision);
     });
     it("rejects fresh explicit zero-revision profiles without rejecting retained valid constructor-fixture history", async () => {
       for (const ref of ["0".repeat(40), "0".repeat(64)]) {
         const fake = fakeGitHub();
         const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref });
-        const operation = { kind: "Policy", epoch: "approved-explicit", policy };
-        const request = newRequest(`zero-default-${ref.length}`, "policy", administrator, { operations: [operation] });
-        await assert.rejects(publishWorkQueueRequest(options(fake, request, administrator)), /policy_missing/);
+        const nodes = submission([genesis(policy)], ["zero-ref"]).operations;
+        const request = newRequest(`zero-default-${ref.length}`, "submit", producer, { nodes });
+        await assert.rejects(publishWorkQueueRequest(options(fake, request, producer, { policyProposal: policy })), /policy_missing/);
         assert.equal(fake.blobs.size, 0);
         assert.equal(fake.refs.has("work-queue"), false);
-        await assert.rejects(initializeWorkQueue({ ...options(fake, request, administrator), policyProposal: policy }), /policy_missing/);
+        await assert.rejects(initializeWorkQueue({ ...options(fake, request, producer), policyProposal: policy }), /unsupported_protocol/);
         assert.equal(fake.blobs.size, 0);
         assert.equal(fake.refs.has("work-queue"), false);
         const retained = fakeGitHub([genesis(policy)]);
@@ -982,7 +1104,7 @@ function registerTests({ describe, it }) {
         assert.equal(retainedState.policy.pools.default.profiles.default.ref, ref);
       }
     });
-    it("verifies the native worker route for direct explicit Policy genesis without a default-profile detour", async () => {
+    it("rejects direct explicit Policy genesis before route reads or writes", async () => {
       for (const policyProposal of [false, true]) {
         const fake = fakeGitHub();
         fake.state.workerContent = null;
@@ -991,6 +1113,10 @@ function registerTests({ describe, it }) {
         const request = newRequest("explicit-native-worker-required", "policy", administrator, { operations: [operation] });
         const input = options(fake, request, administrator);
         await assert.rejects(policyProposal ? initializeWorkQueue({ ...input, policyProposal: policy, epoch: operation.epoch }) : publishWorkQueueRequest(input));
+        assert.equal(
+          fake.state.calls.some(call => call.startsWith("getContent:")),
+          false
+        );
         assert.equal(fake.blobs.size, 0);
         assert.equal(fake.refs.has("work-queue"), false);
         assert.equal(fake.state.updates, 0);
@@ -1275,28 +1401,34 @@ function registerTests({ describe, it }) {
       assert.equal(result.commit.id, expected);
       assert.equal(result.assignments[0].commit_id, expected);
       const empty = fakeGitHub();
-      const operation = genesis(defaultPolicy({ repository: "owner/repo", principal: "1001", ref: empty.state.defaultRevision })).operations[0];
-      const bootstrap = newRequest("canonical-genesis", "policy", administrator, { operations: [operation] });
-      const { commitId: omittedRootCommitId, ...rootPublication } = options(empty, bootstrap, administrator);
+      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: empty.state.defaultRevision });
+      const nodes = submission([genesis(policy)], ["first"]).operations;
+      const bootstrap = newRequest("canonical-genesis", "submit", producer, { nodes });
+      const { commitId: omittedRootCommitId, ...rootPublication } = options(empty, bootstrap, producer, { policyProposal: policy });
       const installed = await publishWorkQueueRequest(rootPublication);
       assert.equal(installed.commit.id, `q_${createHash("sha256").update(bootstrap.id, "utf8").digest("hex")}`);
     });
     it("matches independent native naming goldens for automatic bootstrap and the originating publication", async () => {
       const golden = contractFixture.identities.publisher_generation_example;
       const fake = fakeGitHub();
-      const nodes = submission([genesis()], ["a"]).operations;
+      const policy = defaultPolicy({ repository: "owner/repo", principal: "1001", ref: fake.state.defaultRevision });
+      const nodes = submission([genesis(policy)], ["a"]).operations;
       const request = newRequest(golden.publication_request_id, "submit", producer, { nodes });
-      const { commitId: omittedCommitId, ...publication } = options(fake, request, producer, { initializationContext: context(administrator), maxRetries: 0 });
+      const { commitId: omittedCommitId, ...publication } = options(fake, request, producer, { policyProposal: policy, maxRetries: 0 });
       const result = await publishWorkQueueRequest(publication);
       const log = fake.log();
-      assert.equal(log.length, 2);
+      assert.equal(log.length, 1);
       assert.equal(log[0].request.id, golden.genesis_request_id);
       assert.equal(log[0].id, golden.genesis_commit_id);
       assert.equal(log[0].policy_epoch, golden.genesis_policy_epoch);
       assert.equal(log[0].operations[0].epoch, golden.genesis_policy_epoch);
-      assert.equal(log[1].request.id, golden.publication_request_id);
-      assert.equal(log[1].previous, golden.genesis_commit_id);
-      assert.equal(log[1].id, golden.publication_commit_id);
+      assert.equal(log[0].request.id, golden.publication_request_id);
+      assert.equal(log[0].previous, null);
+      assert.equal(log[0].id, golden.publication_commit_id);
+      assert.deepEqual(
+        log[0].operations.map(operation => operation.kind),
+        ["Policy", "Work"]
+      );
       assert.equal(result.commit.id, golden.publication_commit_id);
       assert.equal(result.state.policy_epoch, golden.genesis_policy_epoch);
     });
@@ -1364,10 +1496,10 @@ function registerTests({ describe, it }) {
       const fake = fakeGitHub();
       const parameters = { pool: "default", max_claims: 1, max_dispatches: 1, max_bytes: 49152 };
       const wrongRole = { ...administrator, role: "reconciler" };
-      await assert.rejects(publishWorkQueueRequest(options(fake, newRequest("wrong-role", "dispatch_next", wrongRole, parameters), wrongRole, { initializationContext: context(administrator) })), /actor_unauthorized/);
+      await assert.rejects(publishWorkQueueRequest(options(fake, newRequest("wrong-role", "dispatch_next", wrongRole, parameters), wrongRole)), /actor_unauthorized/);
       assert.equal(fake.state.calls.length, 0);
       const foreignWorker = { ...dispatcher, role: "worker", dispatch_id: "foreign", claim_handle: "h1" };
-      await assert.rejects(publishWorkQueueRequest(options(fake, newRequest("wrong-scope", "dispatch_next", foreignWorker, parameters), foreignWorker, { initializationContext: context(administrator) })), /claim_scope_invalid/);
+      await assert.rejects(publishWorkQueueRequest(options(fake, newRequest("wrong-scope", "dispatch_next", foreignWorker, parameters), foreignWorker)), /claim_scope_invalid/);
       assert.equal(fake.refs.size, 0);
       assert.equal(fake.state.updates, 0);
     });

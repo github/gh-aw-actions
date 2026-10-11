@@ -35,7 +35,8 @@ function renderWorkQueueMessage(template, values, run) {
 }
 
 function issueBody(state, work, origin, config, branch) {
-  const admission = state.transactions[work.position.commit].actor;
+  const admission = state.workCreators?.get(work.work_id);
+  if (!admission) throw new Error("work_queue_admission_provenance_missing");
   const ledgerUrl = `https://github.com/${state.repository}/blob/${branch}/work-queue.jsonl`;
   return renderWorkQueueMessage(
     "work_queue_issue_body.md",
@@ -45,20 +46,20 @@ function issueBody(state, work, origin, config, branch) {
       admission_link_label: admission.run_id ? "View the admitting run" : "View the admission receipt",
       ledger_url: ledgerUrl,
       tracking_label: config.label,
-      projection_note: config["status-field"] ? "Progress is projected into the configured native Issue status field when synchronization is available." : "The live summary carries its current status.",
+      projection_note: "Progress is projected into a status label; the live summary links to the checked ledger.",
     },
     origin
   );
 }
 
-function renderSummary(values, run, status, nativeField) {
-  const statusSection = nativeField ? "" : renderTemplateFromFile(getPromptPath("work_queue_issue_status.md"), { status }).trimEnd();
+function renderSummary(values, run, status) {
+  const statusSection = renderTemplateFromFile(getPromptPath("work_queue_issue_status.md"), { status }).trimEnd();
   return renderWorkQueueMessage(
     "work_queue_issue_summary.md",
     {
       ...values,
       status_section: statusSection,
-      progress_note: nativeField ? "Progress is tracked in the native Issue status field. The links below follow the checked ledger." : PROGRESS_NOTES[status],
+      progress_note: PROGRESS_NOTES[status],
     },
     run
   );

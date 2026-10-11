@@ -32,6 +32,7 @@ export interface UnifiedSessionUsage {
 export interface UnifiedSessionContextData {
   sessionId?: JsonValue;
   parentToolUseId?: JsonValue;
+  parentToolCallId?: JsonValue;
   agentId?: JsonValue;
 }
 
@@ -98,15 +99,91 @@ export interface RuntimeObservationData {
   requestId?: JsonValue;
 }
 
+/** AWF API proxy steering event-log observation. */
+export interface FirewallSteeringData extends RuntimeObservationData {
+  threshold?: JsonValue;
+}
+
+/** AWF steering notice delivered on a model request. */
+export interface SteeringNotice {
+  type: "ai_credit" | "timeout" | "token";
+  threshold: 80 | 90 | 95 | 99;
+}
+
 export interface ModelRoutingData {
+  schema?: JsonValue;
   stage?: JsonValue;
+  purpose?: JsonValue;
+  attempt?: JsonValue;
+  classifier_model?: JsonValue;
+  classifier_attempts?: JsonValue;
+  classifierModel?: JsonValue;
+  classifierEffort?: JsonValue;
+  objective?: JsonValue;
+  provider?: JsonValue;
+  labels?: JsonValue;
+  mode?: JsonValue;
+  degradedClassification?: JsonValue;
+  degradedReason?: JsonValue;
+  selectedId?: JsonValue;
+  selectedProvider?: JsonValue;
   routed?: JsonValue;
   outcome?: JsonValue;
   selected_model?: JsonValue;
   selected_effort?: JsonValue;
+  selectedModel?: JsonValue;
+  selectedEffort?: JsonValue;
+  wireModel?: JsonValue;
+  endpoint?: JsonValue;
   router?: JsonValue;
+  latencyMs?: JsonValue;
+  code?: JsonValue;
+  requestId?: JsonValue;
   request_id?: JsonValue;
+  classifierAttempts?: JsonValue;
   deviations?: JsonValue;
+  requestedModel?: JsonValue;
+  requestedEffort?: JsonValue;
+}
+
+export interface ModelEndpointMismatchData {
+  category: "model_endpoint_mismatch";
+  phase: "startup" | "runtime";
+  configured_model: string;
+  resolved_model: string;
+  wire_api: string;
+  wire_api_source: string;
+  supported_endpoints: string[];
+  detail: string;
+  fix: string;
+  model?: string;
+  endpoint?: string;
+}
+
+export interface UnifiedModelRoutingData {
+  status?: JsonValue;
+  source?: JsonValue;
+  provider?: JsonValue;
+  wireModel?: JsonValue;
+  model?: JsonValue;
+  effort?: JsonValue;
+  appliedEffort?: JsonValue;
+  effectiveEndpoint?: JsonValue;
+  selectedEndpoint?: JsonValue;
+  mode?: JsonValue;
+  selectedId?: JsonValue;
+  routerVersion?: JsonValue;
+  failureCode?: JsonValue;
+}
+
+export interface ModelRoutingOutcomeData {
+  status?: JsonValue;
+  wireModel?: JsonValue;
+  effectiveEndpoint?: JsonValue;
+  selectedEndpoint?: JsonValue;
+  effort?: JsonValue;
+  appliedEffort?: JsonValue;
+  failureCode?: JsonValue;
 }
 
 export interface McpObservationData {
@@ -134,15 +211,20 @@ export interface FirewallAccessData {
   durationMs?: JsonValue;
 }
 
-export interface UsageReportData {
+export interface UsageReportData extends UnifiedSessionContextData {
+  stepIndex?: SessionCount;
   provider?: JsonValue;
   model?: JsonValue;
+  purpose?: JsonValue;
+  path?: JsonValue;
+  xInitiator?: JsonValue;
   requestId?: JsonValue;
   status?: JsonValue;
   aic?: JsonValue;
   totalAic?: JsonValue;
   premiumRequests?: JsonValue;
   durationMs?: JsonValue;
+  steering?: SteeringNotice;
   usage?: UnifiedSessionUsage | null;
 }
 
@@ -184,14 +266,40 @@ export interface GraderData {
   direction?: JsonValue;
   threshold?: JsonValue;
   error?: JsonValue;
+  source?: JsonValue;
+  enabled?: JsonValue;
+  min?: JsonValue;
+  max?: JsonValue;
+  digest?: JsonValue;
+  severity?: JsonValue;
+  message?: JsonValue;
 }
 
 export interface GraderManifestData {
+  version?: JsonValue;
   graders?: GraderData[];
 }
 
-export interface GraderResultData extends GraderData {
-  results?: GraderData[];
+export interface GraderMeasurementData extends GraderData {
+  implementation?: {
+    id?: JsonValue;
+    version?: JsonValue;
+    digest?: JsonValue;
+  } | null;
+  metrics?: { id?: JsonValue; value?: JsonValue }[];
+}
+
+export interface GraderResultData extends GraderMeasurementData {
+  version?: JsonValue;
+  run?: {
+    id?: JsonValue;
+    attempt?: JsonValue;
+    graderCount?: JsonValue;
+    passed?: JsonValue;
+    failed?: JsonValue;
+    errors?: JsonValue;
+  } | null;
+  results?: GraderMeasurementData[];
 }
 
 export interface EvalResultData {
@@ -199,6 +307,8 @@ export interface EvalResultData {
   answer?: JsonValue;
   model?: JsonValue;
   error?: JsonValue;
+  runId?: JsonValue;
+  assignments?: JsonValue;
 }
 
 export interface ExecutionResultData {
@@ -218,18 +328,32 @@ export interface DailyAICDecisionData {
   threshold?: number;
 }
 
+/** Observed lineage from aw_info.context; hopId identifies the recorded caller. */
+export interface EpisodeLineageData {
+  episodeId?: JsonValue;
+  hopId?: JsonValue;
+  parentHopId?: JsonValue;
+  originEvent?: JsonValue;
+  rootRepo?: JsonValue;
+  rootWorkflowId?: JsonValue;
+  rootRunId?: JsonValue;
+}
+
 export interface WorkflowInfoData {
   engineId?: JsonValue;
   agentVersion?: JsonValue;
   cliVersion?: JsonValue;
   awfVersion?: JsonValue;
   mcpgVersion?: JsonValue;
+  model?: JsonValue;
   requestedModel?: JsonValue;
+  modelRouting?: UnifiedModelRoutingData;
   triggerType?: JsonValue;
   dryRun?: JsonValue;
   workflow?: JsonValue;
   repository?: JsonValue;
   runId?: JsonValue;
+  episode?: EpisodeLineageData | null;
 }
 
 export interface GitHubApiRateLimitData {
@@ -260,7 +384,7 @@ export interface CollectionData {
     phase: string;
     path: string;
     events: SessionCount;
-    timestampUnit?: "seconds" | "milliseconds";
+    timestampUnit?: "seconds" | "milliseconds" | "nanoseconds";
   }[];
   warnings: SessionCount;
   untimedEvents: SessionCount;
@@ -273,16 +397,83 @@ export interface UnifiedSessionEventDataMap {
   "agent.execution": AgentExecutionData;
   "session.init": Pick<SessionInitData, "sourceEngine" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
   "session.start": Pick<SessionInitData, "sourceEngine" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
+  "session.error": {
+    error?: JsonValue;
+    message?: JsonValue;
+    content?: JsonValue;
+    code?: JsonValue;
+    statusCode?: JsonValue;
+    errorType?: JsonValue;
+    model?: JsonValue;
+    severity?: JsonValue;
+    status?: JsonValue;
+    sourceType?: JsonValue;
+    exitCode?: JsonValue;
+  } & UnifiedSessionContextData;
+  "session.info": {
+    message?: JsonValue;
+    content?: JsonValue;
+    model?: JsonValue;
+    status?: JsonValue;
+    sourceType?: JsonValue;
+    role?: JsonValue;
+    messageId?: JsonValue;
+    toolCallId?: JsonValue;
+    toolName?: JsonValue;
+    /** Repeated observed metadata, never additive inference usage. */
+    usageSnapshot?: JsonValue;
+    /** Native estimates, not measured or additive token usage. */
+    estimatedTokens?: JsonValue;
+    estimatedTokensDelta?: JsonValue;
+    cwd?: JsonValue;
+    branch?: JsonValue;
+    kind?: JsonValue;
+    rateLimitInfo?: JsonValue;
+    isAuthenticating?: JsonValue;
+    output?: JsonValue;
+  } & UnifiedSessionContextData;
+  "session.shutdown": {
+    shutdownType?: JsonValue;
+    errorReason?: JsonValue;
+    premiumRequests?: JsonValue;
+    totalNanoAiu?: JsonValue;
+    totalApiDurationMs?: JsonValue;
+    sessionStartTime?: JsonValue;
+    currentModel?: JsonValue;
+  } & UnifiedSessionContextData;
+  "session.task_complete": { success?: JsonValue; summary?: JsonValue } & UnifiedSessionContextData;
   "user.message": UnifiedMessageData;
   "prompt.system": Pick<MessageData, "content">;
   "prompt.user": Pick<MessageData, "content">;
   "assistant.message": UnifiedMessageData;
-  "assistant.refusal": Pick<AssistantRefusalData, "reason" | "content" | "policyCategory" | "explanation" | "partial"> & UnifiedSessionContextData;
+  "assistant.refusal": Pick<AssistantRefusalData, "reason" | "content" | "policyCategory" | "explanation" | "partial"> & UnifiedMessageData;
   "assistant.reasoning": UnifiedMessageData;
-  "tool.execution_start": Pick<ToolExecutionStartData, "toolCallId" | "toolName" | "input" | "command" | "mcpServerName"> & UnifiedSessionContextData;
+  "assistant.message_update": UnifiedMessageData & {
+    sourceType?: JsonValue;
+    /** Native update subtype distinguishes historical Pi text and thinking controls. */
+    type?: JsonValue;
+    /** Observed native usage, not an additive accounting contribution. */
+    usageSnapshot?: JsonValue;
+  };
+  "tool.execution_start": Pick<ToolExecutionStartData, "toolCallId" | "stepIndex" | "toolName" | "input" | "inputTruncated" | "command" | "mcpServerName"> & UnifiedSessionContextData;
+  "tool.execution_update": Pick<ToolExecutionStartData, "toolCallId" | "stepIndex" | "toolName" | "input" | "mcpServerName"> & {
+    output?: JsonValue;
+    partial?: JsonValue;
+    delta?: JsonValue;
+    contentIndex?: JsonValue;
+    sourceType?: JsonValue;
+    /** Repeated observed metadata, never additive inference usage. */
+    usageSnapshot?: JsonValue;
+    durationMs?: JsonValue;
+    status?: JsonValue;
+    command?: JsonValue;
+    taskId?: string;
+    taskType?: string;
+    error?: JsonValue;
+  } & UnifiedSessionContextData;
   "tool.execution_complete": Pick<
     ToolExecutionCompleteData,
-    "toolCallId" | "toolName" | "success" | "output" | "error" | "durationMs" | "exitCode" | "status" | "mcpServerName" | "isError" | "taskId" | "taskType" | "workflowName" | "workflowRunId"
+    "toolCallId" | "stepIndex" | "toolName" | "success" | "output" | "result" | "error" | "durationMs" | "exitCode" | "status" | "mcpServerName" | "isError" | "taskId" | "taskType" | "workflowName" | "workflowRunId"
   > &
     UnifiedSessionContextData;
   "dynamicWorkflows.task_started": DynamicWorkflowObservationData;
@@ -296,11 +487,13 @@ export interface UnifiedSessionEventDataMap {
   "mcp.difc.filtered": McpObservationData;
   "mcp.guard.blocked": McpObservationData;
   "mcp.tool_call": McpObservationData;
-  "mcp.event": RuntimeObservationData;
+  "mcp.event": RuntimeObservationData & { serverName?: JsonValue };
   "firewall.http_access": FirewallAccessData;
   "firewall.token_usage": UsageReportData;
   "firewall.model_routing": ModelRoutingData;
-  "firewall.steering": RuntimeObservationData;
+  "model_routing.outcome": ModelRoutingOutcomeData;
+  "model_endpoint.mismatch": ModelEndpointMismatchData;
+  "firewall.steering": FirewallSteeringData;
   "firewall.event": RuntimeObservationData;
   "safe_output.request": SafeOutputData;
   "safe_output.result": SafeOutputData;

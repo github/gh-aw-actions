@@ -9,6 +9,8 @@
 // the trace as unavailable, keeping the O(n^2) graders computationally cheap.
 const MAX_TRAJECTORY_ITEMS = 5000;
 
+const MAX_DIAGNOSTIC_PATH_LENGTH = 120;
+
 // Maximum length of the text each skill constraint pattern is matched against.
 const MAX_CONSTRAINT_TEXT_LENGTH = 4096;
 
@@ -1384,6 +1386,37 @@ function gradeTrajectoryNdtw(trace, config) {
   };
 }
 
+/** @param {string} value @returns {string} */
+function normalizeFilePath(value) {
+  return value.trim().replace(/^\.\//, "").replace(/^\/+/, "");
+}
+
+/**
+ * @param {any} trace
+ * @returns {{ir: Record<string, any>, required: string[]} | {error: string}}
+ */
+function resolveReferencePatchFiles(trace) {
+  const candidates = irCandidates(trace, { includeTrace: true });
+  const ir = candidates.find(value => isRecord(value.reference) && isRecord(value.reference.patch) && Array.isArray(value.reference.patch.files));
+  if (!ir || ir.reference.patch.files.length === 0) {
+    return { error: "not applicable: no reference patch files" };
+  }
+  const required = ir.reference.patch.files.map(file => (typeof file === "string" ? file : isRecord(file) && typeof file.path === "string" ? file.path : ""));
+  if (required.some(file => normalizeFilePath(file) === "")) {
+    return { error: "unavailable: reference patch file is missing a path" };
+  }
+  return { ir, required };
+}
+
+/**
+ * @param {string} path
+ * @returns {string}
+ */
+function truncateDiagnosticPath(path) {
+  if (path.length <= MAX_DIAGNOSTIC_PATH_LENGTH) return path;
+  return `${path.slice(0, MAX_DIAGNOSTIC_PATH_LENGTH - 3)}...`;
+}
+
 /**
  * code-search-recall: Fraction of reference patch files located during the run.
  * @param {any} trace
@@ -1391,16 +1424,10 @@ function gradeTrajectoryNdtw(trace, config) {
  * @returns {any}
  */
 function gradeCodeSearchRecall(trace, config) {
-  const candidates = irCandidates(trace, { includeTrace: true });
-  const ir = candidates.find(value => isRecord(value.reference) && isRecord(value.reference.patch) && Array.isArray(value.reference.patch.files));
-  if (!ir || ir.reference.patch.files.length === 0) {
-    return { value: null, passed: null, message: "not applicable: no reference patch files" };
-  }
-  const normalize = value => value.trim().replace(/^\.\//, "").replace(/^\/+/, "");
-  const required = ir.reference.patch.files.map(file => (typeof file === "string" ? file : isRecord(file) && typeof file.path === "string" ? file.path : ""));
-  if (required.some(file => normalize(file) === "")) {
-    return { value: null, passed: null, message: "unavailable: reference patch file is missing a path" };
-  }
+  const resolved = resolveReferencePatchFiles(trace);
+  if ("error" in resolved) return { value: null, passed: null, message: resolved.error };
+  const { ir, required } = resolved;
+  const normalize = normalizeFilePath;
   if (!Array.isArray(ir.resources) || !ir.resources.every(isRecord)) {
     return { value: null, passed: null, message: "unavailable: trace lacks well-formed resources" };
   }
@@ -1418,31 +1445,44 @@ function gradeCodeSearchRecall(trace, config) {
   };
 }
 
-/** @type {Record<string, {name: string, description: string, unit: string, direction: string, threshold?: number, min?: number, max?: number}>} */
-const TRAJECTORY_GRADER_META = {
-  "policy-near-miss": { name: "Policy Near-Miss Rate", description: "Fraction of successful traces that left guard or policy objectives unsatisfied", unit: "ratio", direction: "lower_is_better", min: 0, max: 1 },
-  "skill-constraint-coverage": { name: "Skill Constraint Coverage", description: "Fraction of configured skill constraints that were exercised and passed", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "exploration-error": { name: "Exploration Error", description: "Unmet objectives attributable to insufficient search", unit: "ratio", direction: "lower_is_better", min: 0, max: 1 },
-  "exploitation-error": { name: "Exploitation Error", description: "Unmet objectives attributable to gathered evidence that was never used", unit: "ratio", direction: "lower_is_better", min: 0, max: 1 },
-  "state-revisit-probability-rep": { name: "State Revisit Probability REP", description: "Fraction of canonical state visits that revisit an already visited state", unit: "ratio", direction: "lower_is_better", min: 0, max: 1 },
-  "recurrence-determinism": { name: "Recurrence Determinism (RQA DET)", description: "RQA DET: fraction of recurrent points forming diagonal (repeated-subsequence) lines", unit: "ratio", direction: "lower_is_better", min: 0, max: 1 },
-  "recurrence-laminarity": { name: "Recurrence Laminarity (RQA LAM)", description: "RQA LAM: fraction of recurrent points forming vertical (stagnation) lines", unit: "ratio", direction: "lower_is_better", min: 0, max: 1 },
-  "recurrence-trapping-time": { name: "Recurrence Trapping Time (RQA TT)", description: "RQA TT: average length of vertical recurrence lines", unit: "steps", direction: "lower_is_better", min: 0 },
-  "recurrence-rate": { name: "Recurrence Rate (RQA RR)", description: "RQA RR: density of recurrent state pairs across the run", unit: "ratio", direction: "lower_is_better", min: 0, max: 1 },
-  "event-entropy-rate": { name: "Event Entropy Rate", description: "Normalized conditional Shannon entropy rate of the ordered event sequence", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "lempel-ziv-trajectory-complexity": { name: "Lempel-Ziv Trajectory Complexity", description: "Normalized LZ76 complexity of the canonical event sequence", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "tool-output-consumption-rate": { name: "Tool Output Consumption Rate", description: "Fraction of tool outputs referenced by a later action", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "end-to-end-lineage-completeness": { name: "End-to-End Lineage Completeness", description: "Fraction of final outputs traceable to tool or observation evidence roots", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "action-provenance-coverage": { name: "Action Provenance Coverage", description: "Fraction of consequential actions with a provenance path to tool or observation evidence", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "premature-termination-gap": { name: "Premature Termination Gap", description: "Declared completion conditions still unsatisfied at termination", unit: "count", direction: "lower_is_better", min: 0 },
-  "evidence-saturation-stopping-lag": { name: "Evidence Saturation Stopping Lag", description: "Events elapsed between all objectives being satisfied and the run stopping", unit: "count", direction: "lower_is_better", min: 0 },
-  "dependency-order-violation-rate": { name: "Dependency Order Violation Rate", description: "Fraction of dependent objectives satisfied before their prerequisites", unit: "ratio", direction: "lower_is_better", min: 0, max: 1 },
-  "objective-coverage": { name: "Objective Coverage", description: "Fraction of declared objectives that were completed", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "grounding-accuracy": { name: "Grounding Accuracy", description: "Fraction of actions that were valid in the state in which they were issued", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "tool-wise-score": { name: "Tool-Wise Score", description: "Longest correct execution prefix against a reference trajectory, with parameter credit", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "trajectory-ndtw": { name: "Trajectory nDTW", description: "Normalized dynamic time warping similarity to a reference state trajectory", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-  "code-search-recall": { name: "Code Search Recall", description: "Fraction of reference patch files located during the run", unit: "ratio", direction: "higher_is_better", min: 0, max: 1 },
-};
+/**
+ * code-read-precision: Fraction of distinct read or inspected files touched by the reference patch.
+ * @param {any} trace
+ * @param {Record<string, any>} config
+ * @returns {any}
+ */
+function gradeCodeReadPrecision(trace, config) {
+  const resolved = resolveReferencePatchFiles(trace);
+  if ("error" in resolved) return { value: null, passed: null, message: resolved.error };
+  const { ir, required } = resolved;
+  if (!Array.isArray(ir.actions) || !ir.actions.every(isRecord)) {
+    return { value: null, passed: null, message: "unavailable: trace lacks well-formed actions" };
+  }
+  const readFiles = new Set();
+  for (const action of ir.actions) {
+    if (typeof action.type !== "string" || action.type.trim() === "") {
+      return { value: null, passed: null, message: "unavailable: action is missing a type" };
+    }
+    if (typeof action.consequential !== "boolean") {
+      return { value: null, passed: null, message: "unavailable: action is missing a consequential flag" };
+    }
+    if (action.consequential || (action.type !== "read" && action.type !== "inspect")) continue;
+    if (typeof action.target !== "string" || normalizeFilePath(action.target) === "") {
+      return { value: null, passed: null, message: "unavailable: read/inspect action is missing a file target" };
+    }
+    readFiles.add(normalizeFilePath(action.target));
+  }
+  if (readFiles.size === 0) {
+    return { value: null, passed: null, message: "unavailable: trace has no file reads or inspections" };
+  }
+  const requiredSet = new Set(required.map(normalizeFilePath));
+  const irrelevant = [...readFiles].filter(file => !requiredSet.has(file));
+  const relevant = readFiles.size - irrelevant.length;
+  return {
+    value: helpers.ratio(relevant, readFiles.size),
+    details: `referenceFiles=${requiredSet.size} readFiles=${readFiles.size} relevant=${relevant}${irrelevant.length === 0 ? "" : `; unrelated reads: ${irrelevant.slice(0, 5).map(truncateDiagnosticPath).join(", ")}`}`,
+  };
+}
 
 /** @type {Record<string, (trace: any, config?: Record<string, any>) => any>} */
 const TRAJECTORY_GRADERS = {
@@ -1468,7 +1508,11 @@ const TRAJECTORY_GRADERS = {
   "tool-wise-score": withTrajectoryLimits(gradeToolWiseScore),
   "trajectory-ndtw": withTrajectoryLimits(gradeTrajectoryNdtw),
   "code-search-recall": withTrajectoryLimits(gradeCodeSearchRecall),
+  "code-read-precision": withTrajectoryLimits(gradeCodeReadPrecision),
 };
+
+const builtinMeta = require("./builtin_graders.json");
+const TRAJECTORY_GRADER_META = Object.fromEntries(Object.keys(TRAJECTORY_GRADERS).map(id => [id, builtinMeta[id]]));
 
 module.exports = {
   MAX_TRAJECTORY_ITEMS,
@@ -1498,4 +1542,5 @@ module.exports = {
   gradeToolWiseScore,
   gradeTrajectoryNdtw,
   gradeCodeSearchRecall,
+  gradeCodeReadPrecision,
 };

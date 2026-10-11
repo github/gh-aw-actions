@@ -3,7 +3,7 @@
 
 const { canonical, closed, digest } = require("./work_queue_codec.cjs");
 const { normalizeAssignment, normalizeClaimScope } = require("./work_queue_claim_scope.cjs");
-const { actorFromContext } = require("./work_queue_policy.cjs");
+const { actorFromContext, dispatchPrincipal } = require("./work_queue_policy.cjs");
 const { normalizeDispatchParameters, requestForIntent, requestIdForIntent } = require("./work_queue_intents.cjs");
 const { loadQueue, validateStoredAssignment, expectedWorkerRun, bindingForRun } = require("./work_queue_binding.cjs");
 const { authenticatePublisher, fetchNativeRunAttempt, validateNativeRun } = require("./work_queue_native.cjs");
@@ -37,7 +37,7 @@ function controlReceiptForRequest(state, requestId) {
     completion_id: work.completion_id,
     request_id: requestId,
     commit_id: commit.id,
-    parameters_digest: digest(commit.request.parameters),
+    parameters_digest: commit.compacted_parameters_digest ?? digest(commit.request.parameters),
     writes: {
       works: commit.operations.filter(operation => operation.kind === "Work").length,
       claims: commit.operations.filter(operation => operation.kind === "Claim").length,
@@ -72,7 +72,7 @@ async function readClaimQueueControls(options) {
   if (!dispatch.run) throw new Error("work_queue_binding_not_durable");
   const caller = await authenticatePublisher({ ...configured, role: "reconciler" });
   if (caller.run_id === dispatch.run.run_id && caller.run_attempt !== 1) throw new Error("rerun_not_authorized");
-  const expected = { ...expectedWorkerRun(assignment, profile, configured.context, caller.repository), run_id: dispatch.run.run_id };
+  const expected = { ...expectedWorkerRun(assignment, profile, configured.context, caller.repository, dispatchPrincipal(dispatch)), run_id: dispatch.run.run_id };
   const run = await fetchNativeRunAttempt(configured.githubClient, expected.repository, dispatch.run.run_id);
   const proof = validateNativeRun(run, expected);
   if (canonical(dispatch.run) !== canonical(bindingForRun(proof, expected))) throw new Error("run_binding_conflict");
@@ -141,11 +141,23 @@ async function verifyClaimQueueControl(options) {
   const prior = facts.state.requests.get(id);
   const receipt = inventory.controls.find(control => control.request_id === id);
   if (!prior || !receipt || prior.request.kind !== kind) return { verified: false, effects: "unknown", reason: "queue_control_not_committed" };
-  const policy = facts.state.transactions.flatMap(commit => commit.operations).find(operation => operation.kind === "Policy" && operation.epoch === prior.policy_epoch)?.policy;
+  const policy =
+    facts.state.transactions.flatMap(commit => commit.operations).find(operation => operation.kind === "Policy" && operation.epoch === prior.policy_epoch)?.policy ??
+    (facts.state.policy_epoch === prior.policy_epoch ? facts.state.policy : undefined);
   if (!policy) throw new Error("work_queue_policy_missing");
-  const parameters = kind === "submit" ? require("./work_queue_dispatch.cjs").acceptedSubmissionParameters(facts.state, facts.context, message.parameters, prior) : normalizeDispatchParameters(message.parameters, policy, 4096);
+  const parameters =
+    kind === "submit"
+      ? require("./work_queue_dispatch.cjs").acceptedSubmissionParameters(facts.state, facts.context, message.parameters, prior)
+      : {
+          ...normalizeDispatchParameters(message.parameters, policy, 4096),
+          ...(prior.request.parameters.worker_profiles === undefined ? {} : { worker_profiles: prior.request.parameters.worker_profiles }),
+        };
   const request = requestForIntent(facts.context, message.intent_id, kind, parameters);
-  if (prior.request.fingerprint !== request.fingerprint || canonical(prior.request.parameters) !== canonical(request.parameters) || canonical(prior.actor) !== canonical(actorFromContext(facts.context))) {
+  if (
+    prior.request.fingerprint !== request.fingerprint ||
+    (prior.request.parameters !== null && canonical(prior.request.parameters) !== canonical(request.parameters)) ||
+    canonical(prior.actor) !== canonical(actorFromContext(facts.context))
+  ) {
     return { verified: false, effects: "unknown", reason: "queue_control_request_mismatch" };
   }
   return { verified: true, claim_handle: message.claim_handle, resource: { kind: "queue_commit", repository: facts.context.repository, id: prior.id }, evidence: receipt };

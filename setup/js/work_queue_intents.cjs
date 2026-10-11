@@ -87,6 +87,47 @@ function stageIntent(filename, intent) {
   log.debug("intent.stage.complete", { staged_intents: previous.length + 1 });
 }
 
+function stagePlanIntents(filename, plan) {
+  if (plan?.version !== 1 || !Array.isArray(plan.nodes) || plan.nodes.length < 1 || plan.nodes.length > 256) throw new Error("work_queue_plan_invalid");
+  closed(plan.dispatch, ["pool", "max_claims", "max_dispatches"], [], "planned dispatch");
+  identity(plan.dispatch.pool, "pool");
+  integer(plan.dispatch.max_claims, 1, 256, "max_claims");
+  integer(plan.dispatch.max_dispatches, 1, 256, "max_dispatches");
+  for (const node of plan.nodes) {
+    closed(node, ["payload"], ["graph_id", "node_key", "work_id", "pool", "priority", "fairness_key", "worker_profile", "logical_contract", "execution_ref", "depends_on", "subject", "backing_issue", "replacement_of"], "planned Work");
+    if (!node.payload || typeof node.payload !== "object" || Array.isArray(node.payload)) throw new Error("work_queue_plan_payload_invalid");
+    canonical(node.payload);
+    if (identity(node.pool, "pool") !== plan.dispatch.pool) throw new Error("work_queue_plan_pool_mismatch");
+  }
+  const parameters = [
+    { kind: "submit", parameters: { nodes: plan.nodes } },
+    { kind: "dispatch_next", parameters: plan.dispatch },
+  ];
+  const id = digest(parameters);
+  const intents = parameters.map(intent => ({ version: 3, intent_id: `plan:${id}:${intent.kind}`, ...intent }));
+  const previous = readStagedIntents(filename);
+  if (previous.length > intents.length || previous.some((intent, index) => canonical(intent) !== canonical(intents[index]))) throw new Error("work_queue_plan_intents_conflict");
+  for (const intent of intents) {
+    if (!previous.some(existing => existing.intent_id === intent.intent_id)) stageIntent(filename, intent);
+  }
+  return intents;
+}
+
+function validatePreparedPlanIntentBatch(intents, errors) {
+  const hasPlanIntent = intents.some(intent => intent.intent_id.startsWith("plan:")) || errors.some(error => error.intent_id?.startsWith("plan:"));
+  if (!hasPlanIntent) return null;
+  if (errors.length || intents.length !== 2) return "work_queue_plan_intent_batch_invalid";
+  const [submit, dispatch] = intents;
+  if (submit.kind !== "submit" || dispatch.kind !== "dispatch_next") return "work_queue_plan_intent_batch_invalid";
+  const parameters = [
+    { kind: "submit", parameters: submit.parameters },
+    { kind: "dispatch_next", parameters: dispatch.parameters },
+  ];
+  const batchId = digest(parameters);
+  if (submit.intent_id !== `plan:${batchId}:submit` || dispatch.intent_id !== `plan:${batchId}:dispatch_next`) return "work_queue_plan_intent_batch_invalid";
+  return null;
+}
+
 function requestIdForIntent(trustedContext, intentId) {
   const actor = actorFromContext(trustedContext);
   identity(intentId, "intent ID");
@@ -114,7 +155,7 @@ function normalizeSubmitParameters(parameters, policy, at, state) {
   integer(at, 0, Number.MAX_SAFE_INTEGER, "submission timestamp");
   return {
     nodes: parameters.nodes.map(node => {
-      closed(node, ["payload"], ["graph_id", "node_key", "work_id", "pool", "priority", "fairness_key", "worker_profile", "depends_on", "subject", "backing_issue", "replacement_of"], "submitted Work");
+      closed(node, ["payload"], ["graph_id", "node_key", "work_id", "pool", "priority", "fairness_key", "worker_profile", "logical_contract", "execution_ref", "depends_on", "subject", "backing_issue", "replacement_of"], "submitted Work");
       const graphId = Object.hasOwn(node, "graph_id") ? identity(node.graph_id, "graph ID") : digest(node.payload);
       const nodeKey = Object.hasOwn(node, "node_key") ? identity(node.node_key, "node key") : "root";
       const poolName = node.pool === undefined ? "default" : node.pool;
@@ -123,6 +164,10 @@ function normalizeSubmitParameters(parameters, policy, at, state) {
       const profile = pool.profiles[profileName];
       if (!profile) throw new Error("work_queue_profile_not_approved");
       const workId = nodeId(graphId, nodeKey);
+      const existing = state?.works.get(workId);
+      const revision = node.execution_ref === undefined || node.execution_ref === profile.ref ? profile : state?.deployments?.get(poolName)?.get(profileName)?.revisions[node.execution_ref]?.profile;
+      if (!revision) throw new Error("work_queue_execution_pin_not_registered");
+      const contract = node.logical_contract ?? existing?.logical_contract ?? revision.logical_contract;
       if (node.work_id !== undefined && node.work_id !== workId) throw new Error("work_queue_work_identity_invalid");
       return {
         kind: "Work",
@@ -134,6 +179,8 @@ function normalizeSubmitParameters(parameters, policy, at, state) {
         fairness_key: node.fairness_key === undefined ? "" : node.fairness_key,
         worker_profile: profileName,
         batch_trust_domain: profile.trust_domain,
+        ...(contract ? { logical_contract: contract } : {}),
+        ...(node.execution_ref === undefined ? {} : { execution_ref: node.execution_ref }),
         payload: node.payload,
         depends_on: node.depends_on === undefined ? [] : node.depends_on,
         enqueued: state?.works.get(workId)?.enqueued ?? at,
@@ -145,4 +192,17 @@ function normalizeSubmitParameters(parameters, policy, at, state) {
   };
 }
 
-module.exports = { MAX_INTENT_BYTES, MAX_INTENTS, readIntentLines, readStagedIntentBatch, readStagedIntents, stageIntent, requestIdForIntent, requestForIntent, normalizeDispatchParameters, normalizeSubmitParameters };
+module.exports = {
+  MAX_INTENT_BYTES,
+  MAX_INTENTS,
+  readIntentLines,
+  readStagedIntentBatch,
+  readStagedIntents,
+  stageIntent,
+  stagePlanIntents,
+  validatePreparedPlanIntentBatch,
+  requestIdForIntent,
+  requestForIntent,
+  normalizeDispatchParameters,
+  normalizeSubmitParameters,
+};

@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { temporaryDirectory } = require("./work_queue_effect_test_helpers.cjs");
-const { createCompilerDependencyResolver, credentialBindings, main } = require("./work_queue_control_adapter.cjs");
+const { createCompilerDependencyResolver, credentialBindings, dependencyStateForIntents, main } = require("./work_queue_control_adapter.cjs");
 const { queueFixture, WORKFLOW, DISPATCHER, REF, REPOSITORY } = require("./work_queue_lifecycle.test_helpers.cjs");
 const { main: captureIntentOrigin } = require("./capture_work_queue_intent_origin.cjs");
 const { canonical } = require("./work_queue_codec.cjs");
@@ -25,6 +25,11 @@ function resolverOptions(overrides = {}) {
 
 function registerTests({ describe, it }) {
   describe("compiler-bound independent dependency read clients", () => {
+    it("treats an empty credential setting as no bindings without accepting malformed JSON", () => {
+      assert.equal(credentialBindings("").size, 0);
+      assert.equal(credentialBindings(undefined).size, 0);
+      assert.throws(() => credentialBindings("{"));
+    });
     it("maps default-token, compiler-minted App and PAT identities independently from logical requester and START sender", async () => {
       for (const entry of [
         { descriptor: { kind: "github_token" }, principal: "41898282", login: "github-actions[bot]", type: "Bot" },
@@ -55,6 +60,16 @@ function registerTests({ describe, it }) {
         else assert.equal(calls[0].username, entry.login);
         await assert.rejects(validate({ profile: { principal: "11" } }), /credential_principal_mismatch/);
       }
+    });
+
+    it("uses the compiled Policy proposal only to resolve dependencies for a first submit on an absent branch", () => {
+      const fixture = queueFixture({ granted: false });
+      const latest = { sha: null, projection: { policy: null, credential_generation: "initial" } };
+      const state = dependencyStateForIntents(latest, [{ kind: "submit" }], { policyProposal: fixture.policy });
+      assert.equal(canonical(state.policy), canonical(fixture.policy));
+      assert.equal(latest.projection.policy, null);
+      assert.equal(dependencyStateForIntents(latest, [{ kind: "dispatch_next" }], { policyProposal: fixture.policy }), latest.projection);
+      assert.equal(dependencyStateForIntents({ ...latest, sha: "existing" }, [{ kind: "submit" }], { policyProposal: fixture.policy }), latest.projection);
     });
 
     it("rejects spoofed credential kinds, App metadata, human bot lookups, lossy IDs and unavailable identity APIs without a fallback", async () => {
@@ -742,7 +757,7 @@ async function verifyCompiledDispatchIdentity(input) {
             assert.equal(dispatch.sender.principal, "11");
             assert.equal(dispatch.sender.run_attempt, 2);
             assert.equal(parameters.ref, REF);
-            assert.equal(parameters.workflow_id, WORKFLOW);
+            assert.equal(parameters.workflow_id, path.posix.basename(WORKFLOW));
             assert.notEqual(parameters.ref, fixture.dispatcherContext.sha);
             return { status: 200, data: { workflow_run_id: "42", run_url: "https://api.github.com/repos/owner/repo/actions/runs/42", html_url: "https://github.com/owner/repo/actions/runs/42" } };
           },

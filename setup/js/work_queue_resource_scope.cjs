@@ -113,7 +113,7 @@ function validateEffectResourceAuthority(state, authority, resource) {
   const target = validateEffectResource(resource);
   const { claim, work, dispatch } = authority;
   const installedProfile = state.policy?.pools?.[work.pool]?.profiles?.[work.worker_profile];
-  if (!installedProfile || !dispatch?.profile || !dispatch.run || target.repository !== installedProfile.effect_scope || target.repository !== dispatch.profile.effect_scope) {
+  if (!installedProfile || !dispatch?.profile || !dispatch.run || (!dispatch.profile.logical_contract && target.repository !== installedProfile.effect_scope) || target.repository !== dispatch.profile.effect_scope) {
     throw scopeError("effect target lies outside frozen and installed profile scope");
   }
   if (target.run_id !== undefined && target.run_id !== dispatch.run.run_id) throw scopeError("effect target is not the original native worker run");
@@ -123,14 +123,17 @@ function validateEffectResourceAuthority(state, authority, resource) {
   const visited = new Set([work.work_id]);
   let descendant = work;
   for (;;) {
-    const creator = state.transactions.find(commit => commit.operations.some(operation => operation.kind === "Work" && operation.work_id === descendant.work_id))?.actor;
+    const creator =
+      state.workCreators?.get(descendant.work_id) ??
+      [...(state.historicalTransactions ?? []), ...state.transactions].find(commit => commit.operations.some(operation => operation.kind === "Work" && operation.work_id === descendant.work_id))?.actor;
     if (creator?.role !== "worker") break;
     const parentDispatch = state.dispatches.get(creator.dispatch_id);
     const parentMember = parentDispatch?.claims.find(member => member.handle === creator.claim_handle);
     const parent = parentMember && state.works.get(parentMember.work_id);
     if (!parent || visited.has(parent.work_id)) throw scopeError("immutable Work ancestor authority is missing or cyclic");
     const parentProfile = state.policy?.pools?.[parent.pool]?.profiles?.[parent.worker_profile];
-    if (!parentProfile || target.repository !== parentProfile.effect_scope || target.repository !== parentDispatch.profile?.effect_scope) throw scopeError("effect target lies outside immutable ancestor profile scope");
+    if (!parentProfile || (!parentDispatch.profile?.logical_contract && target.repository !== parentProfile.effect_scope) || target.repository !== parentDispatch.profile?.effect_scope)
+      throw scopeError("effect target lies outside immutable ancestor profile scope");
     visited.add(parent.work_id);
     assertWorkTarget(parent, target);
     descendant = parent;
