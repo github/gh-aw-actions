@@ -27,13 +27,14 @@ const { formatAIC } = require("./model_costs.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp_gateway_log.cjs");
 const { readDedupedTokenUsage, getTokenUsagePaths } = require("./parse_token_usage.cjs");
-const { extractShellCommandFromToolData } = require("./tool_call_details.cjs");
+const { extractShellCommandDetailsFromToolData } = require("./tool_call_details.cjs");
 const { resolveFailureIssueRepo } = require("./repo_helpers.cjs");
 const { GITHUB_API_VERSION } = require("./constants.cjs");
-const { EMPTY_OUTPUT_CAUSES, EMPTY_OUTPUT_FAILURE_CAUSES } = require("./empty_output_outcome.cjs");
+const { buildEmptyOutputOutcome, buildCompletionEvidence, EMPTY_OUTPUT_CAUSES, EMPTY_OUTPUT_FAILURE_CAUSES } = require("./empty_output_outcome.cjs");
 const { isAgentExecutionEvent } = require("./agent_execution.cjs");
 const { collectUnifiedSession, isModelEndpointMismatchData } = require("./unified_session.cjs");
 const { validateSessionFileHeader } = require("./unified_session_render.cjs");
+const { isTaskCompleteRegistrationIssue, hasAgentTerminalReasonCompleted, shouldIgnoreTaskCompleteRegistrationReports } = require("./load_agent_output.cjs");
 const fs = require("fs");
 const https = require("https");
 const os = require("os");
@@ -1479,7 +1480,9 @@ function normalizeToolCallPreview(value, maxLen = 120) {
  * @returns {string}
  */
 function extractShellCommandPreview(data) {
-  return normalizeToolCallPreview(extractShellCommandFromToolData(data));
+  const { command, isArgumentVector } = extractShellCommandDetailsFromToolData(data);
+  if (!isArgumentVector) return normalizeToolCallPreview(command);
+  return command.length <= 120 ? command : `${command.slice(0, 120 - ELLIPSIS_LENGTH)}${ELLIPSIS}`;
 }
 
 /**
@@ -1491,6 +1494,9 @@ function extractShellCommandPreview(data) {
  */
 function formatRecentToolCall(toolName, mcpServerName, data) {
   const base = mcpServerName ? `${mcpServerName}.${toolName}` : toolName;
+  if (mcpServerName.replace(/[_-]/g, "").toLowerCase() === "mcpscripts" || /^(?:mcp[._-]+)?mcp[._-]*scripts[._-]/i.test(toolName)) {
+    return `${base}([REDACTED])`;
+  }
   const normalizedToolName = typeof toolName === "string" ? toolName.toLowerCase() : "";
   if (!RECENT_TOOL_CALLS_WITH_COMMAND_PREVIEW.has(normalizedToolName)) {
     return base;
@@ -1701,7 +1707,16 @@ function buildToolDenialsExceededContext(events, workflowId) {
   // Normalize the reason for display: multi-line programs (e.g. Python 3 heredocs) are
   // collapsed to a single-line summary so the issue body renders cleanly.
   const normalizedReason = normalizeDeniedPermissionCommand(reason);
-  const recentToolCallsList = Array.isArray(latestEvent.recentToolCalls) && latestEvent.recentToolCalls.length > 0 ? latestEvent.recentToolCalls.map(toolCall => `- \`${toolCall}\``).join("\n") : "- _No tool calls captured_";
+  const recentToolCallsList =
+    Array.isArray(latestEvent.recentToolCalls) && latestEvent.recentToolCalls.length > 0
+      ? latestEvent.recentToolCalls
+          .map(toolCall => {
+            const backticks = toolCall.match(/`+/g) || [];
+            const delimiter = "`".repeat(backticks.reduce((max, run) => Math.max(max, run.length), 0) + 1);
+            return `- ${delimiter}${toolCall}${delimiter}`;
+          })
+          .join("\n")
+      : "- _No tool calls captured_";
 
   const templatePath = getPromptPath("tool_denials_exceeded_context.md");
   let template;
@@ -1756,51 +1771,15 @@ function loadReportIncompleteMessages(items) {
   }
 }
 
-const DIAGNOSTIC_AGENT_OUTPUT_TYPES = new Set(["noop", "missing_tool", "missing_data", "report_incomplete"]);
-const TASK_COMPLETE_REGISTRATION_SIGNALS = ["not registering", "not registered", "not recognizing", "not recognized", "recognition issue", "not yet marked", "haven't marked", "tool calls are not registering"];
-const TASK_COMPLETE_COMPLETION_SIGNALS = ["completed successfully", "safe-output", "safe output", "no remaining work"];
-const TASK_COMPLETE_COMPLETION_REGEXPS = [/\banalysis steps? completed\b/, /\ball steps completed\b/];
-
-/**
- * Determine whether agent output contains at least one real task-level item.
- * @param {Array<any> | undefined} items
- * @returns {boolean}
- */
-function hasTaskLevelAgentOutput(items) {
-  if (!Array.isArray(items)) {
-    return false;
-  }
-  return items.some(item => item && typeof item.type === "string" && !DIAGNOSTIC_AGENT_OUTPUT_TYPES.has(item.type));
-}
-
-/**
- * Detect a spurious report_incomplete caused only by task_complete registration/recognition
- * trouble after the agent already finished the real task work.
- * @param {{reason?: string, details?: string} | undefined} item
- * @returns {boolean}
- */
-function isTaskCompleteRegistrationIssue(item) {
-  if (!item) {
-    return false;
-  }
-  const text = `${item.reason || ""}\n${item.details || ""}`.toLowerCase();
-  if (!text.includes("task_complete")) {
-    return false;
-  }
-  const hasRegistrationSignal = TASK_COMPLETE_REGISTRATION_SIGNALS.some(signal => text.includes(signal));
-  const hasCompletionSignal = TASK_COMPLETE_COMPLETION_SIGNALS.some(signal => text.includes(signal)) || TASK_COMPLETE_COMPLETION_REGEXPS.some(regexp => regexp.test(text));
-  return hasRegistrationSignal && hasCompletionSignal;
-}
-
 /**
  * Build report_incomplete context string for display in failure issues/comments.
  * This surfaces the agent's structured incompletion signal so maintainers can
  * distinguish an incomplete task from a confirmed task outcome.
  * @param {Array<any>} [items] - Optional pre-loaded agent output items. When provided, avoids re-reading the output file.
- * @param {{includeAgentText?: boolean}} [options]
+ * @param {{collectorEmptyOutputCause?: string, rootDir?: string}} [options]
  * @returns {string} Formatted report_incomplete context
  */
-function buildReportIncompleteContext(items, { includeAgentText = true } = {}) {
+function buildReportIncompleteContext(items, { collectorEmptyOutputCause, rootDir } = {}) {
   const messages = loadReportIncompleteMessages(items);
 
   if (messages.length === 0) {
@@ -1809,17 +1788,15 @@ function buildReportIncompleteContext(items, { includeAgentText = true } = {}) {
 
   core.info(`Found ${messages.length} report_incomplete signal(s)`);
 
-  let context = buildWarningAlertLine(
-    "Task Could Not Be Completed",
-    "The workflow recorded a `report_incomplete` signal: the task was not completed or completion could not be confirmed." + (includeAgentText ? " See the reported reason and diagnostics below." : "")
-  );
-  if (includeAgentText) {
-    context += renderErrorDetails(messages.map(msg => [msg.reason, msg.details].filter(Boolean).join("\n")).join("\n\n"));
+  let context = buildWarningAlertLine("Task Could Not Be Completed", "The workflow recorded a `report_incomplete` signal: the task was not completed or completion could not be confirmed.");
+  // Rebuild collector diagnostics from runtime evidence, never from message text.
+  if (typeof collectorEmptyOutputCause === "string" && Object.hasOwn(EMPTY_OUTPUT_CAUSES, collectorEmptyOutputCause)) {
+    const outcome = buildEmptyOutputOutcome(collectorEmptyOutputCause === "invalid_safe_outputs" ? ["validation_failed"] : [], rootDir);
+    if (outcome.details) context += renderErrorDetails(outcome.details);
   } else {
-    return context + "\nA comment or other safe output does not confirm that the requested task was completed.\n\n";
+    context += renderErrorDetails(["Completion signal: agent reported incomplete (reason and details excluded)", ...buildCompletionEvidence(rootDir)].join("\n"));
   }
-  context +=
-    "\nThis is a structured incompletion signal (`report_incomplete`), not confirmation of a completed task. Do not treat accompanying safe outputs (e.g., comments) as evidence that the requested review or action was completed.\n\n";
+  context += "\nA comment or other safe output does not confirm that the requested task was completed. Only inferred runtime status and error codes are reported; agent text is excluded.\n\n";
 
   return context;
 }
@@ -3031,39 +3008,6 @@ function buildSecretVerificationContext(secretVerificationResult, engineSecretFa
 }
 
 /**
- * Check whether agent-stdio.log contains a terminal_reason: "completed" result entry,
- * indicating the agent finished its task successfully despite a non-zero job exit code.
- * Log lines may be prefixed with a timestamp (e.g. "2026-04-27T21:45:00.080Z  {JSON}").
- *
- * Lazy strategy: tests a single regex against the entire file content in one pass and
- * returns immediately on the first match, avoiding line splitting and JSON parsing.
- * The pattern is specific enough (`"terminal_reason"` key with `"completed"` value,
- * 0 or 1 literal space around the colon) that false positives from unrelated content
- * are negligible in practice.
- *
- * @returns {boolean} true if terminal_reason: "completed" was found in the log
- */
-function hasAgentTerminalReasonCompleted() {
-  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
-  const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
-  try {
-    if (!fs.existsSync(stdioLogPath)) {
-      return false;
-    }
-    const logContent = fs.readFileSync(stdioLogPath, "utf8");
-    // Single-pass scan: "terminal_reason" key with 0 or 1 literal space around
-    // the colon and "completed" value. JSON uses either compact ("key":"val") or
-    // single-spaced ("key" : "val") formatting. `[ ]?` matches only a space
-    // character (not tabs or newlines). Returns on first match without splitting
-    // lines or parsing JSON.
-    return /"terminal_reason"[ ]?:[ ]?"completed"/.test(logContent);
-  } catch {
-    // IO error is ignored — assume not completed.
-  }
-  return false;
-}
-
-/**
  * Detect Copilot authorization failures while the API proxy is using the
  * organization-billed GITHUB_TOKEN supplied by copilot-requests: write.
  * @param {string} [stdioLogPathOverride]
@@ -3231,7 +3175,7 @@ function buildEngineFailureContext(options = {}) {
     const exitCodeText = fs.existsSync(exitCodePath) ? fs.readFileSync(exitCodePath, "utf8").trim() : "";
     const exitDetails = /^[1-9]\d{0,2}$/.test(exitCodeText) && Number(exitCodeText) <= 255 ? renderErrorDetails(`Driver exit code: ${exitCodeText}`) : "";
     if (options.metadataOnly === true) {
-      return exitDetails ? `**Driver exit code:** \`${exitCodeText}\`\n\n` : "";
+      return exitDetails ? renderPromptTemplate("engine_driver_failure.md", { driver_exit_code: exitCodeText }) : "";
     }
     if (!fs.existsSync(stdioLogPath)) {
       if (shellExpansionGuardRejectedFromDetection) {
@@ -4200,13 +4144,7 @@ async function main() {
       core.warning(`Unable to read queue-scoped agent output for failure diagnostics: ${getErrorMessage(error)}`);
       agentOutputResult = { success: false, items: [] };
     }
-    const taskCompleteRegistrationIssueOnlyReportIncomplete =
-      agentOutputResult.success &&
-      agentOutputResult.items &&
-      agentOutputResult.items.some(item => item.type === "report_incomplete") &&
-      hasAgentTerminalReasonCompleted() &&
-      hasTaskLevelAgentOutput(agentOutputResult.items) &&
-      agentOutputResult.items.filter(item => item.type === "report_incomplete").every(isTaskCompleteRegistrationIssue);
+    const taskCompleteRegistrationIssueOnlyReportIncomplete = agentOutputResult.success && shouldIgnoreTaskCompleteRegistrationReports(agentOutputResult.items);
 
     if (agentConclusion === "success") {
       if (!agentOutputResult.success || !agentOutputResult.items || agentOutputResult.items.length === 0) {
@@ -4256,9 +4194,6 @@ async function main() {
         } else {
           hasReportIncomplete = true;
           core.info(`Agent emitted ${reportIncompleteItems.length} report_incomplete signal(s) - activating failure handling`);
-          for (const item of reportIncompleteItems) {
-            core.info(`  report_incomplete reason: ${item.reason}`);
-          }
           // Continue after marking the step failed so optional issue reporting can still run.
           // eslint-disable-next-line gh-aw-custom/require-return-after-core-setfailed
           core.setFailed("Agent reported that it could not complete the task");
@@ -4681,7 +4616,7 @@ async function main() {
         // Suppress when tool-denials-exceeded is present: that context already covers the denied errors.
         const permissionDeniedContext = hasToolDenialsExceeded ? "" : buildPermissionDeniedContext(agentOutputResult.items, workflowID);
         // Build report_incomplete context
-        const reportIncompleteContext = buildReportIncompleteContext(reportItems, { includeAgentText: !needsFailureDiagnostics });
+        const reportIncompleteContext = buildReportIncompleteContext(reportItems, { collectorEmptyOutputCause: emptyOutputCause, rootDir: path.dirname(getAgentStdioLogPath()) });
 
         // Build missing safe outputs context
         let missingSafeOutputsContext = "";
@@ -4695,7 +4630,7 @@ async function main() {
           missingSafeOutputsContext += "- The prompt failed to generate any meaningful result\n";
           missingSafeOutputsContext += "- The agent should have called `noop` to explicitly indicate no action was taken\n";
           missingSafeOutputsContext += "- A `safeoutputs` CLI command was malformed and never invoked the CLI\n\n";
-          missingSafeOutputsContext += buildSafeOutputsCliInvocationContext();
+          if (!hasReportedIncomplete) missingSafeOutputsContext += buildSafeOutputsCliInvocationContext();
         }
 
         // Build fork context hint
@@ -4718,7 +4653,7 @@ async function main() {
           ? buildEngineFailureContext({
               suppressEngineRateLimit429: maxAICreditsExceeded,
               maxCacheMissesExceeded,
-              metadataOnly: needsFailureDiagnostics,
+              metadataOnly: needsFailureDiagnostics || hasReportedIncomplete,
             })
           : "";
         const failureDiagnosticsContext = buildFailureDiagnosticsContext({
@@ -4786,10 +4721,14 @@ async function main() {
           code_push_failure_context: codePushFailureContext,
           repo_memory_validation_context: repoMemoryValidationContext,
           push_repo_memory_failure_context: pushRepoMemoryFailureContext,
-          missing_data_context: missingDataContext,
-          missing_tool_context: missingToolContext,
-          permission_denied_context: permissionDeniedContext,
-          tool_denials_exceeded_context: toolDenialsExceededContext,
+          missing_data_context: hasReportedIncomplete ? (hasMissingData ? buildWarningAlertLine("Missing Data Reported", "A missing-data signal was recorded; agent text is excluded.") : "") : missingDataContext,
+          missing_tool_context: hasReportedIncomplete ? (hasMissingTool ? buildWarningAlertLine("Missing Tools Reported", "A missing-tool signal was recorded; agent text is excluded.") : "") : missingToolContext,
+          permission_denied_context: hasReportedIncomplete ? "" : permissionDeniedContext,
+          tool_denials_exceeded_context: hasReportedIncomplete
+            ? hasToolDenialsExceeded
+              ? buildWarningAlertLine("Tool Denial Limit Exceeded", "The runtime recorded a tool-denial limit signal; agent text is excluded.")
+              : ""
+            : toolDenialsExceededContext,
           report_incomplete_context: reportIncompleteContext,
           failure_diagnostics_context: failureDiagnosticsContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
@@ -4930,7 +4869,7 @@ async function main() {
         const missingToolContext = missingToolReportAsFailure && !hasToolDenialsExceeded ? buildMissingToolContext(agentOutputResult.items) : "";
 
         // Build report_incomplete context
-        const reportIncompleteContext = buildReportIncompleteContext(reportItems, { includeAgentText: !needsFailureDiagnostics });
+        const reportIncompleteContext = buildReportIncompleteContext(reportItems, { collectorEmptyOutputCause: emptyOutputCause, rootDir: path.dirname(getAgentStdioLogPath()) });
 
         // Build permission denied context (denied commands list + fix prompt).
         // Suppress when tool-denials-exceeded is present: that context already covers the denied errors.
@@ -4948,7 +4887,7 @@ async function main() {
           missingSafeOutputsContext += "- The prompt failed to generate any meaningful result\n";
           missingSafeOutputsContext += "- The agent should have called `noop` to explicitly indicate no action was taken\n";
           missingSafeOutputsContext += "- A `safeoutputs` CLI command was malformed and never invoked the CLI\n\n";
-          missingSafeOutputsContext += buildSafeOutputsCliInvocationContext();
+          if (!hasReportedIncomplete) missingSafeOutputsContext += buildSafeOutputsCliInvocationContext();
         }
 
         // Build fork context hint
@@ -4968,7 +4907,7 @@ async function main() {
           shellExpansionGuardRejected,
           Boolean(terminalOutputFailureCause || modelEndpointMismatchContext)
         )
-          ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded, metadataOnly: needsFailureDiagnostics })
+          ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded, metadataOnly: needsFailureDiagnostics || hasReportedIncomplete })
           : "";
         const failureDiagnosticsContext = buildFailureDiagnosticsContext({
           failureCategories,
@@ -5040,10 +4979,14 @@ async function main() {
           code_push_failure_context: codePushFailureContext,
           repo_memory_validation_context: repoMemoryValidationContext,
           push_repo_memory_failure_context: pushRepoMemoryFailureContext,
-          missing_data_context: missingDataContext,
-          missing_tool_context: missingToolContext,
-          permission_denied_context: permissionDeniedContext,
-          tool_denials_exceeded_context: toolDenialsExceededContext,
+          missing_data_context: hasReportedIncomplete ? (hasMissingData ? buildWarningAlertLine("Missing Data Reported", "A missing-data signal was recorded; agent text is excluded.") : "") : missingDataContext,
+          missing_tool_context: hasReportedIncomplete ? (hasMissingTool ? buildWarningAlertLine("Missing Tools Reported", "A missing-tool signal was recorded; agent text is excluded.") : "") : missingToolContext,
+          permission_denied_context: hasReportedIncomplete ? "" : permissionDeniedContext,
+          tool_denials_exceeded_context: hasReportedIncomplete
+            ? hasToolDenialsExceeded
+              ? buildWarningAlertLine("Tool Denial Limit Exceeded", "The runtime recorded a tool-denial limit signal; agent text is excluded.")
+              : ""
+            : toolDenialsExceededContext,
           report_incomplete_context: reportIncompleteContext,
           failure_diagnostics_context: failureDiagnosticsContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
@@ -5160,6 +5103,7 @@ async function main() {
 }
 
 module.exports = {
+  extractShellCommandPreview,
   readModelEndpointMismatch,
   buildModelEndpointMismatchContext,
   isInvalidatedPRMergeCheckout,

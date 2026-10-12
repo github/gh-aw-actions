@@ -3,12 +3,11 @@
 const fs = require("fs");
 const path = require("path");
 const { collectUnifiedSession } = require("./unified_session.cjs");
-const { agentErrorDiagnosticText, agentErrorSummaryText } = require("./agent_execution.cjs");
-const { extractDeniedCommands } = require("./permission_denied_helpers.cjs");
-const { extractShellCommandFromToolData } = require("./tool_call_details.cjs");
+const { agentErrorSummaryText } = require("./agent_execution.cjs");
 const { collectArtifactSecretValues } = require("./safe_output_manifest.cjs");
 const { collectAddMaskedValues } = require("./add_mask_redaction.cjs");
 const { redactDiagnosticText, redactAndBoundDiagnostics } = require("./diagnostic_sanitization.cjs");
+const { lstatGuard } = require("./symlink_guard.cjs");
 
 // Keep cause titles and the category allow-list in sync; schema and docs list these causes too.
 const EMPTY_OUTPUT_CAUSES = Object.freeze({
@@ -21,6 +20,7 @@ const EMPTY_OUTPUT_FAILURE_CAUSES = Object.freeze({
   engine_outage: "experienced an engine outage",
   request_rejection: "had a request rejected",
   prompt_exhaustion: "reported incomplete result",
+  missing_terminal_safe_output: "finished without a terminal safe output",
   unknown: "finished without a clear failure cause",
 });
 
@@ -40,6 +40,102 @@ const REQUEST_REJECTION_ERROR_CATEGORIES = new Set([
 ]);
 
 /**
+ * Read fixed runtime evidence paths without following artifact symlinks or
+ * copying any payload into public diagnostics.
+ * @param {string} rootDir
+ * @param {string} relativePath
+ * @returns {{status: "recorded", content: string} | {status: "not recorded" | "unreadable", content?: undefined}}
+ */
+function readCompletionEvidence(rootDir, relativePath) {
+  try {
+    let current = rootDir;
+    if (!lstatGuard(current)?.isDirectory()) return { status: "unreadable" };
+    for (const part of relativePath.split("/")) {
+      current = path.join(current, part);
+      if (!lstatGuard(current)) return { status: "unreadable" };
+    }
+    const stat = lstatGuard(current);
+    if (!stat?.isFile() || stat.size > 10 * 1024 * 1024) return { status: "unreadable" };
+    return { status: "recorded", content: fs.readFileSync(current, "utf8") };
+  } catch (error) {
+    const missing = error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT";
+    return { status: missing ? "not recorded" : "unreadable" };
+  }
+}
+
+/**
+ * Registration and persistence are observations, not proof of task completion.
+ * Keep CLI and gateway counts separate: one invocation can appear in both.
+ * @param {string} [rootDir]
+ * @returns {string[]}
+ */
+function buildCompletionEvidence(rootDir = "/tmp/gh-aw") {
+  const runnerTemp = process.env.RUNNER_TEMP || "/home/runner/work/_temp";
+  let availability = "unknown (registration evidence not recorded)";
+  const flag = readCompletionEvidence(path.join(runnerTemp, "gh-aw"), "safeoutputs/gateway_empty.flag");
+  const cache = readCompletionEvidence(path.join(runnerTemp, "gh-aw"), "mcp-cli/tools/safeoutputs.json");
+  const gateway = readCompletionEvidence(rootDir, "mcp-logs/tools.json");
+  const validTools = tools => Array.isArray(tools) && tools.every(tool => typeof tool?.name === "string" && tool.name.length > 0);
+  if (flag.status === "recorded") {
+    availability = "unavailable (gateway registered zero tools)";
+  } else if (flag.status === "unreadable") {
+    // An unreadable authoritative override prevents a confident registration claim.
+    availability = "unknown (registration evidence could not be read)";
+  } else {
+    for (const evidence of [cache, gateway]) {
+      if (evidence.status === "recorded") {
+        try {
+          const value = JSON.parse(evidence.content);
+          const tools = evidence === cache ? value : value?.servers?.safeoutputs;
+          if (validTools(tools)) {
+            availability = `${tools.length ? "available" : "unavailable"} at ${evidence === cache ? "setup" : "gateway snapshot"} (registered ${tools.length} tool${tools.length === 1 ? "" : "s"})`;
+            break;
+          }
+          availability = "unknown (invalid registration evidence)";
+        } catch {
+          availability = "unknown (registration evidence could not be read)";
+        }
+      } else if (evidence.status === "unreadable") {
+        availability = "unknown (registration evidence could not be read)";
+      }
+    }
+  }
+  const summary = [`Safe-output tools: ${availability}`];
+  for (const [label, relativePath, eventName] of [
+    ["CLI", "mcp-cli-audit/safeoutputs.jsonl", "call_start"],
+    ["MCP", "mcp-logs/rpc-messages.jsonl", "tools/call"],
+  ]) {
+    const evidence = readCompletionEvidence(rootDir, relativePath);
+    let count = 0;
+    let malformed = 0;
+    for (const line of (evidence.content || "").split("\n").filter(line => line.trim())) {
+      try {
+        const entry = JSON.parse(line);
+        if (label === "CLI" ? entry?.event === eventName : ["rpc_request", "REQUEST"].includes(entry?.event ?? entry?.type) && entry?.server_id === "safeoutputs" && (entry?.method ?? entry?.payload?.method) === eventName) count++;
+      } catch {
+        malformed++;
+      }
+    }
+    summary.push(`Safe-output ${label} calls observed: ${evidence.status === "recorded" ? `${count}${malformed ? ` (partial evidence: ${malformed} malformed record${malformed === 1 ? "" : "s"})` : ""}` : `unknown (${evidence.status})`}`);
+  }
+  const output = readCompletionEvidence(rootDir, "safeoutputs.jsonl");
+  const lines = (output.content || "").split("\n").filter(line => line.trim());
+  let malformed = 0;
+  for (const line of lines) {
+    try {
+      const item = JSON.parse(line);
+      if (!item || typeof item !== "object" || Array.isArray(item) || typeof item.type !== "string") malformed++;
+    } catch {
+      malformed++;
+    }
+  }
+  summary.push(
+    `Safe-output persistence: ${output.status === "recorded" ? `${lines.length ? "nonempty" : "empty"} (${lines.length} record${lines.length === 1 ? "" : "s"}, ${malformed} malformed; not validation or publication evidence)` : output.status}`
+  );
+  return summary;
+}
+
+/**
  * Silence is not evidence of an intentional noop. Preserve runtime diagnostics
  * in a first-class incomplete signal when the agent emitted no valid outputs.
  * @param {string[]} errors
@@ -55,9 +151,9 @@ const REQUEST_REJECTION_ERROR_CATEGORIES = new Set([
  * }}
  */
 function buildEmptyOutputOutcome(errors, rootDir = "/tmp/gh-aw") {
-  const diagnostics = new Set(["Agent finished without emitting a terminal safe output; task completion could not be confirmed.", ...errors]);
+  const diagnostics = new Set(["Agent finished without emitting a terminal safe output; task completion could not be confirmed."]);
+  if (errors.length) diagnostics.add("Safe-output validation status: failed");
   let reason = errors.length ? "invalid_safe_outputs" : "missing_terminal_safe_output";
-  const starts = new Map();
   let events = [];
   let maskedValues = [];
   try {
@@ -97,13 +193,17 @@ function buildEmptyOutputOutcome(errors, rootDir = "/tmp/gh-aw") {
     // Ignore missing CLI audit evidence for workflows using MCP directly.
   }
   let driverExitCode;
+  let lastToolCallStatus = "not recorded";
+  let lastToolExitCode;
+  let failedToolCalls = 0;
+  let permissionDenials = 0;
+  let toolDenialLimitExceeded = false;
   let executionCategories = [];
   let executionErrorCodes = [];
   for (const event of events) {
     if (event.type === "agent.execution" && event.provenance.component === "execution" && event.provenance.phase === "agent" && event.data.exitCode > 0) {
       // A CLI parse error itself makes the bridge exit non-zero; preserve that more specific cause.
       if (!safeoutputsCliError) reason = "engine_driver_failure";
-      diagnostics.add(`Driver exit code: ${event.data.exitCode}. The engine driver exited before a terminal safe output was recorded.`);
     }
     if (event.type === "agent.execution" && event.provenance.component === "execution" && event.provenance.phase === "agent") {
       if (Number.isSafeInteger(event.data.exitCode)) driverExitCode = event.data.exitCode;
@@ -113,12 +213,12 @@ function buildEmptyOutputOutcome(errors, rootDir = "/tmp/gh-aw") {
     if (event.provenance.component !== "agent") continue;
     /** @type {any} */
     const data = event.data;
-    const key = `${event.provenance.path}:${event.session_id || ""}:${data.toolCallId}`;
     if (event.type === "tool.execution_start") {
-      starts.set(key, data);
-    } else if (
-      event.type === "tool.execution_complete" &&
-      (data.success === false ||
+      lastToolCallStatus = "started (completion not recorded)";
+      lastToolExitCode = undefined;
+    } else if (event.type === "tool.execution_complete") {
+      const failed =
+        data.success === false ||
         data.is_error === true ||
         data.isError === true ||
         data.result?.isError === true ||
@@ -126,22 +226,14 @@ function buildEmptyOutputOutcome(errors, rootDir = "/tmp/gh-aw") {
         data.status === "failed" ||
         data.status === "error" ||
         data.error != null ||
-        (typeof data.exitCode === "number" && data.exitCode !== 0))
-    ) {
-      const start = starts.get(key);
-      const toolName = data.toolName || start?.toolName || "unknown tool";
-      const tool = [data.mcpServerName || start?.mcpServerName, toolName].filter(Boolean).join(".");
-      const errorValue = data.error || data.output || data.result || "Tool execution failed";
-      const error = typeof errorValue === "string" ? redact(errorValue) : redactJson(errorValue);
-      const command = /^(bash|shell)$/i.test(toolName) ? extractShellCommandFromToolData(start) : "";
-      diagnostics.add(`${tool}${command ? `: ${command}` : ""}: ${error}`);
-    } else if (event.type === "guard.tool_denials_exceeded" && typeof data.reason === "string") {
-      diagnostics.add(data.reason);
+        (typeof data.exitCode === "number" && data.exitCode !== 0);
+      lastToolCallStatus = failed ? "failed" : data.success === true || data.exitCode === 0 ? "succeeded" : "completed (outcome unknown)";
+      lastToolExitCode = Number.isSafeInteger(data.exitCode) && data.exitCode >= 0 && data.exitCode <= 255 ? data.exitCode : undefined;
+      if (failed) failedToolCalls++;
+    } else if (event.type === "guard.tool_denials_exceeded") {
+      toolDenialLimitExceeded = true;
     } else if (event.type === "session.result" && Array.isArray(data.permissionDenials)) {
-      for (const denial of data.permissionDenials) {
-        const command = extractShellCommandFromToolData({ input: denial.tool_input });
-        diagnostics.add(`Permission denied: ${denial.tool_name || "unknown tool"}${command ? `: ${command}` : ""}`);
-      }
+      permissionDenials += data.permissionDenials.length;
     }
   }
   const safeStdio = stdio
@@ -154,23 +246,17 @@ function buildEmptyOutputOutcome(errors, rootDir = "/tmp/gh-aw") {
       }
     })
     .join("\n");
-  // Extract denied commands without copying harness configuration or transcript data.
   const rawSourceEngine = process.env.GH_AW_ENGINE_ID === "aider" || events.some(event => event.type === "workflow.info" && event.provenance.component === "workflow" && event.data.engineId === "aider") ? "aider" : undefined;
-  const attributedDiagnostics = agentErrorDiagnosticText(safeStdio, events, rawSourceEngine);
-  for (const command of extractDeniedCommands(attributedDiagnostics)) diagnostics.add(`Permission denied: ${command}`);
   const engineSummary = agentErrorSummaryText(safeStdio, events, rawSourceEngine);
   if (engineSummary) diagnostics.add(engineSummary);
   const engineErrorType = engineSummary.match(/\(([a-z][a-z0-9_]*)\)/)?.[1] || "";
-  if (driverExitCode !== undefined && ![...diagnostics].some(diagnostic => diagnostic.startsWith("Driver exit code:"))) {
-    diagnostics.add(`Driver exit code: ${driverExitCode}`);
-  }
   const errorCodes = executionErrorCodes.filter(code => Number.isSafeInteger(code) && code >= 400 && code <= 599);
   const isPromptExhaustion = executionCategories.some(category => PROMPT_EXHAUSTION_ERROR_CATEGORIES.has(category));
   const isRequestRejection = ["invalid_safe_outputs", "safeoutputs_cli_error"].includes(reason) || executionCategories.some(category => REQUEST_REJECTION_ERROR_CATEGORIES.has(category)) || errorCodes.some(code => code >= 400 && code < 500);
-  const isEngineOutage = reason === "engine_driver_failure" || executionCategories.some(category => ["agentic_engine_timeout", "capi_server_error", "sandbox_runtime_crash"].includes(category)) || errorCodes.some(code => code >= 500);
-  // Absence of evidence is not evidence of prompt exhaustion: without a matched category
-  // or status code, classify as "unknown" instead of guessing prompt_exhaustion.
-  const failureCause = isPromptExhaustion ? "prompt_exhaustion" : isRequestRejection ? "request_rejection" : isEngineOutage ? "engine_outage" : "unknown";
+  // Crash categories can be inferred from exit codes alone; they do not establish an outage.
+  const isEngineOutage = executionCategories.some(category => ["agentic_engine_timeout", "capi_server_error"].includes(category)) || errorCodes.some(code => code >= 500);
+  // Missing completion and nonzero driver exits are observed outcomes, not evidence of budget exhaustion or an outage.
+  const failureCause = isPromptExhaustion ? "prompt_exhaustion" : isRequestRejection ? "request_rejection" : isEngineOutage ? "engine_outage" : reason === "missing_terminal_safe_output" ? "missing_terminal_safe_output" : "unknown";
   const retryEvents = events.filter(event => event.type === "claude.api_retry" || (event.type === "system" && event.data.subtype === "api_retry"));
   const harnessRetryLines = stdio.split(/\r?\n/).filter(line => /^\[(?:copilot|claude|codex)-harness\].*\bretrying\b/i.test(line));
   const harnessRetryCount = harnessRetryLines.length;
@@ -182,14 +268,29 @@ function buildEmptyOutputOutcome(errors, rootDir = "/tmp/gh-aw") {
       )
     ),
   ];
-  diagnostics.add(`Failure classification: ${failureCause}`);
+  const summary = [
+    `Failure classification: ${failureCause}`,
+    reason === "engine_driver_failure" ? `Driver exit code: ${driverExitCode ?? "not recorded"}. The engine driver exited before a terminal safe output was recorded.` : `Driver exit code: ${driverExitCode ?? "not recorded"}`,
+    `Last tool call status: ${lastToolCallStatus}`,
+    ...(lastToolExitCode !== undefined ? [`Last tool exit code: ${lastToolExitCode}`] : []),
+    `Failed tool calls observed: ${failedToolCalls}`,
+    `Token budget state: ${executionCategories.includes("effective_tokens_limit_exceeded") ? "exceeded" : "unknown (no exhaustion signal recorded)"}`,
+    `Step budget state (LLM invocations): ${executionCategories.includes("invocation_cap_exceeded") ? "exceeded" : "unknown (no exhaustion signal recorded)"}`,
+    ...buildCompletionEvidence(rootDir),
+  ];
+  if (failureCause === "missing_terminal_safe_output") {
+    summary.push("Check the last tool status and safe-output registration, then ensure the workflow emits a terminal safe output. Missing completion alone does not identify an underlying engine or budget failure.");
+  }
+  if (errorCodes.length) diagnostics.add(`Engine HTTP error codes: ${[...new Set(errorCodes)].join(", ")}`);
+  if (permissionDenials) diagnostics.add(`Permission denials observed: ${permissionDenials}`);
+  if (toolDenialLimitExceeded) diagnostics.add("Tool denial limit status: exceeded");
   if (engineErrorType) {
     diagnostics.add(`Last engine error type: ${engineErrorType}`);
   } else if (reason === "engine_driver_failure") {
     diagnostics.add("Last engine error type: unknown");
   }
   diagnostics.add(`Retry attempts observed: ${retryCount}${retryStatusCodes.length ? ` (HTTP ${retryStatusCodes.join(", HTTP ")})` : ""}`);
-  const details = [...diagnostics].slice(0, 20).join("\n");
+  const details = [...summary, ...diagnostics].slice(0, 20).join("\n");
   const sanitized = redactAndBoundDiagnostics(details, { secrets, maskedValues });
   return {
     type: "report_incomplete",
@@ -202,4 +303,4 @@ function buildEmptyOutputOutcome(errors, rootDir = "/tmp/gh-aw") {
   };
 }
 
-module.exports = { buildEmptyOutputOutcome, EMPTY_OUTPUT_CAUSES, EMPTY_OUTPUT_FAILURE_CAUSES };
+module.exports = { buildEmptyOutputOutcome, buildCompletionEvidence, EMPTY_OUTPUT_CAUSES, EMPTY_OUTPUT_FAILURE_CAUSES };
