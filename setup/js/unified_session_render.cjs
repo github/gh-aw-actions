@@ -24,6 +24,7 @@ const RUNTIME_TYPES = new Set([
   "mcp.guard.blocked",
   "mcp.tool_call",
   "mcp.event",
+  "mcp.configuration",
   "firewall.http_access",
   "firewall.token_usage",
   "firewall.model_routing",
@@ -132,6 +133,10 @@ function eventDetail(event) {
       return fields(data, ["requestId", "toolCallId", "decisionSource"]) + " " + fields(data.result, ["kind"]);
     case "skill.invoked":
       return fields(data, ["name", "path", "source", "trigger", "model", "invokedAtTurn"]);
+    case "skill.inventory":
+      return `installed skills=${Array.isArray(data.skills) ? data.skills.length : "unavailable"}`;
+    case "skill.conflict":
+      return fields(data, ["name", "kind", "sources"]);
     case "skill.context_delivered_ref":
       return fields(data, ["interactionId", "source", "contentId"]) + " [skill instructions omitted]";
     case "system.message":
@@ -179,6 +184,8 @@ function eventDetail(event) {
       return `[blocked/filtered] ${fields(data, ["serverName", "toolName", "reason"])}`;
     case "mcp.tool_call":
       return fields(data, ["serverName", "toolName", "durationMs", "status", "error"]);
+    case "mcp.configuration":
+      return `servers=[${data.servers.map(server => fields(server, ["serverName", "transport", "required", "tools"])).join("; ")}]`;
     case "firewall.http_access":
       return fields(data, ["host", "method", "status", "decision"]);
     case "firewall.steering":

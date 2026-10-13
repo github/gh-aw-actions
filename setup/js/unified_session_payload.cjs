@@ -6,6 +6,7 @@ const { computeInferenceAIC, findModelPricing } = require("./model_costs.cjs");
 const { COPILOT_WORKFLOW_EVENT_FIELDS } = require("./copilot_workflow_events.cjs");
 const { DYNAMIC_WORKFLOW_EVENT_TYPES } = require("./dynamic_workflow_session.cjs");
 const { sessionContext } = require("./agent_session.cjs");
+const { normalizeMcpConfigurationData } = require("./mcp_configuration.cjs");
 
 const SCOPED_AGENT_TYPES = new Set([
   "session.init",
@@ -167,9 +168,20 @@ const TASK_FIELDS = {
 
 /** @type {Record<string, Fields>} */
 const EVENT_FIELDS = {
+  "plugin.installation": {
+    plugin: ["plugin"],
+    repository: ["repository"],
+    ref: ["ref"],
+    path: ["path"],
+    status: ["status"],
+  },
   ...COPILOT_WORKFLOW_EVENT_FIELDS,
   "session.format": { version: ["version"] },
   "agent.execution": { categories: ["categories"], errorCodes: ["errorCodes"], errorTypes: ["errorTypes"], exitCode: ["exitCode", "exit_code"] },
+  "skill.invoked": { name: ["name"], path: ["path"], source: ["source"], trigger: ["trigger"], model: ["model"], invokedAtTurn: ["invokedAtTurn"] },
+  "skill.context_delivered_ref": { interactionId: ["interactionId"], source: ["source"], contentId: ["contentId"] },
+  "skill.inventory": { skills: ["skills"] },
+  "skill.conflict": { name: ["name"], kind: ["kind"], sources: ["sources"] },
   "session.init": { sourceEngine: ["sourceEngine"], model: ["model", "selectedModel"], sessionId: ["sessionId", "session_id"], cwd: ["cwd"], reasoningEffort: ["reasoningEffort"] },
   "session.shutdown": {
     shutdownType: ["shutdownType"],
@@ -444,7 +456,7 @@ function normalizeUnifiedSessionEvent(event, phase) {
   /** @type {any} */
   const source = event.data;
   const known = Object.hasOwn(EVENT_FIELDS, event.type);
-  const data = known ? selectFields(source, EVENT_FIELDS[event.type]) : structuredClone(source);
+  const data = event.type === "mcp.configuration" ? normalizeMcpConfigurationData(source) : known ? selectFields(source, EVENT_FIELDS[event.type]) : structuredClone(source);
   if (event.type === "workflow.info") {
     const awContext = Object.hasOwn(source, "awContext") ? source.awContext : source.context;
     if (awContext && typeof awContext === "object" && !Array.isArray(awContext)) {
@@ -459,6 +471,17 @@ function normalizeUnifiedSessionEvent(event, phase) {
       const lineage = selectFields(episode, EPISODE_LINEAGE_FIELDS);
       if (Object.keys(lineage).length || Object.hasOwn(source, "episode")) data.episode = lineage;
     }
+  }
+  if (event.type === "skill.inventory" && Array.isArray(source.skills)) {
+    data.skills = source.skills.map(skill =>
+      selectFields(skill, {
+        name: ["name"],
+        source: ["source"],
+        scope: ["scope"],
+        digest: ["digest"],
+        purpose: ["purpose"],
+      })
+    );
   }
   if (SCOPED_AGENT_TYPES.has(event.type) || (Object.hasOwn(COPILOT_WORKFLOW_EVENT_FIELDS, event.type) && event.type.startsWith("subagent."))) {
     const parentToolCallId = Object.hasOwn(source, "parentToolCallId") ? source.parentToolCallId : event.parentToolCallId;
