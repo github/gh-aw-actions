@@ -522,7 +522,7 @@
   },
   {
     "name": "add_comment",
-    "description": "WRITE-ONCE: do NOT call this tool with empty or placeholder arguments to probe or discover its schema \u2014 the required `body` field is listed in this schema; if you are not ready to post a real comment, call `noop` instead. Adds a comment to an existing GitHub issue, pull request, or discussion. Use this to provide feedback, answer questions, or add information to an existing conversation. For creating new items, use create_issue, create_discussion, or create_pull_request instead. IMPORTANT: Comments are subject to validation constraints enforced by the MCP server - maximum 65536 characters for the complete comment (including footer which is added automatically), 10 mentions (@username), and 50 links. Exceeding these limits will result in an immediate error with specific guidance. NOTE: By default, this tool does not require discussions:write permission. Set 'discussions: true' in the workflow's safe-outputs.add-comment configuration to enable discussion comments and request this permission.",
+    "description": "WRITE-ONCE: do NOT call this tool with empty or placeholder arguments to probe or discover its schema \u2014 the required `body` field is listed in this schema; if you are not ready to post a real comment, call `noop` instead. Adds a comment to an existing GitHub issue, pull request, or discussion. Use this to provide feedback, answer questions, or add information to an existing conversation. For creating new items, use create_issue, create_discussion, or create_pull_request instead. IMPORTANT: Comments are subject to validation constraints enforced by the MCP server - maximum 65536 characters for the complete comment (including footer which is added automatically), 10 mentions (@username), and the configured max-links URL occurrences in agent content (default: 50; generated footer and metadata links excluded). Exceeding these limits will result in an immediate error with specific guidance. NOTE: By default, this tool does not require discussions:write permission. Set 'discussions: true' in the workflow's safe-outputs.add-comment configuration to enable discussion comments and request this permission.",
     "inputSchema": {
       "type": "object",
       "required": ["body"],
@@ -530,7 +530,7 @@
         "body": {
           "type": "string",
           "maxLength": 65536,
-          "description": "The comment text in Markdown format. Must be the final intended comment \u2014 not a placeholder or test value. This is the 'body' field - do not use 'comment_body' or other variations. Provide helpful, relevant information that adds value to the conversation. CONSTRAINTS: The complete comment (your body text + automatically added footer) must not exceed 65536 characters total. Maximum 10 mentions (@username), maximum 50 links (http/https URLs). A footer (~200-500 characters) is automatically appended with workflow attribution, so leave adequate space. If these limits are exceeded, the tool call will fail with a detailed error message indicating which constraint was violated."
+          "description": "The comment text in Markdown format. Must be the final intended comment \u2014 not a placeholder or test value. This is the 'body' field - do not use 'comment_body' or other variations. Provide helpful, relevant information that adds value to the conversation. CONSTRAINTS: The complete comment (your body text + automatically added footer) must not exceed 65536 characters total. Maximum 10 mentions (@username); http/https URL occurrences in your body must not exceed the configured max-links (default: 50), including repeated URLs. Generated footer and metadata links are excluded. A footer (~200-500 characters) is automatically appended with workflow attribution, so leave adequate space. If these limits are exceeded, the tool call will fail with a detailed error message indicating which constraint was violated."
         },
         "item_number": {
           "type": ["number", "string"],
@@ -1713,14 +1713,14 @@
   },
   {
     "name": "link_sub_issue",
-    "description": "Link an issue as a sub-issue of a parent issue. Use this to establish parent-child relationships between issues for better organization and tracking of related work items.",
+    "description": "Link an issue as a sub-issue of a parent issue. Use this to establish parent-child relationships between issues for better organization and tracking of related work items. The workflow's `link-sub-issue: target:` configuration controls the parent: `triggering` (the default) uses the triggering issue and ignores `parent_issue_number`; a fixed target uses the configured issue number; only `target: '*'` uses `parent_issue_number`. Scheduled and workflow_dispatch workflows must configure `target: '*'` to select parent issues explicitly, or configure a fixed parent target. The tool fails when `target: triggering` has no triggering issue.",
     "inputSchema": {
       "type": "object",
       "required": ["parent_issue_number", "sub_issue_number"],
       "properties": {
         "parent_issue_number": {
           "type": ["number", "string"],
-          "description": "The parent issue number to link the sub-issue to. This is the numeric ID from the GitHub URL (e.g., 100 in github.com/owner/repo/issues/100).",
+          "description": "The parent issue number or temporary ID of a newly created parent issue. This is the numeric ID from the GitHub URL (e.g., 100 in github.com/owner/repo/issues/100). Only effective when the workflow configures `link-sub-issue: target: '*'`; ignored for triggering or fixed targets.",
           "x-synonyms": ["parentIssueNumber"]
         },
         "sub_issue_number": {

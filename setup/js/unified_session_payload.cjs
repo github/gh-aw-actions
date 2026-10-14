@@ -7,6 +7,8 @@ const { COPILOT_WORKFLOW_EVENT_FIELDS } = require("./copilot_workflow_events.cjs
 const { DYNAMIC_WORKFLOW_EVENT_TYPES } = require("./dynamic_workflow_session.cjs");
 const { sessionContext } = require("./agent_session.cjs");
 const { normalizeMcpConfigurationData } = require("./mcp_configuration.cjs");
+const { ERR_VALIDATION } = require("./error_codes.cjs");
+const { getMcpRateLimitHint, getRpcRateLimitHint } = require("./mcp_rate_limit.cjs");
 
 const SCOPED_AGENT_TYPES = new Set([
   "session.init",
@@ -75,6 +77,8 @@ const MCP_FIELDS = {
   inputSize: ["inputSize", "input_size"],
   outputSize: ["outputSize", "output_size"],
   status: ["status"],
+  httpStatus: ["httpStatus"],
+  retryHint: ["retryHint"],
   reason: ["reason"],
   error: ["error"],
 };
@@ -168,6 +172,7 @@ const TASK_FIELDS = {
 
 /** @type {Record<string, Fields>} */
 const EVENT_FIELDS = {
+  "model.inventory": {},
   "plugin.installation": {
     plugin: ["plugin"],
     repository: ["repository"],
@@ -446,6 +451,72 @@ function resolveUsageAic(source, data, usage) {
 }
 
 /**
+ * Validate and project inventory formats together so collectors cannot accept
+ * malformed snapshots that would otherwise look like genuinely empty inventories.
+ * @param {any} value
+ * @returns {import("./types/unified_session").ModelInventoryData | undefined}
+ */
+function normalizeModelInventoryData(value) {
+  const isObject = entry => entry !== null && typeof entry === "object" && !Array.isArray(entry);
+  const isIdentifier = entry => typeof entry === "string" && entry.trim().length > 0;
+  const firstField = (entry, names) => names.map(name => entry[name]).find(field => field !== undefined);
+  const normalizeRouting = entries => {
+    if (!Array.isArray(entries)) return undefined;
+    const result = [];
+    for (const entry of entries) {
+      if (!isObject(entry)) return undefined;
+      const modelId = firstField(entry, ["modelId", "model_id"]);
+      const supportedEndpoints = firstField(entry, ["supportedEndpoints", "supported_endpoints"]);
+      if (!isIdentifier(modelId) || (supportedEndpoints !== undefined && (!Array.isArray(supportedEndpoints) || !supportedEndpoints.every(isIdentifier)))) return undefined;
+      result.push({ modelId, ...(supportedEndpoints !== undefined ? { supportedEndpoints: [...supportedEndpoints] } : {}) });
+    }
+    return result;
+  };
+  if (!isObject(value)) return undefined;
+  let entries;
+  if (value.endpoints !== undefined) {
+    if (!Array.isArray(value.endpoints)) return undefined;
+    entries = value.endpoints;
+  } else if (value.providers !== undefined) {
+    if (!isObject(value.providers)) return undefined;
+    entries = [];
+    for (const [provider, entry] of Object.entries(value.providers)) {
+      if (!isObject(entry)) return undefined;
+      entries.push({ ...entry, provider });
+    }
+  } else if (value.provider !== undefined) {
+    entries = [value];
+  } else {
+    return undefined;
+  }
+  const topRouting = firstField(value, ["routingModels", "routing_models"]);
+  const topRoutingModels = topRouting === undefined ? undefined : normalizeRouting(topRouting);
+  if (topRouting !== undefined && topRoutingModels === undefined) return undefined;
+  /** @type {import("./types/unified_session").ModelInventoryData["endpoints"]} */
+  const endpoints = [];
+  for (const entry of entries) {
+    if (!isObject(entry) || !isIdentifier(entry.provider)) return undefined;
+    const rawModels = firstField(entry, ["models", "available_models", "detected_models", "model_ids", "availableModels"]);
+    // AWF uses null for unconfigured endpoints and pending model fetches.
+    const models = rawModels === null && typeof entry.configured === "boolean" ? [] : rawModels;
+    if (!Array.isArray(models)) return undefined;
+    const modelIds = [];
+    for (const model of models) {
+      const id = typeof model === "string" ? model : isObject(model) ? firstField(model, ["id", "name", "model"]) : undefined;
+      if (!isIdentifier(id)) return undefined;
+      modelIds.push(id);
+    }
+    const endpointRouting = firstField(entry, ["routingModels", "routing_models"]);
+    const routingModels = endpointRouting === undefined ? topRoutingModels : normalizeRouting(endpointRouting);
+    if (endpointRouting !== undefined && routingModels === undefined) return undefined;
+    endpoints.push({ provider: entry.provider, models: modelIds, ...(routingModels !== undefined ? { routingModels: structuredClone(routingModels) } : {}) });
+  }
+  const modelsFetchComplete = firstField(value, ["modelsFetchComplete", "models_fetch_complete"]);
+  if (modelsFetchComplete !== undefined && typeof modelsFetchComplete !== "boolean") return undefined;
+  return { endpoints, ...(modelsFetchComplete !== undefined ? { modelsFetchComplete } : {}) };
+}
+
+/**
  * Compact known payloads without truncating text or changing native parser traces.
  * Unknown extension data remains opaque for forward compatibility.
  * @param {SessionEvent} event
@@ -457,6 +528,11 @@ function normalizeUnifiedSessionEvent(event, phase) {
   const source = event.data;
   const known = Object.hasOwn(EVENT_FIELDS, event.type);
   const data = event.type === "mcp.configuration" ? normalizeMcpConfigurationData(source) : known ? selectFields(source, EVENT_FIELDS[event.type]) : structuredClone(source);
+  if (event.type === "model.inventory") {
+    const inventory = normalizeModelInventoryData(source);
+    if (inventory === undefined) throw new Error(`${ERR_VALIDATION}: Model inventory snapshot must contain valid endpoint model collections`);
+    Object.assign(data, inventory);
+  }
   if (event.type === "workflow.info") {
     const awContext = Object.hasOwn(source, "awContext") ? source.awContext : source.context;
     if (awContext && typeof awContext === "object" && !Array.isArray(awContext)) {
@@ -530,6 +606,20 @@ function normalizeUnifiedSessionEvent(event, phase) {
       if (!Object.hasOwn(data, key) && value !== undefined) data[key] = structuredClone(value);
     }
     if (data.error && typeof data.error === "object") data.error = selectFields(data.error, { code: ["code"], message: ["message"] });
+    const retryHint =
+      data.httpStatus === 429 && typeof data.retryHint === "string"
+        ? data.retryHint
+        : event.type === "mcp.rpc.response"
+          ? getRpcRateLimitHint({ payload: rpc })
+          : event.type === "mcp.tool_call" && typeof source.error === "string"
+            ? getMcpRateLimitHint(source.error)
+            : null;
+    if (retryHint !== null) {
+      data.httpStatus = 429;
+      data.retryHint = retryHint;
+      if (typeof data.error === "string") data.error = `HTTP 429: ${retryHint}`;
+      else if (data.error && typeof data.error === "object") data.error.message = `HTTP 429: ${retryHint}`;
+    }
   }
   if (["session.result", "firewall.token_usage", "usage.report"].includes(event.type)) {
     const usage = selectFields(event.type === "session.result" ? source.usage : (source.usage ?? source), USAGE_FIELDS);
@@ -585,4 +675,4 @@ function normalizeUnifiedSessionEvent(event, phase) {
   };
 }
 
-module.exports = { normalizeUnifiedSessionEvent, evalResultRunId };
+module.exports = { normalizeUnifiedSessionEvent, normalizeModelInventoryData, evalResultRunId };
