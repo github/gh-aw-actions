@@ -12,7 +12,7 @@ const { administrator, bind, commit, context, dispatcher, evidence, finish, gene
 const resourceFixture = require("../../../specs/work-queue/fixtures/resource-scope.json");
 const contractFixture = require("../../../specs/work-queue/fixtures/contract.json");
 
-function fakeGitHub(initial = [], { immutableIds = false } = {}) {
+function fakeGitHub(initial = []) {
   let serial = 0;
   const blobs = new Map();
   const trees = new Map();
@@ -36,10 +36,7 @@ function fakeGitHub(initial = [], { immutableIds = false } = {}) {
     emptyLog: false,
     updates: 0,
   };
-  const id = prefix => {
-    const value = `${prefix}-${++serial}`;
-    return immutableIds ? createHash("sha1").update(value).digest("hex") : value;
-  };
+  const id = prefix => `${prefix}-${++serial}`;
   const missing = () => Object.assign(new Error("Not found"), { status: 404 });
   function install(log, branch = "work-queue") {
     const blob = id("blob");

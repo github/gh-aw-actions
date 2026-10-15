@@ -78,7 +78,6 @@ function hasRateLimitIndicator(messageLower) {
  * @returns {boolean} True if the error is transient and should be retried
  */
 function isTransientError(error) {
-  if (error?.code === "ERR_TRANSPORT_INTEGRITY") return false;
   const errorMsg = getErrorMessage(error);
   const errorMsgLower = errorMsg.trimStart().toLowerCase();
   const status = error?.response?.status ?? error?.status ?? null;
@@ -283,7 +282,7 @@ async function withRetry(operation, config = {}, operationName = "operation") {
       const errorMsg = getErrorMessage(error);
 
       // Check if this error should be retried
-      if (error?.code === "ERR_TRANSPORT_INTEGRITY" || !fullConfig.shouldRetry(error)) {
+      if (!fullConfig.shouldRetry(error)) {
         core.debug(`${operationName} failed with non-retryable error: ${errorMsg}`);
         throw enhanceError(error, {
           operation: operationName,

@@ -5,11 +5,10 @@
 const fs = require("fs");
 const { getPatchPathForBranch, getPatchPathForBranchInRepo } = require("./git_patch_utils.cjs");
 const { getBundlePathForBranch, getBundlePathForBranchInRepo } = require("./generate_git_bundle.cjs");
-const { TransportIntegrityError } = require("./transport_integrity.cjs");
 
 /**
  * Derive patch and bundle file paths for a safe-output message from the
- * validated branch and qualified target repository.
+ * validated `branch` (and optional `repo`) fields.
  *
  * Paths are always re-derived from `branch` so that even a malicious agent
  * cannot point the privileged handler at a file outside the canonical
@@ -17,31 +16,37 @@ const { TransportIntegrityError } = require("./transport_integrity.cjs");
  * `getPatchPathForBranch` / `getBundlePathForBranch` enforces that prefix.
  *
  * @param {Object} message - The safe-output message
- * @param {string} [qualifiedRepo] - Authorized, fully qualified target repo slug
+ * @param {string} [defaultTargetRepo] - Default target repo slug used as a fallback
+ *   candidate for multi-repo path computation
  * @returns {{patchPath: string|undefined, bundlePath: string|undefined}}
  */
-function resolveTransportPaths(message, qualifiedRepo) {
+function resolveTransportPaths(message, defaultTargetRepo) {
   const branch = message.branch;
   if (!branch) {
     return { patchPath: undefined, bundlePath: undefined };
   }
-  const repoCandidates = qualifiedRepo ? [qualifiedRepo, null] : [null];
-  const candidates = repoCandidates
-    .map(repo => {
-      const patch = repo ? getPatchPathForBranchInRepo(branch, repo) : getPatchPathForBranch(branch);
-      const bundle = repo ? getBundlePathForBranchInRepo(branch, repo) : getBundlePathForBranch(branch);
-      return {
-        patchPath: fs.existsSync(patch) ? patch : undefined,
-        bundlePath: fs.existsSync(bundle) ? bundle : undefined,
-      };
-    })
-    .filter(candidate => candidate.patchPath || candidate.bundlePath);
-  // Patch and bundle must belong to one namespace, never independently selected
-  // from qualified and legacy artifacts left by separate producer invocations.
-  if (candidates.length > 1) {
-    throw new TransportIntegrityError(branch, undefined, "resolve", "ambiguous transport candidates");
+  /** @type {(string|null)[]} */
+  const repoCandidates = [];
+  if (message.repo) repoCandidates.push(message.repo);
+  if (defaultTargetRepo && defaultTargetRepo !== message.repo) repoCandidates.push(defaultTargetRepo);
+  repoCandidates.push(null);
+  let patchPath;
+  let bundlePath;
+  for (const repo of repoCandidates) {
+    const p = repo ? getPatchPathForBranchInRepo(branch, repo) : getPatchPathForBranch(branch);
+    if (fs.existsSync(p)) {
+      patchPath = p;
+      break;
+    }
   }
-  return candidates[0] || { patchPath: undefined, bundlePath: undefined };
+  for (const repo of repoCandidates) {
+    const p = repo ? getBundlePathForBranchInRepo(branch, repo) : getBundlePathForBranch(branch);
+    if (fs.existsSync(p)) {
+      bundlePath = p;
+      break;
+    }
+  }
+  return { patchPath, bundlePath };
 }
 
 module.exports = { resolveTransportPaths };
