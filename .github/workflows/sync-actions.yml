@@ -426,17 +426,18 @@ jobs:
 
           echo "::endgroup::"
 
-      - name: Create release
+      - name: Create draft release
         if: steps.resolve-ref.outputs.should_create_tag == 'true'
         run: |
-          echo "::group::Creating Release"
+          echo "::group::Creating Draft Release"
           TAG="$TAG_REF"
-          echo "Creating GitHub release for tag: $TAG"
+          echo "Creating draft GitHub release for tag: $TAG"
           gh release create "$TAG" \
+            --draft \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
             --notes "Sync of actions from [gh-aw](https://github.com/github/gh-aw) at \`$TAG\`."
-          echo "Release '$TAG' created. ✓"
+          echo "Draft release '$TAG' created. ✓"
           echo "::endgroup::"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
