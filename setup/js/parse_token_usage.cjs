@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { iterateJsonl, iterateJsonlEvents, iterateLines } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
@@ -9,6 +10,7 @@ const { parseTokenUsageJsonl, generateTokenUsageSummary, formatAICForOutput } = 
 const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
 const { mapAWFRoutingEffort, resolveAWFModelRoutingSelection, getAWFModelRoutingPolicy } = require("./awf_model_routing.cjs");
 const { recordModelRouting, resolveEffectiveModel, validateModelIdentifier } = require("./model_attribution.cjs");
+const { persistCopilotModelSelection } = require("./copilot_model_selection.cjs");
 
 const DEFAULT_GH_AW_DIR = "/tmp/gh-aw";
 /**
@@ -64,33 +66,28 @@ function readModelRoutingRecord(ghAwDir) {
   const seenOutcomeRecords = new Set();
   const requestRecords = [];
   for (const relativePath of paths) {
-    let lines;
+    let content;
     try {
-      lines = fs.readFileSync(path.join(ghAwDir, relativePath), "utf8").split("\n");
+      content = fs.readFileSync(path.join(ghAwDir, relativePath), "utf8");
     } catch {
       continue;
     }
     const previousPathRecords = new Set(seenOutcomeRecords);
-    for (const line of lines) {
-      try {
-        const record = JSON.parse(line);
-        if (typeof record?._schema !== "string" || !record._schema.startsWith("model-routing/")) continue;
-        if (record.stage === "selection" || record.stage === "failure") {
-          // Suppress mirrored copies from earlier paths, not repeated records within this log.
-          const key = JSON.stringify(record);
-          if (previousPathRecords.has(key)) continue;
-          seenOutcomeRecords.add(key);
-          if (record.stage === "selection") {
-            selection = record;
-            failureAfterSelection = null;
-          } else {
-            lastFailure = record;
-            if (selection) failureAfterSelection = record;
-          }
-        } else if (record.stage === "request") requestRecords.push(record);
-      } catch {
-        // Skip incomplete proxy records.
-      }
+    for (const record of iterateJsonl(content)) {
+      if (typeof record?._schema !== "string" || !record._schema.startsWith("model-routing/")) continue;
+      if (record.stage === "selection" || record.stage === "failure") {
+        // Suppress mirrored copies from earlier paths, not repeated records within this log.
+        const key = JSON.stringify(record);
+        if (previousPathRecords.has(key)) continue;
+        seenOutcomeRecords.add(key);
+        if (record.stage === "selection") {
+          selection = record;
+          failureAfterSelection = null;
+        } else {
+          lastFailure = record;
+          if (selection) failureAfterSelection = record;
+        }
+      } else if (record.stage === "request") requestRecords.push(record);
     }
   }
   const result = selection || lastFailure;
@@ -350,7 +347,7 @@ function readDedupedTokenUsage(paths) {
       continue;
     }
 
-    for (const line of fileContent.split("\n")) {
+    for (const line of iterateLines(fileContent)) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       const dedupeKey = extractTokenUsageDedupeKey(trimmed) || trimmed;
@@ -406,11 +403,11 @@ function findCopilotUsageCheckpoint(sessionStateDir = getGhAwPath("sandbox/agent
     } catch {
       continue;
     }
-    for (const line of content.split("\n")) {
+    for (const entry of iterateJsonlEvents(content)) {
       sequence++;
-      if (!line.trim()) continue;
+      if (entry.type === "invalid") continue;
       try {
-        const event = JSON.parse(line);
+        const event = entry.value;
         if (event?.type !== "session.usage_checkpoint") continue;
         const totalNanoAiu = Number(event?.data?.totalNanoAiu);
         if (!Number.isFinite(totalNanoAiu) || totalNanoAiu < 0) continue;
@@ -427,6 +424,7 @@ function findCopilotUsageCheckpoint(sessionStateDir = getGhAwPath("sandbox/agent
         // Ignore malformed session events.
       }
     }
+    if (!content || content.endsWith("\n")) sequence++;
   }
   return latest;
 }
@@ -553,6 +551,7 @@ async function main(copilotSessionStateDir = getGhAwPath("sandbox/agent/logs/cop
   /** @type {{routing: any, effective: any}|null} */
   let routedAttribution = null;
   try {
+    persistCopilotModelSelection();
     routedAttribution = recordModelRoutingFromArtifacts();
     const tokenUsagePaths = getReadableTokenUsagePaths(getTokenUsagePaths());
     if (tokenUsagePaths.length === 0) {
