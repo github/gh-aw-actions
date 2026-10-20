@@ -5,7 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const { isSessionEvent } = require("./agent_session.cjs");
 const { hasCopilotConversation, deduplicateCopilotFallback, normalizeCopilotSession } = require("./copilot_session.cjs");
-const { collectAddMaskedValues, writeSessionArtifact, removeFailedSessionArtifacts } = require("./session_artifact.cjs");
+const { collectAddMaskedValues, serializeSessionArtifact, writeSessionArtifact, removeFailedSessionArtifacts } = require("./session_artifact.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { normalizeUnifiedSessionEvent, normalizeModelInventoryData, evalResultRunId } = require("./unified_session_payload.cjs");
 const { ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
@@ -30,6 +30,24 @@ function isModelEndpointMismatchData(data) {
     data.supported_endpoints.every(endpoint => typeof endpoint === "string") &&
     ["model", "endpoint"].every(key => !Object.hasOwn(data, key) || typeof data[key] === "string")
   );
+}
+
+const MODEL_RESOLUTION_STATUSES = ["resolved", "exact", "failed"];
+const MODEL_RESOLUTION_CAUSES = ["model_unavailable", "catalog_unavailable"];
+
+/**
+ * Validate one entry of agent/model-resolution.json, written by the shared
+ * "resolve configured model" step (resolve_model_alias.cjs).
+ * @param {any} data
+ * @returns {boolean}
+ */
+function isModelResolutionData(data) {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return false;
+  if (!["engine", "role", "configured_model"].every(key => typeof data[key] === "string" && data[key] !== "")) return false;
+  if (!["resolved_model", "provider"].every(key => data[key] === null || typeof data[key] === "string")) return false;
+  if (!MODEL_RESOLUTION_STATUSES.includes(data.status)) return false;
+  if (data.status === "failed") return MODEL_RESOLUTION_CAUSES.includes(data.cause) && data.resolved_model === null;
+  return data.cause === null && typeof data.resolved_model === "string";
 }
 
 /** @typedef {import("./types/agent_session").SessionEvent} SessionEvent */
@@ -551,6 +569,22 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
       report(mismatchFile, "malformed_json", undefined);
     }
   }
+  const resolutionFile = path.join(rootDir, "agent/model-resolution.json");
+  if (exists(resolutionFile)) {
+    try {
+      const records = JSON.parse(read(resolutionFile));
+      if (!Array.isArray(records) || records.length === 0 || !records.every(isModelResolutionData)) {
+        report(resolutionFile, "invalid_model_resolution", undefined);
+      } else {
+        const keys = ["engine", "role", "configured_model", "resolved_model", "provider", "status", "cause"];
+        const events = records.map(record => /** @type {SessionEvent} */ ({ type: "model.resolution", data: Object.fromEntries(keys.map(key => [key, record[key]])) }));
+        sources.push({ component: "model_resolution", phase: "agent", path: "agent/model-resolution.json", events });
+      }
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      report(resolutionFile, "malformed_json", undefined);
+    }
+  }
   for (const [candidates, component, phase, type] of observations) {
     const file = choose(candidates);
     if (type === "model_routing.outcome" && file) {
@@ -677,27 +711,43 @@ function collectUnifiedSession({ rootDir = "/tmp/gh-aw", engine, warn = message 
 }
 
 /**
- * @param {{rootDir?: string, engine?: string, outputPath?: string, warn?: (message: string) => void, jobDurations?: Record<string, number>}} [options]
- * @returns {SessionEvent[]}
+ * @param {{rootDir?: string, engine?: string, outputPath?: string, warn?: (message: string) => void, jobDurations?: Record<string, number>, graders?: any[], customGraderIds?: string[]}} [options]
+ * @returns {import("./types/unified_session").UnifiedSession}
  */
 function writeUnifiedSession(options = {}) {
   const outputPath = options.outputPath ?? path.join(options.rootDir ?? "/tmp/gh-aw", "usage/aw_session.jsonl");
   try {
-    const { events, maskedValues } = collectUnifiedSession(options);
+    const collected = collectUnifiedSession(options);
+    const maskedValues = collected.maskedValues;
+    let events = collected.events;
+    if (options.graders !== undefined) {
+      // Grade the exact redacted representation that is published, without
+      // rereading the session or any of its source files.
+      const session = [];
+      for (const entry of iterateJsonlEvents(serializeSessionArtifact(events, maskedValues))) {
+        if (entry.type === "json") session.push(entry.value);
+        else if (entry.reason !== "blank") throw new Error(`${ERR_VALIDATION}: Invalid serialized unified session`);
+      }
+      events = require("./grader_artifacts.cjs").writeGraderArtifacts(session, path.dirname(outputPath), options.graders, options.customGraderIds);
+    }
     writeSessionArtifact(outputPath, events, maskedValues);
     return events;
   } catch (error) {
-    removeFailedSessionArtifacts([outputPath], error);
+    const graderFiles = options.graders === undefined ? [] : ["grader_manifest.json", "grader_results.json"].map(file => path.join(path.dirname(outputPath), "graders", file));
+    removeFailedSessionArtifacts([outputPath, ...graderFiles], error);
     throw error;
   }
 }
 
-/** @param {{rootDir?: string, engine?: string, outputPath?: string, jobDurations?: Record<string, number>}} [options] @returns {Promise<void>} */
+/** @param {{rootDir?: string, engine?: string, outputPath?: string, jobDurations?: Record<string, number>, graders?: any[], customGraderIds?: string[]}} [options] @returns {Promise<void>} */
 async function main(options = {}) {
   const jobDurations = options.jobDurations ?? (await require("./workflow_job_durations.cjs").collectJobDurations({ warn: message => global.core.warning(message) }));
-  writeUnifiedSession({ ...options, jobDurations });
+  const { readGraderManifestEnvironment, publishGraderSummary } = require("./grader_artifacts.cjs");
+  const manifest = options.graders === undefined ? readGraderManifestEnvironment() : { graders: options.graders };
+  const events = writeUnifiedSession({ ...options, jobDurations, graders: manifest.graders, customGraderIds: options.customGraderIds ?? manifest.customGraders });
   const { publishUnifiedSessionSummary } = require("./unified_session_render.cjs");
   await publishUnifiedSessionSummary(options.outputPath ?? path.join(options.rootDir ?? "/tmp/gh-aw", "usage/aw_session.jsonl"));
+  await publishGraderSummary(events);
 }
 
 if (require.main === module) {
@@ -708,4 +758,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { SESSION_FILE_FORMAT_VERSION, sessionTimestamp, mergeSessionSources, normalizeRuntimeEvent, parseEngineSession, collectUnifiedSession, isModelEndpointMismatchData, writeUnifiedSession, main };
+module.exports = { SESSION_FILE_FORMAT_VERSION, sessionTimestamp, mergeSessionSources, normalizeRuntimeEvent, parseEngineSession, collectUnifiedSession, isModelEndpointMismatchData, isModelResolutionData, writeUnifiedSession, main };

@@ -8,6 +8,8 @@ const { MANIFEST_FILE_PATH, TEMPORARY_ID_MAP_FILE_PATH, SAFE_OUTPUT_ERRORS_FILE_
 const { redactBuiltInPatterns, redactSecrets, extractMCPGatewayTokens, MCP_GATEWAY_CONFIG_PATHS } = require("./redact_secrets.cjs");
 const { currentClaimHandle, claimArtifactPath, claimIdentity, assertClaimIdentity, assertClaimArtifactDirectory, assertClaimArtifactFile } = require("./work_queue_claim_scope.cjs");
 
+const CLAIM_DELIVERY_ERRORS_FILE_NAME = "claim-delivery-errors.json";
+
 /** @param {string} filename @returns {string} */
 function scopedArtifactFile(filename) {
   const handle = currentClaimHandle();
@@ -284,6 +286,7 @@ function extractCreatedItemFromResult(type, result) {
   const labels = Array.isArray(result.labels) ? result.labels : Array.isArray(result.labelsAdded) ? result.labelsAdded.map(name => ({ name })) : undefined;
   const metadata = {
     ...(result.metadata || {}),
+    ...(type === "dispatch_workflow" && result.run_id != null ? { run_id: result.run_id } : {}),
     ...(type === "assign_milestone" && result.milestone_number != null ? { milestone_number: result.milestone_number } : {}),
     ...(type === "push_to_pull_request_branch" && result.commit_sha ? { commit_sha: result.commit_sha } : {}),
   };
@@ -392,6 +395,7 @@ module.exports = {
   MANIFEST_FILE_PATH,
   TEMPORARY_ID_MAP_FILE_PATH,
   SAFE_OUTPUT_ERRORS_FILE_PATH,
+  CLAIM_DELIVERY_ERRORS_FILE_NAME,
   CREATE_ITEM_TYPES,
   NOT_LOGGED_TYPES,
   createManifestLogger,

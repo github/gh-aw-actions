@@ -11,6 +11,7 @@
 
 const { loadAgentOutput } = require("./load_agent_output.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { getStalePullRequestReason } = require("./pr_lifecycle.cjs");
 const { ERR_CONFIG, ERR_PARSE, ERR_VALIDATION, SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
 const { classifySafeOutputResult, computeSafeOutputsStatus, isFailedProcessingResult } = require("./safe_outputs_status.cjs");
 const { hasUnresolvedTemporaryIds, replaceTemporaryIdReferences, replaceArtifactUrlReferences, normalizeTemporaryId, extractTemporaryIdReferences, getCreatedTemporaryId } = require("./temporary_id.cjs");
@@ -26,12 +27,13 @@ const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { parseIntTemplatable } = require("./templatable.cjs");
 const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 const { getDefaultTargetRepo, parseRepoSlug } = require("./repo_helpers.cjs");
-const { createManifestLogger, ensureManifestExists, extractCreatedItemFromResult, writeTemporaryIdMapFile, writeSafeOutputErrorReport } = require("./safe_output_manifest.cjs");
+const { createManifestLogger, ensureManifestExists, extractCreatedItemFromResult, writeTemporaryIdMapFile, writeSafeOutputErrorReport, SAFE_OUTPUT_ERRORS_FILE_PATH, CLAIM_DELIVERY_ERRORS_FILE_NAME } = require("./safe_output_manifest.cjs");
 const { loadCustomSafeOutputJobTypes, loadCustomSafeOutputScriptHandlers, loadCustomSafeOutputActionHandlers, isStagedMode } = require("./safe_output_helpers.cjs");
 const { emitSafeOutputActionOutputs } = require("./safe_outputs_action_outputs.cjs");
 const { listCommentMemoryFiles, COMMENT_MEMORY_DIR } = require("./comment_memory_helpers.cjs");
 const { checkRateLimitHeadroom } = require("./rate_limit_helpers.cjs");
 const { redactSensitiveConfig } = require("./safe_outputs_config_redact.cjs");
+const { getEffectiveDetectionConclusion } = require("./threat_detection_warning.cjs");
 const nodePath = require("path");
 const fs = require("fs");
 const {
@@ -1020,7 +1022,8 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
   });
   const processingOrder = sortMessageIndicesByTemporaryIdDependencies(messages);
   const results = [];
-  const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || "";
+  const detectionConclusion = getEffectiveDetectionConclusion(process.env.GH_AW_DETECTION_CONCLUSION, process.env.GH_AW_DETECTION_REASON);
+  const detectionConclusionMissing = String(process.env.GH_AW_RUN_DETECTION || "").trim() === "true" && detectionConclusion === "";
 
   // Collect missing_tool, missing_data, noop, and report_incomplete messages first
   const missings = collectMissingMessages(messages.filter(message => !currentClaimHandle() || !message._claimScopeError));
@@ -1091,6 +1094,28 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
 
     if (!messageType) {
       core.warning(`Skipping message ${i + 1} without type`);
+      continue;
+    }
+
+    if (detectionConclusion === "failure" || detectionConclusionMissing) {
+      // Defence in depth: a failure conclusion that is not a warn-mode tooling failure
+      // (those are normalized to "warning" above), or a missing conclusion when detection
+      // was required, never reaches safe_outputs in a valid run. Never apply outputs
+      // unrestricted when it does.
+      const errorCode = detectionConclusionMissing ? "threat_detection_conclusion_missing" : "threat_detection_failure_blocked";
+      const error = detectionConclusionMissing
+        ? `Threat detection was required but reported no conclusion; "${messageType}" was not applied.`
+        : `Threat detection concluded failure (reason: ${process.env.GH_AW_DETECTION_REASON || "unknown"}); "${messageType}" was not applied.`;
+      core.warning(`🚫 ${error}`);
+      results.push({
+        type: messageType,
+        messageIndex: i,
+        success: false,
+        cancelled: true,
+        threatDetected: true,
+        errorCode,
+        error,
+      });
       continue;
     }
 
@@ -1241,6 +1266,12 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
 
       // Call the message handler with the individual message and resolved temp IDs
       await assertClaimAuthorized(effectiveMessage);
+      const stalePRReason = await getStalePullRequestReason(global.github, global.context);
+      if (stalePRReason) {
+        core.info(stalePRReason);
+        results.push(buildSkippedResult(messageType, i, { skipped: true, reason: stalePRReason }));
+        continue;
+      }
       const result = await messageHandler(effectiveMessage, resolvedTemporaryIds, temporaryIdMap);
 
       // Check if the handler explicitly returned a skipped result (e.g. policy filters,
@@ -1437,7 +1468,8 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
 
         // Call the handler again with updated temp ID map
         await assertClaimAuthorized(deferred.message);
-        const result = await deferred.handler(deferred.message, resolvedTemporaryIds, temporaryIdMap);
+        const stalePRReason = await getStalePullRequestReason(global.github, global.context);
+        const result = stalePRReason ? { skipped: true, reason: stalePRReason } : await deferred.handler(deferred.message, resolvedTemporaryIds, temporaryIdMap);
 
         if (result && result.skipped === true && !result.deferred) {
           const msg = result.reason || result.warning || result.error || "Handler returned skipped: true";
@@ -1793,6 +1825,11 @@ async function processSyntheticUpdates(github, context, trackedOutputs, temporar
           core.info(`Updating ${tracked.type} ${logInfo} (${resolvedCount} temp ID(s) resolved)`);
 
           try {
+            const stalePRReason = await getStalePullRequestReason(github, context);
+            if (stalePRReason) {
+              core.info(stalePRReason);
+              continue;
+            }
             const targetRepo = parseRepoSlug(tracked.result.repo);
             const allowedAliases = targetRepo ? await resolveAllowedMentionsFromPayload(context, github, core, mentionsConfig, undefined, targetRepo) : [];
             // Replace artifact URL references first, then issue number references
@@ -1860,10 +1897,11 @@ async function processSyntheticUpdates(github, context, trackedOutputs, temporar
  * report must never mask the original failure, so errors are swallowed.
  *
  * @param {{errorCode?: string, message?: string, failures?: Array<{type?: string, errorCode?: string, error?: string}>}} report
+ * @param {string} [filePath]
  */
-function recordSafeOutputFailure(report) {
+function recordSafeOutputFailure(report, filePath) {
   try {
-    writeSafeOutputErrorReport({ status: "failure", ...report });
+    writeSafeOutputErrorReport({ status: "failure", ...report }, filePath);
   } catch (error) {
     core.warning(`Failed to write safe output error report: ${getErrorMessage(error)}`);
   }
@@ -1932,7 +1970,7 @@ async function settleClaimDelivery(scope, messages, results, options = {}) {
   return delivery;
 }
 
-/** @param {{claimPartition?: boolean, messages?: object[], verifyOutput?: Function, finalizeResults?: Function, controlIntentPath?: string, authorize?: (request: Record<string, unknown>) => unknown, activationCommentLinks?: string[]}} [options] */
+/** @param {{claimPartition?: boolean, messages?: object[], verifyOutput?: Function, finalizeResults?: Function, controlIntentPath?: string, queueClient?: object, authorize?: (request: Record<string, unknown>) => unknown, activationCommentLinks?: string[]}} [options] */
 async function main(options = {}) {
   const activationCommentLinks = options.activationCommentLinks ?? [];
   const scope = readClaimScopeContext();
@@ -1960,13 +1998,15 @@ async function main(options = {}) {
     rejectCrossClaimTemporaryReferences(partitions, rejected);
     const settlements = [];
     const verificationPasses = new Map();
+    const queueClient = options.queueClient || github;
     for (const [handle, scopedMessages] of partitions) {
       try {
         const unscopedGithub = github;
         const effects = [];
-        const authorize = options.authorize || (request => require("./finish_work_queue_claim.cjs").authorizeWorkerClaim({ ...request, github: unscopedGithub }));
+        const authorize = options.authorize || (request => require("./finish_work_queue_claim.cjs").authorizeWorkerClaim({ ...request, github: unscopedGithub, queueClient }));
         const claimOptions = {
           ...options,
+          queueClient,
           authorize,
           effects,
           controlMessages: controls.messages.filter(message => message.claim_handle === handle),
@@ -2008,6 +2048,7 @@ async function main(options = {}) {
       finalized = await finalize({
         core,
         github,
+        queueClient,
         context,
         assignment: scope.assignment,
         verifyEffects: createClaimDeliveryVerifier({
@@ -2029,6 +2070,28 @@ async function main(options = {}) {
     const cancelled = states.filter(state => state === "cancelled").length;
     const outcome = isStagedMode() ? "staged_preview" : !settled ? "delivery_pending" : cancelled === states.length ? "cancelled" : cancelled ? "completed_with_cancellations" : "completed";
     core.setOutput("work_queue_outcome", outcome);
+    if (!isStagedMode()) {
+      for (const settlement of settlements) {
+        const result = finalized?.claims?.[settlement.claim_handle];
+        if (["result", "cancelled"].includes(result?.state)) continue;
+        await withClaimExecution({ ...scope, claim_handle: settlement.claim_handle, authorize: options.authorize }, () =>
+          recordSafeOutputFailure(
+            {
+              errorCode: "claim_delivery_unverified",
+              message: `Claim delivery state: ${result?.state || "pending"}; effects: ${result?.effects || "unknown"}`,
+              failures: [
+                {
+                  type: "claim_delivery",
+                  errorCode: result?.reason || (result?.state === "delivery_failed" ? "delivery_failed" : "verification_unresolved"),
+                  error: settlement.delivery?.reason || settlement.error || "Independent delivery verification is unavailable",
+                },
+              ],
+            },
+            nodePath.join(nodePath.dirname(SAFE_OUTPUT_ERRORS_FILE_PATH), CLAIM_DELIVERY_ERRORS_FILE_NAME)
+          )
+        );
+      }
+    }
     if (rejected.length) {
       core.setOutput("claim_scope_errors", JSON.stringify(rejected));
       core.setFailed(`${rejected.length} safe-output message(s) have invalid Claim scope`);
@@ -2037,7 +2100,7 @@ async function main(options = {}) {
       core.setFailed("One or more Claim-scoped safe-output passes failed; independently valid siblings were reconciled");
     }
     if (!isStagedMode() && !settled) {
-      core.setFailed("One or more Claim deliveries remain unverified; inspect claim_results and the queue ledger before retrying. Independently valid siblings were reconciled");
+      core.setFailed("One or more Claim deliveries remain unverified; inspect the safe-outputs-items Claim diagnostics and the queue ledger before retrying. Independently valid siblings were reconciled");
     }
     return { settlements, rejected };
   }
@@ -2141,6 +2204,12 @@ async function main(options = {}) {
         let reviewFailureError = null;
         try {
           await assertClaimAuthorized({ type: "submit_pull_request_review", claim_handle: currentClaimHandle(), repo: reviewRepo, pull_request_number: reviewPrNum });
+          const stalePRReason = await getStalePullRequestReason(github, context);
+          if (stalePRReason) {
+            core.info(stalePRReason);
+            skipReviewResultsForPR(processingResult.results, reviewRepo, reviewPrNum, stalePRReason);
+            continue;
+          }
           const reviewResult = await reviewBuffer.submitReview();
           if (reviewResult.success && !reviewResult.skipped) {
             logCreatedItemFromResult(logCreatedItem, "submit_pull_request_review", reviewResult);

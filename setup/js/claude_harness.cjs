@@ -51,7 +51,7 @@ const {
   claudeSafeOutputsOffset,
   removeClaudePlugin,
 } = require("./claude_runtime.cjs");
-const { runHarnessRetryLoop, shouldSkipForNoopSafeOutputs, shouldStopForNoopSafeOutputs } = require("./harness_retry_runner.cjs");
+const { captureExecutionEvidenceConfiguration, runHarnessRetryLoop, shouldSkipForNoopSafeOutputs, shouldStopForNoopSafeOutputs, stripExecutionEvidenceEnv } = require("./harness_retry_runner.cjs");
 const { resolveRetryConfig: resolveSharedRetryConfig } = require("./harness_retry_config.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
@@ -72,6 +72,7 @@ const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSi
 const { isCrashSignalExitCode, crashSignalNameForExitCode } = require("./harness_crash_signals.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
 const { applyModelFallback, normalizeClaudeModel, normalizeClaudeModelArgs } = require("./model_fallback.cjs");
+const { resolveEngineModel } = require("./resolve_model_alias.cjs");
 const { parseMaxAICreditsExceededFromAuditLog } = require("./ai_credits_context.cjs");
 const { resolveAWFModelRoutingSelection, mapAWFRoutingEffort, recordAWFModelRoutingOutcome, getAWFModelRoutingPolicy, getAWFModelRoutingFailureCode } = require("./awf_model_routing.cjs");
 const CLAUDE_ROUTING_POLICY = getAWFModelRoutingPolicy("claude");
@@ -406,12 +407,15 @@ function resolveClaudeModelRouting(reflectData, env = process.env) {
 
 /**
  * Build Claude child process env with provider endpoint overrides resolved from /reflect.
+ * The configured model goes through the shared "resolve configured model" step first;
+ * Claude's own handling (copilot/ prefix, `auto` rule) runs on the result.
  * @param {import("./awf_reflect.cjs").ReflectData | null | undefined} reflectData
  * @param {NodeJS.ProcessEnv} [env]
  * @param {(message: string) => void} [logger]
+ * @param {{ refetchReflectData?: () => Promise<any> }} [options]
  * @returns {Promise<NodeJS.ProcessEnv>}
  */
-async function buildClaudeChildEnv(reflectData, env = process.env, logger = log) {
+async function buildClaudeChildEnv(reflectData, env = process.env, logger = log, options = {}) {
   const childEnv = { ...env };
   applyClaudeRuntimeTimeouts(childEnv);
   if (env.GH_AW_MODEL_ROUTING === "1") {
@@ -429,7 +433,20 @@ async function buildClaudeChildEnv(reflectData, env = process.env, logger = log)
   const provider = normalizeReflectProviderName(env.GH_AW_LLM_PROVIDER, "anthropic");
   const copilotProvider = REFLECT_PROVIDER_ALIASES.github.has(provider);
   if (childEnv.ANTHROPIC_MODEL && env.GH_AW_MODEL_ROUTING !== "1") {
-    childEnv.ANTHROPIC_MODEL = normalizeClaudeModel(childEnv.ANTHROPIC_MODEL, provider, childEnv, { reflectData, logger });
+    const resolution = await resolveEngineModel({
+      engine: "claude",
+      role: "main",
+      configuredModel: childEnv.ANTHROPIC_MODEL,
+      provider,
+      reflectData,
+      refetchReflectData: options.refetchReflectData,
+      preserveAuto: true,
+      normalize: result => normalizeClaudeModel(result.resolvedModel, provider, childEnv, { reflectData, logger }),
+      logger,
+      env,
+    });
+    if (resolution.reflectData) reflectData = resolution.reflectData;
+    childEnv.ANTHROPIC_MODEL = resolution.engineModel;
   }
   const resolved = reflectData ? resolveProviderEndpointFromReflect({ provider: copilotProvider ? "github" : provider, reflectData, logger }) : null;
   if (copilotProvider && (!resolved || !REFLECT_PROVIDER_ALIASES.github.has(normalizeReflectProviderName(resolved.endpointProvider)))) {
@@ -439,7 +456,7 @@ async function buildClaudeChildEnv(reflectData, env = process.env, logger = log)
     childEnv.ANTHROPIC_BASE_URL = resolved.baseUrl;
     logger(`configured ANTHROPIC_BASE_URL from /reflect for provider=${provider}: ${resolved.baseUrl}`);
   }
-  return childEnv;
+  return stripExecutionEvidenceEnv(childEnv);
 }
 
 /**
@@ -479,6 +496,8 @@ function applyClaudeSettingsEnv(args, env = process.env) {
  * Main entry point: run claude with retry logic for transient API failures.
  */
 async function main() {
+  const executionEvidence = captureExecutionEvidenceConfiguration(process.env);
+  stripExecutionEvidenceEnv(process.env);
   const [, , command, ...args] = process.argv;
   const retryConfig = resolveRetryConfig(process.env, log);
   const { maxRetries, initialDelayMs, backoffMultiplier, maxDelayMs } = retryConfig;
@@ -516,7 +535,9 @@ async function main() {
     } else {
       initialArgs = normalizeClaudeModelArgs(initialArgs, normalizeReflectProviderName(process.env.GH_AW_LLM_PROVIDER, "anthropic"), process.env, { reflectData: reflection.reflectData, logger: log });
     }
-    childEnv = await buildClaudeChildEnv(reflection.reflectData, process.env, log);
+    childEnv = await buildClaudeChildEnv(reflection.reflectData, process.env, log, {
+      refetchReflectData: async () => (await fetchAWFReflect({ logger: log })).reflectData || null,
+    });
   } catch (error) {
     removeClaudePlugin(pluginDir);
     throw error;
@@ -533,7 +554,7 @@ async function main() {
   // A noop indicates the work is complete or there is nothing to do — starting the agent
   // would be wasteful and potentially harmful.
   const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS || "";
-  if (shouldSkipForNoopSafeOutputs({ safeOutputsPath, hasNoopInSafeOutputs, log })) {
+  if (shouldSkipForNoopSafeOutputs({ safeOutputsPath, hasNoopInSafeOutputs, log, executionEvidence })) {
     removeClaudePlugin(pluginDir);
     process.exit(0);
   }

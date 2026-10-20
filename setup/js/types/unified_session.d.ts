@@ -153,6 +153,26 @@ export interface ModelRoutingData {
   deviations?: JsonValue;
   requestedModel?: JsonValue;
   requestedEffort?: JsonValue;
+  /** AWF route choices in rank order; ranks are one-based array positions. */
+  rankedChoices?: ModelRoutingRankedChoice[];
+  eligibleChoices?: JsonValue;
+  catalogueOverlap?: JsonValue;
+  selectedEndpoint?: JsonValue;
+  requestedEndpoint?: JsonValue;
+  upstreamEndpoint?: JsonValue;
+  /** Request-telemetry dimensions AWF did not observe, such as `model` and `effort`; not unavailable models. */
+  unavailable?: string[];
+  /** Observed HTTP status, independent of `outcome`. */
+  status?: JsonValue;
+  /** AWF failure phase, such as `primary` or `bootstrap`; not the collection provenance phase. */
+  phase?: JsonValue;
+}
+
+export interface ModelRoutingRankedChoice {
+  rank: number;
+  id?: string;
+  model?: string;
+  effort?: string | null;
 }
 
 export interface ModelEndpointMismatchData {
@@ -167,6 +187,16 @@ export interface ModelEndpointMismatchData {
   fix: string;
   model?: string;
   endpoint?: string;
+}
+
+export interface ModelResolutionData {
+  engine: string;
+  role: string;
+  configured_model: string;
+  resolved_model: string | null;
+  provider: string | null;
+  status: "resolved" | "exact" | "failed";
+  cause: "model_unavailable" | "catalog_unavailable" | null;
 }
 
 export interface UnifiedModelRoutingData {
@@ -198,10 +228,23 @@ export interface ModelRoutingOutcomeData {
 export interface ModelInventoryData {
   endpoints: {
     provider: string;
-    models: string[];
+    /** AWF's endpoint configuration state; absent when the source did not supply it. */
+    configured?: boolean;
+    /** Advertised model IDs in source order; absent means unknown, not empty. */
+    models?: string[];
+    /** Routing metadata in source order; absent means unknown, not empty. */
     routingModels?: {
       modelId: string;
       supportedEndpoints?: string[];
+      /** Identifier-shaped reasoning efforts; absent means unknown; a supplied empty array stays empty. */
+      supportedReasoningEfforts?: string[];
+      /**
+       * Positive context window size in tokens; absent means unknown.
+       * @asType integer
+       * @minimum 1
+       * @maximum 9007199254740991
+       */
+      contextWindowTokens?: number;
     }[];
   }[];
   modelsFetchComplete?: boolean;
@@ -310,6 +353,7 @@ export interface GraderData {
 export interface GraderManifestData {
   version?: JsonValue;
   graders?: GraderData[];
+  customGraders?: string[];
 }
 
 export interface GraderMeasurementData extends GraderData {
@@ -377,6 +421,12 @@ export interface EpisodeLineageData {
   rootRepo?: JsonValue;
   rootWorkflowId?: JsonValue;
   rootRunId?: JsonValue;
+  parentRepo?: JsonValue;
+  parentRunId?: JsonValue;
+  parentRunAttempt?: JsonValue;
+  parentWorkflowId?: JsonValue;
+  parentWorkflowCallId?: JsonValue;
+  parentEventType?: JsonValue;
 }
 
 export interface ModelSelectionData {
@@ -399,8 +449,19 @@ export interface WorkflowInfoData {
   triggerType?: JsonValue;
   dryRun?: JsonValue;
   workflow?: JsonValue;
+  /** Executing workflow reference supplied by the compiler from job.workflow_ref. */
+  workflowId?: JsonValue;
+  /** Current workflow invocation ID from aw_info, separate from the caller's ID. */
+  workflowCallId?: JsonValue;
+  /** GITHUB_WORKFLOW_REF; identifies the top-level caller in reusable workflows. */
+  callerWorkflowRef?: JsonValue;
   repository?: JsonValue;
   runId?: JsonValue;
+  runAttempt?: JsonValue;
+  ref?: JsonValue;
+  sha?: JsonValue;
+  actor?: JsonValue;
+  targetRepo?: JsonValue;
   awContext?: Record<string, JsonValue>;
   episode?: EpisodeLineageData | null;
 }
@@ -568,6 +629,7 @@ export interface UnifiedSessionEventDataMap {
   "firewall.model_routing": ModelRoutingData;
   "model_routing.outcome": ModelRoutingOutcomeData;
   "model_endpoint.mismatch": ModelEndpointMismatchData;
+  "model.resolution": ModelResolutionData;
   "firewall.steering": FirewallSteeringData;
   "firewall.event": RuntimeObservationData;
   "safe_output.request": SafeOutputData;
