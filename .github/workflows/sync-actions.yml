@@ -243,6 +243,9 @@ jobs:
             fi
           done
 
+          # Remove setup JS test tooling and test data; only runtime scripts are needed here.
+          rm -rf "gh-aw-actions/setup/js/scripts" "gh-aw-actions/setup/js/testdata"
+
           # gh-aw-actions mirrors runtime action scripts only; JS dependency management (including
           # actions/setup/js/package-lock.json) stays in github/gh-aw, so remove this lockfile here.
           rm -f "gh-aw-actions/setup/js/package-lock.json"
