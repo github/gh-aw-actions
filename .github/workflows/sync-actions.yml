@@ -225,11 +225,11 @@ jobs:
           echo "::group::Syncing action folders from gh-aw/actions/ to repo root"
           # --archive preserves permissions/timestamps; --delete removes files absent in source (remote wins)
           # --exclude='README*' preserves any local README files in each destination folder
-          # --exclude='*.test.cjs' and --exclude='*_test.sh' prevent test files from being copied into the destination
+          # Test files and fixture/test-data directories are not copied into the destination.
           for dir in gh-aw/actions/*/; do
             name=$(basename "$dir")
             echo "Syncing: gh-aw/actions/$name/ -> gh-aw-actions/$name/"
-            rsync --archive --verbose --delete --exclude='README*' --exclude='*.test.cjs' --exclude='*_test.sh' "gh-aw/actions/$name/" "gh-aw-actions/$name/"
+            rsync --archive --verbose --delete --exclude='README*' --exclude='*.test.cjs' --exclude='*_test.sh' --exclude='**/fixtures/***' --exclude='**/test_data/***' "gh-aw/actions/$name/" "gh-aw-actions/$name/"
           done
 
           # Explicitly remove any lingering *.test.cjs and *_test.sh files from destination folders,
@@ -239,6 +239,7 @@ jobs:
             if [ -d "gh-aw-actions/$name" ]; then
               find "gh-aw-actions/$name" -type f -name '*.test.cjs' -delete 2>/dev/null || true
               find "gh-aw-actions/$name" -type f -name '*_test.sh' -delete 2>/dev/null || true
+              find "gh-aw-actions/$name" -type d \( -name fixtures -o -name test_data \) -prune -exec rm -rf {} +
             fi
           done
 
