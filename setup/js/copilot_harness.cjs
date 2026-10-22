@@ -105,7 +105,7 @@ const COPILOT_ROUTING_POLICY = getAWFModelRoutingPolicy("copilot");
 const { loadModelsJson } = require("./model_costs.cjs");
 const { applyCopilotWireAPI: configureCopilotWireAPI, warnCopilotSubagentEndpoints, recordModelEndpointMismatch, getSupportedEndpoints, MODEL_ENDPOINT_FIX } = require("./copilot_wire_api.cjs");
 const { loadModelAliasMap, resolveEngineModel, normalizeForCopilotCLI, ModelAliasResolutionError, recordModelResolution, splitModelIdentifier } = require("./resolve_model_alias.cjs");
-const { createCopilotModelObserver, recordCopilotModelSelection } = require("./copilot_model_selection.cjs");
+const { COPILOT_MODEL_VERIFICATION_EXIT_CODE, createCopilotModelObserver, readCopilotModelSubstitution, recordCopilotModelSelection } = require("./copilot_model_selection.cjs");
 const { getEngineSubAgentTarget } = require("./extract_inline_sub_agents.cjs");
 const { inlineArtifactTarget } = require("./inline_artifact_target.cjs");
 const MODEL_NOT_SUPPORTED_PATTERN = /The requested model is not supported|No model available\b[^\n]*policy enablement/i;
@@ -199,6 +199,8 @@ const FIRST_CONNECTION_REFUSED_RETRY_DELAY_MS = 1000;
 // A fresh restart is required to discard the poisoned history.
 const NULL_TYPE_TOOL_CALL_PATTERN = /tool_calls\[.*?\]\.type.*null/;
 const TOOL_CALL_ID_SCHEMA_ERROR_PATTERN = /400\s+Invalid ['"]input\[\d+\]\.id['"]:\s*['"]ctc_call_[^'"\s]+['"]\.\s*Expected an ID that begins with ['"]fc['"]/i;
+// A truncated completion stream must not be resumed with incomplete tool-call history.
+const INCOMPLETE_TOOL_CALL_STREAM_PATTERN = /Failed to finalize chat-completions stream:\s*missing choices\[\d+\]\.tool_calls\[\d+\]\.id\b/;
 /**
  * Emit a diagnostic log line to stderr.
  * All driver messages are prefixed with "[copilot-harness]" so they are easy to
@@ -320,6 +322,11 @@ function isHTTP400ResponseError(output) {
 
 function isToolCallIdSchemaError(output) {
   return TOOL_CALL_ID_SCHEMA_ERROR_PATTERN.test(output);
+}
+
+/** @param {string} output @returns {boolean} */
+function isIncompleteToolCallStreamError(output) {
+  return INCOMPLETE_TOOL_CALL_STREAM_PATTERN.test(output);
 }
 
 /**
@@ -1230,6 +1237,7 @@ function isCopilotContentFilterError(output) {
  *   isModelNotSupported?: boolean,
  *   isHTTP400ResponseError?: boolean,
  *   isToolCallIdSchemaError?: boolean,
+ *   isIncompleteToolCallStream?: boolean,
  *   isInvocationCapExceeded?: boolean,
  *   isAPIProxyGuardRejected?: boolean,
  *   isNullTypeToolCall?: boolean,
@@ -1259,6 +1267,7 @@ function classifyCopilotFailure(detection) {
   if (detection.isMCPPolicy) return "mcp_policy_blocked";
   if (detection.isModelNotSupported) return "model_not_supported";
   if (detection.isToolCallIdSchemaError) return "tool_call_id_schema_error";
+  if (detection.isIncompleteToolCallStream) return "incomplete_tool_call_stream";
   if (detection.isHTTP400ResponseError) return "http_400_response_error";
   if (detection.isNullTypeToolCall) return "null_type_tool_call";
   if (detection.isAuthErr) return "no_auth_info";
@@ -1978,6 +1987,8 @@ async function main() {
     multiProviderJson,
     subagentModelsJson,
   });
+  // The SDK driver records model-selection evidence against the requested model (`auto` when routed).
+  if (copilotSDKMode) sdkChildEnv.GH_AW_COPILOT_CONFIGURED_MODEL = selectionConfiguredModel;
   const childEnv = Object.keys(sdkChildEnv).length > 0 ? buildCopilotEngineChildEnv(process.env, sdkChildEnv) : undefined;
 
   let delay = initialDelayMs;
@@ -2088,11 +2099,13 @@ async function main() {
                 }
               : undefined,
           });
-          const modelSubstitution = modelObserver.check(true);
-          if (modelSubstitution) {
+          // The SDK driver observes its main session, records any substitution it refused and
+          // exits with COPILOT_MODEL_VERIFICATION_EXIT_CODE on any verification failure.
+          const modelSubstitution = copilotSDKMode ? readCopilotModelSubstitution() : modelObserver.check(true);
+          if (modelSubstitution || (copilotSDKMode && result.exitCode === COPILOT_MODEL_VERIFICATION_EXIT_CODE)) {
             result.exitCode = 1;
             result.runtimeGuardReason = "copilot_model_verification";
-            result.output += `\n${modelSubstitution}`;
+            if (modelSubstitution) result.output += `\n${modelSubstitution}`;
           }
           lastHasOutput = result.hasOutput;
           const attemptDetections = detectCopilotErrors(result.output);
@@ -2125,6 +2138,7 @@ async function main() {
           const isModelNotSupported = isModelNotSupportedError(result.output);
           const hasHTTP400ResponseError = isHTTP400ResponseError(result.output);
           const hasToolCallIdSchemaError = isToolCallIdSchemaError(result.output);
+          const hasIncompleteToolCallStream = isIncompleteToolCallStreamError(result.output);
           const isAuthErr = isNoAuthInfoError(result.output);
           const isAuthenticationFailed = isAuthenticationFailedError(result.output);
           const proxyAuthDiagnostic = buildCopilotProxyAuthFailureDiagnostic(result.output, process.env);
@@ -2167,6 +2181,7 @@ async function main() {
             isModelNotSupported,
             isHTTP400ResponseError: hasHTTP400ResponseError,
             isToolCallIdSchemaError: hasToolCallIdSchemaError,
+            isIncompleteToolCallStream: hasIncompleteToolCallStream,
             isInvocationCapExceeded,
             isAPIProxyGuardRejected: !!apiProxyGuardRejection,
             isNullTypeToolCall,
@@ -2191,6 +2206,7 @@ async function main() {
               ` isModelNotSupportedError=${isModelNotSupported}` +
               ` isHTTP400ResponseError=${hasHTTP400ResponseError}` +
               ` isToolCallIdSchemaError=${hasToolCallIdSchemaError}` +
+              ` isIncompleteToolCallStream=${hasIncompleteToolCallStream}` +
               ` isNullTypeToolCallError=${isNullTypeToolCall}` +
               ` isSDKSessionIdleTimeoutError=${isSDKSessionIdleTimeout}` +
               ` isMCPGatewayShutdownError=${isMCPGatewayShutdown}` +
@@ -2377,6 +2393,17 @@ async function main() {
             return { action: "stop" };
           }
 
+          if (hasIncompleteToolCallStream) {
+            if (attempt < maxRetries && result.hasOutput) {
+              useContinueOnRetry = false;
+              continueDisabledPermanently = true;
+              log(`attempt ${attempt + 1}: incomplete tool-call stream — restarting fresh (--continue disabled permanently)`);
+              return { action: "retry" };
+            }
+            log(`attempt ${attempt + 1}: incomplete tool-call stream — no retry budget remains; detection or task completion is unverified`);
+            return { action: "stop" };
+          }
+
           if (hasHTTP400ResponseError) {
             if (attempt < maxRetries && result.hasOutput && useContinueOnRetry) {
               useContinueOnRetry = false;
@@ -2525,6 +2552,7 @@ if (typeof module !== "undefined" && module.exports) {
     computeStartupRetryEligible,
     isHTTP400ResponseError,
     isToolCallIdSchemaError,
+    isIncompleteToolCallStreamError,
     isModelAvailableInReflectData,
     isModelAvailableInReflectFile,
     resolveMultiProviderFromReflect,
