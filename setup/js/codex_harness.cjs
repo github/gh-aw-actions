@@ -35,11 +35,20 @@
 const { iterateJsonl, JsonlParser } = require("./jsonl_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const fs = require("fs");
-const { DEFAULT_MCP_CALL_WATCHDOG_MS, MCP_CALL_TRANSPORT_GRACE_MS } = require("./constants.cjs");
+const path = require("node:path");
+const { DEFAULT_MCP_CALL_WATCHDOG_MS, MCP_CALL_TRANSPORT_GRACE_MS, TMP_GH_AW_PATH } = require("./constants.cjs");
 const { loadCompiledConfig, mergeConfig } = require("./codex_config.cjs");
 const { parseJsonPrefix } = require("./parse_json_prefix.cjs");
 const { runProcess, formatDuration, sleep, MIN_POST_RESULT_WATCHDOG_TIMEOUT_MS, DEFAULT_POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS, MAX_POST_RESULT_WATCHDOG_TIMEOUT_MS, resolvePostResultWatchdogIdleTimeoutMs } = require("./process_runner.cjs");
-const { captureExecutionEvidenceConfiguration, resolveHarnessRetryTelemetryPath, runHarnessRetryLoop, shouldSkipForNoopSafeOutputs, shouldStopForNoopSafeOutputs, stripExecutionEvidenceEnv } = require("./harness_retry_runner.cjs");
+const {
+  captureExecutionEvidenceConfiguration,
+  resolveHarnessRetryTelemetryPath,
+  runHarnessRetryLoop,
+  selectedHarnessStrategy,
+  shouldSkipForNoopSafeOutputs,
+  shouldStopForNoopSafeOutputs,
+  stripExecutionEvidenceEnv,
+} = require("./harness_retry_runner.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
   AWF_REFLECT_OUTPUT_PATH,
@@ -64,7 +73,7 @@ const { resolveEngineModel } = require("./resolve_model_alias.cjs");
 const { applyCodexSubagentModels, isDetectionPhase } = require("./engine_subagent_models.cjs");
 const { parseMaxAICreditsExceededFromAuditLog } = require("./ai_credits_context.cjs");
 const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
-const { resolveAWFModelRoutingSelection, mapAWFRoutingEffort, recordAWFModelRoutingOutcome, getAWFModelRoutingPolicy, getAWFModelRoutingFailureCode } = require("./awf_model_routing.cjs");
+const { resolveAWFModelRoutingSelection, mapAWFRoutingEffort, recordAWFModelRoutingOutcome, getAWFModelRoutingPolicy, getAWFModelRoutingFailureCode, resolveAWFRoutingProvider } = require("./awf_model_routing.cjs");
 const CODEX_ROUTING_POLICY = getAWFModelRoutingPolicy("codex");
 
 // Pattern to detect OpenAI rate-limit errors.
@@ -541,13 +550,21 @@ function getCodexRoutingFailureCode(error) {
 }
 
 /**
- * Resolve and apply AWF's selection to a Codex invocation.
+ * Resolve and apply AWF's selection to a Codex invocation. Codex routes on GitHub
+ * Copilot (model-provider: github) or natively on OpenAI, matching the engine's
+ * resolved GH_AW_LLM_PROVIDER.
  * @param {any} reflectData
  * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} [env]
  * @returns {{selection: any, model: string, args: string[], error: string|null}}
  */
-function resolveCodexModelRouting(reflectData, args) {
-  const result = resolveAWFModelRoutingSelection(reflectData, true, CODEX_ROUTING_POLICY.endpoints, CODEX_ROUTING_POLICY.allowEndpointOverride);
+function resolveCodexModelRouting(reflectData, args, env = process.env) {
+  const routingProvider = resolveAWFRoutingProvider("codex", env.GH_AW_LLM_PROVIDER);
+  const result = routingProvider
+    ? routingProvider === "github"
+      ? resolveAWFModelRoutingSelection(reflectData, true, CODEX_ROUTING_POLICY.endpoints, CODEX_ROUTING_POLICY.allowEndpointOverride)
+      : resolveAWFModelRoutingSelection(reflectData, true, CODEX_ROUTING_POLICY.endpoints, CODEX_ROUTING_POLICY.allowEndpointOverride, routingProvider)
+    : { selection: null, error: `AWF model routing is not supported for Codex on provider ${env.GH_AW_LLM_PROVIDER}` };
   if (result.error || !result.selection) {
     recordAWFModelRoutingOutcome({
       status: reflectData?.routing?.status === "failed" ? "failed" : "rejected",
@@ -669,6 +686,50 @@ function reflectHasMatchingProviderEndpoint(reflectData, provider) {
   return endpoints.some(ep => matchingProviders.has(normalizeReflectProviderName(ep.provider)));
 }
 
+function resolveSafeCodexConfigPath(codexConfigPath, managedRoot = TMP_GH_AW_PATH) {
+  try {
+    if (!path.isAbsolute(codexConfigPath) || path.resolve(codexConfigPath) !== codexConfigPath) return "";
+    const lexicalRoot = path.resolve(managedRoot);
+    const relativePath = path.relative(lexicalRoot, codexConfigPath);
+    const isWithinRoot = relative => relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    if (path.basename(codexConfigPath) !== "config.toml" || !isWithinRoot(relativePath)) return "";
+
+    const root = fs.realpathSync(lexicalRoot);
+    const expectedRoot = path.join(fs.realpathSync(path.dirname(lexicalRoot)), path.basename(lexicalRoot));
+    if (root !== expectedRoot) return "";
+    const resolvedPath = path.resolve(codexConfigPath);
+    let resolvedDirectory;
+    try {
+      resolvedDirectory = fs.realpathSync(path.dirname(resolvedPath));
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ error.code === "ENOENT") return resolvedPath;
+      return "";
+    }
+    const relativeDirectory = path.relative(root, resolvedDirectory);
+    if (!isWithinRoot(relativeDirectory)) return "";
+    const canonicalPath = path.join(resolvedDirectory, path.basename(resolvedPath));
+    let stat;
+    try {
+      stat = fs.lstatSync(canonicalPath);
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ error.code === "ENOENT") return canonicalPath;
+      return "";
+    }
+    return stat.isFile() && !stat.isSymbolicLink() ? canonicalPath : "";
+  } catch {
+    return "";
+  }
+}
+
+function resolveRuntimeCodexConfigPath(codexConfigPath) {
+  const managedPath = resolveSafeCodexConfigPath(codexConfigPath);
+  if (managedPath) return managedPath;
+  if (isDetectionPhase(process.env.GH_AW_PHASE) && process.env.RUNNER_TEMP) {
+    return resolveSafeCodexConfigPath(codexConfigPath, path.join(process.env.RUNNER_TEMP, "gh-aw", "threat-detection"));
+  }
+  return "";
+}
+
 /**
  * Validate that Codex openai-proxy base_url matches the configured provider endpoint from /reflect.
  * @param {{
@@ -681,10 +742,12 @@ function reflectHasMatchingProviderEndpoint(reflectData, provider) {
  */
 function validateCodexOpenAIBaseURLFromReflect(options) {
   const readFileSync = (options && options.readFileSync) || fs.readFileSync;
-  const codexConfigPath = options && options.codexConfigPath;
+  const requestedConfigPath = options && options.codexConfigPath;
+  const codexConfigPath = requestedConfigPath ? resolveRuntimeCodexConfigPath(requestedConfigPath) : "";
   const reflectPath = options && options.reflectPath;
   const provider = normalizeReflectProviderName(options?.provider || "openai", "openai");
-  if (!codexConfigPath || !reflectPath) return { ok: true };
+  if (!requestedConfigPath || !reflectPath) return { ok: true };
+  if (!codexConfigPath) return { ok: false, reason: "Codex config path is outside a managed temporary directory" };
 
   let tomlContent;
   let reflectContent;
@@ -731,10 +794,16 @@ function validateCodexOpenAIBaseURLFromReflect(options) {
  */
 function configureCodexProviderFromReflect(options) {
   const env = { ...process.env };
-  const codexConfigPath = options && options.codexConfigPath;
+  const requestedConfigPath = options && options.codexConfigPath;
+  let codexConfigPath = requestedConfigPath || "";
   const reflectPath = (options && options.reflectPath) || AWF_REFLECT_OUTPUT_PATH;
   const provider = normalizeReflectProviderName(options?.provider || process.env.GH_AW_LLM_PROVIDER, "openai");
   if (!reflectPath) return { env, configured: false };
+  if (codexConfigPath) codexConfigPath = resolveRuntimeCodexConfigPath(codexConfigPath);
+  if (requestedConfigPath && !codexConfigPath) {
+    log("warning: refusing to update Codex config outside the managed temporary directory");
+    return { env, configured: false };
+  }
   try {
     const reflectData = options?.reflectData || JSON.parse(fs.readFileSync(reflectPath, "utf8"));
     const resolved = resolveProviderEndpointFromReflect({ provider, reflectData, logger: log });
@@ -1066,7 +1135,9 @@ async function main() {
     log,
     softTimeoutGuard,
     getRetryMode: () => (resumeArgs ? `resume ${lastThreadId}` : "fresh run"),
-    runAttempt: async attempt => {
+    runAttempt: async (attempt, observeStrategy) => {
+      const strategy = selectedHarnessStrategy(resumeArgs || resolvedArgs, "codex");
+      observeStrategy(strategy);
       const terminalErrors = [];
       const mcpWatchdog = createMCPCallWatchdog(item => {
         const server = item.server ?? item.server_name ?? item.serverName;
@@ -1145,9 +1216,9 @@ async function main() {
       // `handleFailure` runs. Normalize the exit code so the failure handler always sees it.
       if (result.runtimeGuardFired && result.exitCode === 0) {
         log(`attempt ${attempt + 1}: runtime guard fired but process exited 0 — normalizing exit code to 1`);
-        return { ...result, exitCode: 1, safeOutputsByteOffset };
+        return { ...result, exitCode: 1, safeOutputsByteOffset, strategy };
       }
-      return { ...result, safeOutputsByteOffset };
+      return { ...result, safeOutputsByteOffset, strategy };
     },
     handleFailure: ({ attempt, result }) => {
       if (result.runtimeGuardFired) {
@@ -1378,6 +1449,7 @@ if (typeof module !== "undefined" && module.exports) {
     emitMissingToolPermissionIssue,
     buildCodexChildEnv,
     resolveCodexConfiguredModel,
+    resolveSafeCodexConfigPath,
     hasCodexAzureOIDCProxy,
     extractPortFromURL,
     extractOpenAIProxyBaseURLFromToml,
