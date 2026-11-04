@@ -72,7 +72,15 @@ const {
 } = require("./process_runner.cjs");
 const { buildCopilotSDKServerArgs, getCopilotSDKServerPort, startCopilotSDKServer, stopCopilotSDKServer, waitForCopilotSDKServer } = require("./copilot_sdk_sidecar.cjs");
 const { resolveRetryConfig: resolveSharedRetryConfig } = require("./harness_retry_config.cjs");
-const { captureExecutionEvidenceConfiguration, resolveHarnessRetryTelemetryPath, runHarnessRetryLoop, shouldSkipForNoopSafeOutputs, shouldStopForNoopSafeOutputs, stripExecutionEvidenceEnv } = require("./harness_retry_runner.cjs");
+const {
+  captureExecutionEvidenceConfiguration,
+  resolveHarnessRetryTelemetryPath,
+  runHarnessRetryLoop,
+  selectedHarnessStrategy,
+  shouldSkipForNoopSafeOutputs,
+  shouldStopForNoopSafeOutputs,
+  stripExecutionEvidenceEnv,
+} = require("./harness_retry_runner.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
   AWF_REFLECT_OUTPUT_PATH,
@@ -1651,8 +1659,8 @@ function removeExplicitPromptOptions(args) {
 /**
  * Resolve --prompt-file arguments for the Copilot CLI.
  * Small files are inlined as -p prompt text for compatibility with older Copilot CLIs.
- * Larger files are removed from the argument list and returned as stdin data so the full
- * prompt reaches Copilot without being constrained by the operating system's argv limit.
+ * Larger files and files containing NUL bytes are returned as stdin data so the full
+ * prompt reaches Copilot without being constrained by the operating system's argv limits.
  * @param {string[]} args
  * @returns {{args: string[], stdin?: Buffer}}
  */
@@ -1684,8 +1692,13 @@ function resolvePromptFileInput(args) {
         log(`prompt file exceeds ${PROMPT_FILE_INLINE_THRESHOLD_LABEL}; streaming prompt via stdin`);
         promptStdin = fs.readFileSync(promptFile);
       } else {
-        const promptText = fs.readFileSync(promptFile, "utf8");
-        resolvedArgs.push("-p", promptText);
+        const prompt = fs.readFileSync(promptFile);
+        if (prompt.includes(0)) {
+          log("prompt file contains NUL bytes; streaming prompt via stdin");
+          promptStdin = prompt;
+        } else {
+          resolvedArgs.push("-p", prompt.toString("utf8"));
+        }
       }
       i++; // Skip the prompt-file path argument
     } catch (error) {
@@ -2067,7 +2080,7 @@ async function main() {
         log,
         softTimeoutGuard,
         getRetryMode: () => (!copilotSDKMode && useContinueOnRetry ? "--continue" : "fresh run"),
-        runAttempt: async attempt => {
+        runAttempt: async (attempt, observeStrategy) => {
           // Verified native retries resume the exact UUID; other CLI paths retain --continue.
           let currentArgs = !copilotSDKMode && attempt > 0 && useContinueOnRetry ? [...resolvedArgs, "--continue"] : resolvedArgs;
           const verifyModel = !copilotSDKMode && (!process.env.GH_AW_PHASE || process.env.GH_AW_PHASE === "agent") && Boolean(process.env.COPILOT_MODEL);
@@ -2080,6 +2093,8 @@ async function main() {
           }
 
           // Redact --prompt / -p value from logs to avoid leaking prompt content
+          const strategy = copilotSDKMode ? "restart" : attempt > 0 && useContinueOnRetry ? "resume" : selectedHarnessStrategy(currentArgs, "copilot");
+          observeStrategy(strategy);
           const safeArgs = currentArgs.map((arg, i) => (currentArgs[i - 1] === "--prompt" || currentArgs[i - 1] === "-p" ? "<redacted>" : arg));
           const modelObserver = !verifyModel ? { check: () => "" } : createCopilotModelObserver({ configuredModel: selectionConfiguredModel, resolvedModel: process.env.COPILOT_MODEL || "", sessionId, logger: log });
           // Driver mode: run copilot_sdk_driver.cjs as a normal subprocess. The harness has
@@ -2115,7 +2130,7 @@ async function main() {
           detectedCopilotErrors.agenticEngineTimeout ||= attemptDetections.agenticEngineTimeout;
           detectedCopilotErrors.modelNotSupportedError ||= attemptDetections.modelNotSupportedError;
           detectedCopilotErrors.http400ResponseError ||= attemptDetections.http400ResponseError;
-          return result;
+          return { ...result, strategy };
         },
         handleFailure: async ({ attempt, result }) => {
           if (result.runtimeGuardReason === "copilot_model_verification") {

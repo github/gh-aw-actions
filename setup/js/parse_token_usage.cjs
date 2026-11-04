@@ -1,14 +1,14 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { iterateJsonl, iterateJsonlEvents, iterateLines } = require("./jsonl_helpers.cjs");
+const { iterateJsonl, iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_PARSE } = require("./error_codes.cjs");
 const { parseTokenUsageJsonl, generateTokenUsageSummary, formatAICForOutput } = require("./parse_mcp_gateway_log.cjs");
 const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
-const { mapAWFRoutingEffort, resolveAWFModelRoutingSelection, getAWFModelRoutingPolicy } = require("./awf_model_routing.cjs");
+const { mapAWFRoutingEffort, resolveAWFModelRoutingSelection, getAWFModelRoutingPolicy, resolveAWFRoutingProvider, routingEndpointPaths } = require("./awf_model_routing.cjs");
 const { recordModelRouting, resolveEffectiveModel, validateModelIdentifier } = require("./model_attribution.cjs");
 const { persistCopilotModelSelection } = require("./copilot_model_selection.cjs");
 const { persistModelConfigBaseline } = require("./routing_analytics.cjs");
@@ -103,9 +103,11 @@ function getModelRoutingRequestModel(record) {
   return "";
 }
 
-function hasCorroboratedModelRoutingRequests(requestRecords, wireModel, endpoint) {
+function hasCorroboratedModelRoutingRequests(requestRecords, wireModel, endpoint, routingProvider = "github") {
   const requests = requestRecords.filter(record => getModelRoutingRequestModel(record) === wireModel);
-  return requests.length > 0 && requests.every(record => record.routed === "as_selected" && record.upstream_endpoint === endpoint && Array.isArray(record.deviations) && record.deviations.every(deviation => deviation === "endpoint"));
+  // Native OpenAI forwards /responses upstream as /v1/responses; Copilot paths are compared exactly.
+  const upstream = record => (routingProvider === "github" ? record.upstream_endpoint : routingEndpointPaths([record.upstream_endpoint])[0]);
+  return requests.length > 0 && requests.every(record => record.routed === "as_selected" && upstream(record) === endpoint && Array.isArray(record.deviations) && record.deviations.every(deviation => deviation === "endpoint"));
 }
 
 function getModelRoutingSelectionFailureCode(error) {
@@ -139,10 +141,24 @@ function resolveModelRoutingOutcome(env = process.env, ghAwDir = env.GH_AW_TMP_D
       failure_code: wireModel ? "" : "invalid_selection",
     };
     const policy = getAWFModelRoutingPolicy(String(env.GH_AW_ENGINE_ID || ""));
+    // Native Claude (Anthropic) and Codex (OpenAI) selections are checked against their own provider's endpoint.
+    // Only a selection that omits its provider defaults to GitHub; an unrecognized provider, one the engine
+    // cannot route on, or one that differs from the compiled routing provider is rejected, never coerced.
+    const configuredRouting = readJSONIfExists(path.join(ghAwDir, "aw_info.json"))?.model_config?.routing;
+    const configuredProvider = configuredRouting && typeof configuredRouting === "object" ? configuredRouting.provider || "github" : "";
+    const routingProvider = routing.provider ? resolveAWFRoutingProvider(String(env.GH_AW_ENGINE_ID || ""), routing.provider) : "github";
+    const providerMismatch = !routingProvider || (configuredProvider !== "" && routingProvider !== configuredProvider);
     const selectedAdvisory = advisory?.status === "selected" && (advisory.endpoint !== undefined || advisory.selected_endpoint !== undefined);
     const advisoryEndpointOverride = selectedAdvisory && ((typeof advisory.endpoint === "string" && advisory.endpoint !== routing.endpoint) || advisory.selected_endpoint !== routing.endpoint);
     const endpointOverride = !policy.endpoints.includes(routing.endpoint) || advisoryEndpointOverride;
-    if (advisory?.status === "selected" && advisory.wire_model && advisory.wire_model !== wireModel) {
+    if (providerMismatch) {
+      routing = {
+        ...routing,
+        status: "rejected",
+        failure_code: "provider_mismatch",
+        detail: `AWF model routing selected provider ${JSON.stringify(String(routing.provider || "github"))}, which ${routingProvider ? `does not match the compiled ${JSON.stringify(configuredProvider)} routing provider` : `the ${String(env.GH_AW_ENGINE_ID || "")} engine cannot route on`}`,
+      };
+    } else if (advisory?.status === "selected" && advisory.wire_model && advisory.wire_model !== wireModel) {
       routing = { ...routing, status: "rejected", failure_code: "harness_selection_mismatch", detail: "Harness routing outcome did not match the proxy selection" };
     } else if (["failed", "rejected", "pending", "unavailable"].includes(advisory?.status)) {
       routing = { ...routing, status: advisory.status, failure_code: advisory.failure_code || routing.failure_code, detail: advisory.detail || routing.detail };
@@ -152,7 +168,8 @@ function resolveModelRoutingOutcome(env = process.env, ghAwDir = env.GH_AW_TMP_D
         { ...reflectData, routing: { status: "selected", selection: { ...routing, endpoint: requestedEndpoint, selected_endpoint: routing.endpoint } } },
         true,
         policy.endpoints,
-        policy.allowEndpointOverride
+        policy.allowEndpointOverride,
+        routingProvider
       );
       if (checked.error || !checked.selection) {
         const detail = checked.error || "AWF /reflect did not return a compatible model-routing selection";
@@ -162,7 +179,7 @@ function resolveModelRoutingOutcome(env = process.env, ghAwDir = env.GH_AW_TMP_D
         const selectedModelMatches = !selectedAdvisory || advisory.wire_model === wireModel;
         const selectedEndpointMatches = !selectedAdvisory || advisory.selected_endpoint === routing.endpoint;
         const endpointMatches = policy.endpoints.includes(effectiveEndpoint) && checked.selection.endpoint === effectiveEndpoint;
-        const requestsCorroborate = hasCorroboratedModelRoutingRequests(requestRecords, wireModel, effectiveEndpoint);
+        const requestsCorroborate = hasCorroboratedModelRoutingRequests(requestRecords, wireModel, effectiveEndpoint, routingProvider);
         if (!selectedModelMatches || !selectedEndpointMatches || !endpointMatches || !requestsCorroborate) {
           routing = {
             ...routing,
@@ -175,7 +192,7 @@ function resolveModelRoutingOutcome(env = process.env, ghAwDir = env.GH_AW_TMP_D
         }
       }
     } else if (reflectData?.endpoints) {
-      const checked = resolveAWFModelRoutingSelection({ ...reflectData, routing: { status: "selected", selection: routing } }, true, policy.endpoints, policy.allowEndpointOverride);
+      const checked = resolveAWFModelRoutingSelection({ ...reflectData, routing: { status: "selected", selection: routing } }, true, policy.endpoints, policy.allowEndpointOverride, routingProvider);
       if (checked.error || !checked.selection) {
         const detail = checked.error || "AWF /reflect did not return a compatible model-routing selection";
         routing = { ...routing, status: "rejected", failure_code: getModelRoutingSelectionFailureCode(detail), detail };
@@ -282,9 +299,9 @@ function writeEmptyUsageEvidence() {
   const usageJSONLPath = getUsageOutputPath("GH_AW_AGENT_USAGE_JSONL_PATH", getGhAwPath("agent_usage.jsonl"));
   fs.mkdirSync(path.dirname(usagePath), { recursive: true });
   fs.mkdirSync(path.dirname(usageJSONLPath), { recursive: true });
-  fs.writeFileSync(usagePath, '{"input_tokens":0,"output_tokens":0,"ai_credits":0}\n');
-  fs.writeFileSync(usageJSONLPath, '{"provider":"unknown","ai_credits":0}\n');
-  core.info("Recorded explicit zero token usage evidence");
+  fs.writeFileSync(usagePath, "{}\n");
+  fs.writeFileSync(usageJSONLPath, '{"provider":"unknown"}\n');
+  core.info("Recorded unavailable token usage evidence");
 }
 
 /**
@@ -348,9 +365,15 @@ function readDedupedTokenUsage(paths) {
       continue;
     }
 
-    for (const line of iterateLines(fileContent)) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+    for (const event of iterateJsonlEvents(fileContent)) {
+      if (event.type === "invalid" && event.reason === "blank") continue;
+      const trimmed = event.rawLine.trim();
+      // A partial record may contain a request_id already seen in a valid
+      // record. Preserve it so aggregation can mark counters unavailable.
+      if (event.type === "invalid") {
+        dedupedLines.push(trimmed);
+        continue;
+      }
       const dedupeKey = extractTokenUsageDedupeKey(trimmed) || trimmed;
       if (uniqueLineKeys.has(dedupeKey)) continue;
       uniqueLineKeys.add(dedupeKey);
@@ -618,10 +641,7 @@ async function main(copilotSessionStateDir = getGhAwPath("sandbox/agent/logs/cop
     if (process.env.GH_AW_PHASE !== "detection") primaryModel = effectiveAttribution.model || primaryModel;
 
     const agentUsage = {
-      input_tokens: summary.totalInputTokens,
-      output_tokens: summary.totalOutputTokens,
-      cache_read_tokens: summary.totalCacheReadTokens,
-      cache_write_tokens: summary.totalCacheWriteTokens,
+      ...summary.tokenUsage,
       ambient_context: Math.round(summary.ambientContextTokens || 0),
       ...(summary.aiCreditsAvailable ? { ai_credits: summary.aiCreditsSource === "awf_reported" ? Number(summary.totalAIC.toFixed(6)) : Number(summary.totalAIC.toFixed(3)) } : {}),
       ...(primaryModel ? { primary_model: primaryModel } : {}),

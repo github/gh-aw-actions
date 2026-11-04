@@ -715,9 +715,10 @@ function getFencedCodeRanges(s) {
  * @param {(s: string, before?: string, after?: string) => string} fn - Transformation to apply to non-code portions
  * @param {string} [outerBefore] - Character immediately before this text segment
  * @param {string} [outerAfter] - Character immediately after this text segment
+ * @param {(s: string) => string} [codeFn] - Transformation for code spans
  * @returns {string} The processed text
  */
-function applyFnOutsideInlineCode(text, fn, outerBefore = "", outerAfter = "") {
+function applyFnOutsideInlineCode(text, fn, outerBefore = "", outerAfter = "", codeFn = text => text) {
   if (!text) return fn(text || "", outerBefore, outerAfter);
 
   const parts = [];
@@ -766,7 +767,7 @@ function applyFnOutsideInlineCode(text, fn, outerBefore = "", outerAfter = "") {
         const before = textStart > 0 ? text[textStart - 1] : outerBefore;
         parts.push(fn(text.slice(textStart, btStart), before, text[btStart]));
       }
-      parts.push(text.slice(btStart, closeIdx + btCount));
+      parts.push(codeFn(text.slice(btStart, closeIdx + btCount)));
       textStart = closeIdx + btCount;
       i = textStart;
     }
@@ -787,13 +788,17 @@ function applyFnOutsideInlineCode(text, fn, outerBefore = "", outerAfter = "") {
  * Skips both fenced code blocks (``` / ~~~ delimited) and inline code spans (backtick
  * delimited) so that the transformation is not applied to code content.
  *
- * Falls back to applying fn to the entire string if any parsing error occurs.
+ * Falls back to applying fn to the entire string if any parsing error occurs,
+ * unless a code-region transformation was supplied, in which case errors propagate.
  *
  * @param {string} s - Markdown content to process
  * @param {(s: string, before?: string, after?: string) => string} fn - Transformation to apply outside code regions
+ * @param {(s: string) => string} [codeFn] - Optional transformation for code regions
  * @returns {string} The content with the transformation applied only outside code regions
  */
-function applyToNonCodeRegions(s, fn) {
+function applyToNonCodeRegions(s, fn, codeFn) {
+  const hasCodeFn = codeFn !== undefined;
+  codeFn = codeFn ?? (text => text);
   if (!s || typeof s !== "string") {
     return s || "";
   }
@@ -803,7 +808,7 @@ function applyToNonCodeRegions(s, fn) {
 
     if (codeRanges.length === 0) {
       // No fenced code blocks – still protect inline code spans
-      return applyFnOutsideInlineCode(s, fn);
+      return applyFnOutsideInlineCode(s, fn, "", "", codeFn);
     }
 
     const parts = [];
@@ -812,20 +817,21 @@ function applyToNonCodeRegions(s, fn) {
     for (const [start, end] of codeRanges) {
       if (pos < start) {
         // Non-code text before this code block: protect inline code spans
-        parts.push(applyFnOutsideInlineCode(s.slice(pos, start), fn, pos > 0 ? s[pos - 1] : "", s[start]));
+        parts.push(applyFnOutsideInlineCode(s.slice(pos, start), fn, pos > 0 ? s[pos - 1] : "", s[start], codeFn));
       }
       // Fenced code block: preserve verbatim
-      parts.push(s.slice(start, end));
+      parts.push(codeFn(s.slice(start, end)));
       pos = end;
     }
 
     // Non-code text after the last code block
     if (pos < s.length) {
-      parts.push(applyFnOutsideInlineCode(s.slice(pos), fn, pos > 0 ? s[pos - 1] : "", ""));
+      parts.push(applyFnOutsideInlineCode(s.slice(pos), fn, pos > 0 ? s[pos - 1] : "", "", codeFn));
     }
 
     return parts.join("");
   } catch (_e) {
+    if (hasCodeFn) throw _e;
     // Fallback: apply fn to the entire string (conservative – redacts more, never less)
     return fn(s, "", "");
   }
@@ -1328,12 +1334,13 @@ function neutralizeGitHubReferences(s, allowedRepos) {
  * Apply truncation limits to content
  * @param {string} content - The content to truncate
  * @param {number} [maxLength] - Maximum length of content (default: 524288)
+ * @param {number} [maxLines] - Maximum number of lines (default: 65000)
  * @returns {string} The truncated content
  */
-function applyTruncation(content, maxLength) {
+function applyTruncation(content, maxLength, maxLines) {
   maxLength = maxLength || 524288;
   const lines = content.split("\n");
-  const maxLines = 65000;
+  maxLines = maxLines || 65000;
 
   // If content has too many lines, truncate by lines (primary limit)
   if (lines.length > maxLines) {
@@ -1641,9 +1648,10 @@ function canonicalizePublicationText(text, { preserveImageAttributes = false } =
  * @param {string} content - The content to sanitize
  * @param {number} [maxLength] - Maximum length of content (default: 524288)
  * @param {number} [maxBotMentions] - Max bot trigger references before filtering (default: MAX_BOT_TRIGGER_REFERENCES)
+ * @param {number} [maxLines] - Maximum number of lines (default: 65000)
  * @returns {string} The sanitized content
  */
-function sanitizeContentCore(content, maxLength, maxBotMentions) {
+function sanitizeContentCore(content, maxLength, maxBotMentions, maxLines) {
   if (!content || typeof content !== "string") {
     return "";
   }
@@ -1651,7 +1659,7 @@ function sanitizeContentCore(content, maxLength, maxBotMentions) {
   // Apply truncation early to avoid running expensive operations on oversized inputs.
   // This is a pre-pass truncation on raw content; a second truncation pass is applied
   // later after normalization (which may reduce length via stripping invisible chars).
-  content = applyTruncation(content, maxLength);
+  content = applyTruncation(content, maxLength, maxLines);
 
   // Build list of allowed domains from environment and GitHub context
   const allowedDomains = buildAllowedDomains();
@@ -1695,7 +1703,7 @@ function sanitizeContentCore(content, maxLength, maxBotMentions) {
   sanitized = applyURLSanitizationPolicy(sanitized, allowedDomains);
 
   // Apply truncation limits
-  sanitized = applyTruncation(sanitized, maxLength);
+  sanitized = applyTruncation(sanitized, maxLength, maxLines);
 
   // Neutralize ALL @mentions after truncation so a length boundary cannot split
   // an inserted code-span delimiter and reactivate the mention.

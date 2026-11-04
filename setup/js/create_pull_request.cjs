@@ -46,9 +46,11 @@ const { extractPatchBaseCommit } = require("./commit_sha_helpers.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { createOrUpdatePullRequest } = require("./create_or_update_pull_request.cjs");
 const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
+const { createTokenBrokerGitHubClient, isTokenBrokerEnabled } = require("./token_broker_github.cjs");
 const { ensureFullHistoryForBundle, importLocalBundle, offlineGitOptions, getBundlePrerequisites, linearizeRangeAsCommit } = require("./git_helpers.cjs");
 const { parseDiffGitHeader: parseDiffGitHeaderPaths, extractDiffGitHeaderEntries } = require("./patch_path_helpers.cjs");
 const { resolveTransportPaths } = require("./resolve_transport_paths.cjs");
+const { recoverObjectPack, isObjectPack, recoveryToken } = require("./object_pack_transport.cjs");
 const { withTransportIntegrity } = require("./transport_integrity.cjs");
 const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
 const {
@@ -88,6 +90,7 @@ const MAX_GITHUB_BODY_LENGTH = 65536;
  * assignment API requires a PAT rather than a GitHub App token.
  *
  * Token priority:
+ *   0. Token broker copilot-task capability, when opted in (never falls back)
  *   1. config["github-token"] — explicit per-handler override
  *   2. GH_AW_ASSIGN_TO_AGENT_TOKEN — injected by the compiler when copilot is in assignees
  *   3. global github — step-level token (fallback when no agent token is available)
@@ -96,6 +99,7 @@ const MAX_GITHUB_BODY_LENGTH = 65536;
  * @returns {Promise<Object>} Authenticated GitHub client
  */
 async function createCopilotAssignmentClient(config) {
+  if (isTokenBrokerEnabled()) return createTokenBrokerGitHubClient();
   const token = config["github-token"] || process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN;
   if (!token) {
     core.debug("No dedicated agent token configured — using step-level github client for copilot assignment");
@@ -759,11 +763,13 @@ async function main(config = {}) {
     try {
       const agentId = await findAgent(owner, repo, "copilot", issueNumber, copilotClient);
       if (!agentId) {
+        if (isTokenBrokerEnabled()) throw new Error(`Broker-authenticated copilot assignment failed for fallback issue #${issueNumber}: agent unavailable`);
         core.warning(`copilot coding agent is not available for ${owner}/${repo}`);
         return;
       }
       const issueDetails = await getIssueDetails(owner, repo, issueNumber, copilotClient);
       if (!issueDetails) {
+        if (isTokenBrokerEnabled()) throw new Error(`Broker-authenticated copilot assignment failed for fallback issue #${issueNumber}: issue details unavailable`);
         core.warning(`Failed to get issue details for copilot assignment of fallback issue #${issueNumber}`);
         return;
       }
@@ -787,10 +793,12 @@ async function main(config = {}) {
       if (assigned) {
         core.info(`Successfully assigned copilot coding agent to fallback issue #${issueNumber}`);
       } else {
+        if (isTokenBrokerEnabled()) throw new Error(`Broker-authenticated copilot assignment failed for fallback issue #${issueNumber}`);
         core.warning(`Failed to assign copilot to fallback issue #${issueNumber}`);
       }
     } catch (error) {
       core.warning(`Failed to assign copilot to fallback issue #${issueNumber}: ${getErrorMessage(error)}`);
+      if (isTokenBrokerEnabled()) throw error;
     }
   }
 
@@ -952,6 +960,8 @@ async function main(config = {}) {
 
     // Determine the bundle file path from the message (set when patch-format: bundle is configured)
     const bundleFilePath = transportPaths.bundlePath;
+    let recoveryPatchOnly = false;
+    const objectPackRecovery = {};
     if (bundleFilePath) {
       core.info(`Bundle file path: ${bundleFilePath}`);
     }
@@ -1159,11 +1169,27 @@ async function main(config = {}) {
         }
       }
 
+      if (bundleFilePath && isObjectPack(transport.read(bundleFilePath))) {
+        const recovered = await recoverObjectPack(transport, transportPaths, {
+          repo: itemRepo,
+          baseBranch,
+          branch: pullRequestItem.branch?.trim(),
+          mode: "full",
+          config,
+          message: pullRequestItem,
+          checkoutSha: itemRepo.toLowerCase() === `${context.repo?.owner}/${context.repo?.repo}`.toLowerCase() ? process.env.GITHUB_SHA : undefined,
+          token: await recoveryToken(githubClient, config["github-token"]),
+          staged: isStaged,
+          manualRecovery: objectPackRecovery,
+        });
+        recoveryPatchOnly = recovered && config.patch_format === "am";
+      }
+
       // Check if patch file exists and has valid content.
       // Always require patch content for policy enforcement, even when bundle transport
       // is used for apply-time commit transport.
       transport.assertUnchanged();
-      const hasBundleFile = !!(bundleFilePath && fs.existsSync(bundleFilePath));
+      const hasBundleFile = !!(!recoveryPatchOnly && bundleFilePath && fs.existsSync(bundleFilePath));
       const applyTransport = hasBundleFile ? "bundle" : "patch";
       core.info(`Apply transport mode: ${applyTransport} (bundle file present: ${hasBundleFile})`);
       if (bundleFilePath && !hasBundleFile) {
@@ -1641,9 +1667,12 @@ async function main(config = {}) {
             ...(dependsOnPullRequests.length ? { depends_on: dependsOnPullRequests } : {}),
           },
         });
-      /** @param {import("./report_ast.cjs").ReportBlock[]} children */
-      const fallbackFrame = children =>
-        buildIssueBodyReport(title, children, { repo: repoParts, footer: includeFooter, bodyFooter: config.body_footer, expiresHours, closeOlderKey, allowedMentions: allowedMentionAliases, runUrl, itemType: "pull_request" });
+      /**
+       * @param {import("./report_ast.cjs").ReportBlock[]} children
+       * @param {Partial<import("./issue_body.cjs").IssueBodyOptions>} [options]
+       */
+      const fallbackFrame = (children, options = {}) =>
+        buildIssueBodyReport(title, children, { repo: repoParts, footer: includeFooter, bodyFooter: config.body_footer, expiresHours, closeOlderKey, allowedMentions: allowedMentionAliases, runUrl, itemType: "pull_request", ...options });
 
       // Generate footer using messages template system (respects custom messages.footer config)
       // When footer is disabled, only add XML markers (no visible footer content)
@@ -1916,6 +1945,7 @@ async function main(config = {}) {
 
                 const artifactFileName = bundleFilePath ? bundleFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.bundle";
                 const recoveryInstructions = buildManualBranchRecoveryCommands({
+                  objectPackRecovery,
                   hasBundleFile: true,
                   runId,
                   artifactFileName,
@@ -2282,6 +2312,7 @@ async function main(config = {}) {
 
                 const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
                 const recoveryInstructions = buildManualBranchRecoveryCommands({
+                  objectPackRecovery,
                   hasBundleFile: false,
                   runId,
                   artifactFileName: patchFileName,
@@ -2465,6 +2496,7 @@ async function main(config = {}) {
           const runId = context.runId;
           const artifactFileName = hasBundleFile ? bundleFilePath.replace("/tmp/gh-aw/", "") : patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
           const applyInstructions = buildManualBranchRecoveryCommands({
+            objectPackRecovery,
             hasBundleFile,
             runId,
             artifactFileName,
@@ -2496,7 +2528,18 @@ async function main(config = {}) {
 
         try {
           transport.assertUnchanged();
-          const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackFrame(fallbackBody), mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees, transport.assertUnchanged);
+          const expiresAt = new Date(Date.now() + (expiresHours > 0 ? expiresHours : 7 * 24) * 60 * 60 * 1000).toISOString();
+          /** @param {import("./report_ast.cjs").ReportBlock[]} children */
+          const protectedFallbackFrame = children => fallbackFrame([...children, { type: "quote", agentTainted: false, children: [{ type: "expiration", expiresAt, agentTainted: false }] }], { expiresHours: 0, itemType: "issue" });
+          const { data: issue, issueRepoParts } = await createFallbackIssue(
+            githubClient,
+            repoParts,
+            title,
+            protectedFallbackFrame(fallbackBody),
+            mergeFallbackIssueLabels([...effectiveFallbackLabels, "pull-request-fallback"]),
+            configAssignees,
+            transport.assertUnchanged
+          );
 
           core.info(`Created protected-file-protection review issue #${issue.number}: ${issue.html_url}`);
 
@@ -2516,7 +2559,7 @@ async function main(config = {}) {
                     owner: issueRepoParts.owner,
                     repo: issueRepoParts.repo,
                     issue_number: issue.number,
-                    body: renderSizedReport(fallbackFrame(fallbackBodyWithCloseKeyword)).body,
+                    body: renderSizedReport(protectedFallbackFrame(fallbackBodyWithCloseKeyword)).body,
                   }),
                 RATE_LIMIT_RETRY_CONFIG,
                 `update protected-file-protection fallback issue #${issue.number} with auto-close link`
