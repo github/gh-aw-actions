@@ -12,7 +12,8 @@ const { getMcpRateLimitHint, getRpcRateLimitHint } = require("./mcp_rate_limit.c
 const { redactWebhookPayloads } = require("./webhook_context.cjs");
 const { isErrorIdentifier, normalizeEngineHarness } = require("./routing_analytics.cjs");
 const { projectSafeOutputData } = require("./safe_output_outcomes.cjs");
-const { normalizeHarnessRetryRecord, normalizeHarnessAttemptEvent } = require("./harness_retry_record.cjs");
+const { normalizeHarnessRetryRecord, normalizeHarnessAttemptEvent, normalizeHarnessDecisionData } = require("./harness_retry_record.cjs");
+const { sessionMessageTimestamp } = require("./unified_session_order.cjs");
 
 /** AWF failed-request origins: provider response versus AWF-originated rejection. */
 const ERROR_SOURCES = new Set(["upstream", "awf"]);
@@ -55,6 +56,8 @@ const AIC_RESOLVABLE_PHASES = new Set(["detection", "evals"]);
 const TOOL_FIELDS = {
   toolCallId: ["toolCallId", "tool_call_id", "tool_use_id"],
   toolName: ["toolName", "tool_name"],
+  messageId: ["messageId", "message_id"],
+  model: ["model"],
   mcpServerName: ["mcpServerName"],
   parentToolCallId: ["parentToolCallId"],
   stepIndex: ["stepIndex", "step_index"],
@@ -193,6 +196,8 @@ const TASK_FIELDS = {
 
 /** @type {Record<string, Fields>} */
 const EVENT_FIELDS = {
+  "durable.restore": { engine: ["engine"], storage: ["storage"], runId: ["runId"], runAttempt: ["runAttempt"], status: ["status"], parentRunId: ["parentRunId"], artifactId: ["artifactId"] },
+  "durable.session": { engine: ["engine"], storage: ["storage"], runId: ["runId"], runAttempt: ["runAttempt"], status: ["status"], parentRunId: ["parentRunId"], sessionId: ["sessionId"] },
   "model.inventory": {},
   "plugin.installation": {
     plugin: ["plugin"],
@@ -208,6 +213,7 @@ const EVENT_FIELDS = {
   "agent.execution": { categories: ["categories"], errorCodes: ["errorCodes"], errorTypes: ["errorTypes"], exitCode: ["exitCode", "exit_code"] },
   "harness.retry": {},
   "harness.attempt": {},
+  "harness.decision": {},
   "engine.retry": { sourceEngine: ["sourceEngine"], sourceType: ["sourceType"], errors: ["errors"] },
   "skill.invoked": { name: ["name"], path: ["path"], source: ["source"], trigger: ["trigger"], model: ["model"], invokedAtTurn: ["invokedAtTurn"] },
   "skill.context_delivered_ref": { interactionId: ["interactionId"], source: ["source"], contentId: ["contentId"] },
@@ -252,6 +258,8 @@ const EVENT_FIELDS = {
     ...TOOL_FIELDS,
     success: ["success"],
     output: ["output"],
+    outputTruncated: ["outputTruncated"],
+    structuredContent: ["structuredContent"],
     result: ["result"],
     error: ["error"],
     fileEdits: ["fileEdits"],
@@ -669,6 +677,11 @@ function normalizeUnifiedSessionEvent(event, phase) {
   }
   const known = Object.hasOwn(EVENT_FIELDS, event.type);
   const data = event.type === "mcp.configuration" ? normalizeMcpConfigurationData(source) : known ? selectFields(source, EVENT_FIELDS[event.type]) : structuredClone(source);
+  if (event.type === "harness.decision") {
+    const decision = normalizeHarnessDecisionData(source);
+    if (!decision) throw new Error(`${ERR_VALIDATION}: Harness decision evidence must contain bounded outcomes and latency metadata`);
+    Object.assign(data, decision);
+  }
   if (event.type === "harness.retry" || event.type === "harness.attempt") {
     const retry = event.type === "harness.retry" ? normalizeHarnessRetryRecord(source) : normalizeHarnessAttemptEvent(source);
     if (!retry) throw new Error(`${ERR_VALIDATION}: Harness retry evidence must contain valid bounded attempt metadata`);
@@ -854,9 +867,8 @@ function normalizeUnifiedSessionEvent(event, phase) {
     if (Array.isArray(errors)) data.errors = errors.filter(error => error && typeof error === "object" && !Array.isArray(error)).map(projectSafeOutputData);
   }
   const metadata = selectFields(event, { id: ["id"], parentId: ["parentId"], timestamp: ["timestamp", "ts", "time", "created_at"], agentId: ["agentId"], ephemeral: ["ephemeral"] });
-  /** @type {any} */
-  const nativeMessage = event.message;
-  if (!Object.hasOwn(metadata, "timestamp") && nativeMessage?.timestamp !== undefined) metadata.timestamp = structuredClone(nativeMessage.timestamp);
+  const nativeTimestamp = sessionMessageTimestamp(event);
+  if (!Object.hasOwn(metadata, "timestamp") && nativeTimestamp !== undefined) metadata.timestamp = nativeTimestamp;
   return {
     type: event.type,
     ...metadata,

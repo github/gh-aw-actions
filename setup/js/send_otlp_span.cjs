@@ -17,8 +17,10 @@ const { normalizeCodexSession } = require("./codex_session.cjs");
 const { projectSessionResult, observedSessionModel } = require("./agent_session.cjs");
 const { resolveEffectiveModel, resolveModelRoutingSummary } = require("./model_attribution.cjs");
 const { normalizeHarnessRetryRecord } = require("./harness_retry_record.cjs");
+const { isDurableSessionRecord } = require("./durable_session_record.cjs");
 const { readEvalsNotEvaluatedStatus } = require("./evals_status.cjs");
 const { MAX_OTLP_RESPONSE_BYTES, readOTLPResponse, inspectOTLPResponse, unavailableOTLPResponse } = require("./otlp_response.cjs");
+const { OTEL_ATTR_WORKFLOW_NAME, OTEL_ATTR_REPOSITORY, OTEL_ATTR_RUN_ID, OTEL_ATTR_GITHUB_RUN_ID, OTEL_ATTR_ENGINE_ID, canonicalAttributeName } = require("./otel_attributes_generated.cjs");
 
 function getGhAwPath(relativePath) {
   const root = (process.env.GH_AW_TMP_DIR || "").trim() || "/tmp/gh-aw";
@@ -108,6 +110,7 @@ function toNanoString(ms) {
  * @returns {{ key: string, value: object }}
  */
 function buildAttr(key, value) {
+  key = canonicalAttributeName(key);
   if (typeof value === "boolean") {
     return { key, value: { boolValue: value } };
   }
@@ -136,7 +139,7 @@ function buildAttr(key, value) {
  * @returns {{ key: string, value: { doubleValue: number } }}
  */
 function buildDoubleAttr(key, value) {
-  return { key, value: { doubleValue: typeof value === "number" && Number.isFinite(value) ? value : 0 } };
+  return { key: canonicalAttributeName(key), value: { doubleValue: typeof value === "number" && Number.isFinite(value) ? value : 0 } };
 }
 
 /**
@@ -149,7 +152,7 @@ function buildDoubleAttr(key, value) {
  * @returns {{ key: string, value: { arrayValue: { values: Array<{ stringValue: string }> } } }}
  */
 function buildArrayAttr(key, values) {
-  return { key, value: { arrayValue: { values: values.map(v => ({ stringValue: String(v) })) } } };
+  return { key: canonicalAttributeName(key), value: { arrayValue: { values: values.map(v => ({ stringValue: String(v) })) } } };
 }
 
 /**
@@ -440,7 +443,7 @@ function buildGitHubActionsResourceAttributes({
   };
 
   upsertResourceAttr(buildAttr("github.repository", repository));
-  upsertResourceAttr(buildAttr("github.run_id", runId));
+  upsertResourceAttr(buildAttr(OTEL_ATTR_GITHUB_RUN_ID, runId));
   upsertResourceAttr(buildAttr("github.run_attempt", runAttempt));
   const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
   if (runUrlAttr) {
@@ -1572,11 +1575,11 @@ async function sendJobSetupSpan(options = {}) {
 
   const attributes = [
     buildAttr("gh-aw.job.name", jobName),
-    buildAttr("gh-aw.workflow.name", workflowName),
-    buildAttr("gh-aw.run.id", runId),
+    buildAttr(OTEL_ATTR_WORKFLOW_NAME, workflowName),
+    buildAttr(OTEL_ATTR_RUN_ID, runId),
     buildAttr("gh-aw.run.attempt", runAttempt),
     buildAttr("gh-aw.run.actor", actor),
-    buildAttr("gh-aw.repository", repository),
+    buildAttr(OTEL_ATTR_REPOSITORY, repository),
   ];
   const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
   if (runUrlAttr) {
@@ -1589,7 +1592,7 @@ async function sendJobSetupSpan(options = {}) {
   if (engineId) {
     const genAiSystem = ENGINE_TO_SYSTEM_MAP[engineId] || engineId;
     attributes.push(buildAttr("gen_ai.system", genAiSystem));
-    attributes.push(buildAttr("gh-aw.engine.id", engineId));
+    attributes.push(buildAttr(OTEL_ATTR_ENGINE_ID, engineId));
   }
   if (eventName) {
     attributes.push(buildAttr("gh-aw.event_name", eventName));
@@ -1700,6 +1703,26 @@ function readJSONLIfExists(filePath) {
     return Array.from(readJsonlFile(filePath));
   } catch {
     return [];
+  }
+}
+
+function readDurableParentRunId(runId, runAttempt) {
+  const file = getGhAwPath("agent/durable-session.jsonl");
+  try {
+    const info = fs.lstatSync(file);
+    if (!info.isFile() || info.size > 1024 * 1024 || fs.lstatSync(path.dirname(file)).isSymbolicLink()) throw new Error("Invalid durable session source");
+    let parentRunId;
+    for (const record of iterateJsonl(fs.readFileSync(file, "utf8"), { strict: true })) {
+      if (!isDurableSessionRecord(record)) throw new Error("Invalid durable session metadata");
+      if (record.data.runId !== String(runId) || record.data.runAttempt !== String(runAttempt) || record.type !== "durable.restore" || record.data.status !== "restored") continue;
+      if (parentRunId && parentRunId !== record.data.parentRunId) throw new Error("Conflicting durable session parents");
+      parentRunId = record.data.parentRunId;
+    }
+    return parentRunId;
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    if (code !== "ENOENT") console.warn("[otlp] Durable session parent unavailable: invalid or unreadable metadata");
+    return undefined;
   }
 }
 
@@ -2375,7 +2398,11 @@ async function sendJobConclusionSpan(spanName, options = {}) {
     statusMessage = `agent ${agentConclusion}: ${errorMessages[0]}`.slice(0, 256);
   }
 
-  const attributes = [buildAttr("gh-aw.workflow.name", workflowName), buildAttr("gh-aw.run.id", runId), buildAttr("gh-aw.run.attempt", runAttempt), buildAttr("gh-aw.run.actor", actor), buildAttr("gh-aw.repository", repository)];
+  const attributes = [buildAttr(OTEL_ATTR_WORKFLOW_NAME, workflowName), buildAttr(OTEL_ATTR_RUN_ID, runId), buildAttr("gh-aw.run.attempt", runAttempt), buildAttr("gh-aw.run.actor", actor), buildAttr(OTEL_ATTR_REPOSITORY, repository)];
+  if (jobName === "agent") {
+    const durableParentRunId = readDurableParentRunId(runId, runAttempt);
+    if (durableParentRunId) attributes.push(buildAttr("gh-aw.durable.parent_run_id", durableParentRunId));
+  }
   const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
   if (runUrlAttr) {
     attributes.push(runUrlAttr);
@@ -2446,7 +2473,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   if (engineId) {
     const genAiSystem = ENGINE_TO_SYSTEM_MAP[engineId] || engineId;
     attributes.push(buildAttr("gen_ai.system", genAiSystem));
-    attributes.push(buildAttr("gh-aw.engine.id", engineId));
+    attributes.push(buildAttr(OTEL_ATTR_ENGINE_ID, engineId));
   }
   if (model) attributes.push(buildAttr("gen_ai.request.model", model));
   if (modelAttribution.routing) {

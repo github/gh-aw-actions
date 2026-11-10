@@ -17,6 +17,8 @@ const { getApiProxyEventName } = require("./steering_helpers.cjs");
 const { estimateBaseline, projectModelConfig } = require("./routing_analytics.cjs");
 const { normalizeHarnessRetryRecord } = require("./harness_retry_record.cjs");
 const { parseHarnessAttempts, correlateHarnessAttempts } = require("./harness_retry_session.cjs");
+const { isDurableSessionRecord } = require("./durable_session_record.cjs");
+const { buildWorkflowCallId } = require("./aw_context.cjs");
 
 const SESSION_FILE_FORMAT_VERSION = 1;
 
@@ -162,7 +164,7 @@ function parseEngineSession(content, engine) {
 /**
  * Collect only known runtime directories; never follow artifact symlinks.
  * Replicated firewall files use logs > audit > legacy precedence, including empty files.
- * @param {{rootDir?: string, engine?: string, protectedSessionCapture?: boolean, warn?: (message: string) => void, dailyAIC?: NodeJS.ProcessEnv, admission?: NodeJS.ProcessEnv, jobResults?: string, safeJobNames?: string, safeJobResults?: string, jobDurations?: Record<string, number>}} [options]
+ * @param {{rootDir?: string, engine?: string, protectedSessionCapture?: boolean, warn?: (message: string) => void, dailyAIC?: NodeJS.ProcessEnv, executionIdentity?: {runId?: string, runAttempt: number}, admission?: NodeJS.ProcessEnv, jobResults?: string, safeJobNames?: string, safeJobResults?: string, jobDurations?: Record<string, number>}} [options]
  * @returns {{events: import("./types/unified_session").UnifiedSession, maskedValues: string[]}}
  */
 function collectUnifiedSession({
@@ -171,14 +173,16 @@ function collectUnifiedSession({
   protectedSessionCapture = false,
   warn = message => console.warn(message),
   dailyAIC = process.env,
+  executionIdentity,
   admission = process.env,
   jobResults = process.env.GH_AW_JOB_RESULTS,
   safeJobNames = process.env.GH_AW_SAFE_JOB_NAMES,
   safeJobResults = process.env.GH_AW_SAFE_JOB_RESULTS,
   jobDurations = {},
 } = {}) {
-  let currentRunId = dailyAIC.GITHUB_RUN_ID;
-  let currentRunAttempt = dailyAIC.GITHUB_RUN_ATTEMPT;
+  const liveIdentity = executionIdentity?.runId && Number.isSafeInteger(executionIdentity.runAttempt) && executionIdentity.runAttempt > 0 ? executionIdentity : undefined;
+  let currentRunId = liveIdentity?.runId ?? dailyAIC.GITHUB_RUN_ID;
+  let currentRunAttempt = liveIdentity ? String(liveIdentity.runAttempt) : dailyAIC.GITHUB_RUN_ATTEMPT;
   /** @type {SessionSource[]} */
   const sources = [];
   const masks = new Set();
@@ -348,13 +352,44 @@ function collectUnifiedSession({
   if (metadata) {
     const phase = metadata === path.join(rootDir, "runtime/aw_info.json") ? "agent" : metadata === path.join(rootDir, "usage/aw_info.json") ? "conclusion" : "activation";
     add(metadata, "workflow", phase, "workflow.info");
-    const info = sources.at(-1)?.events[0]?.data;
+    const event = sources.at(-1)?.events[0];
+    const info = event?.data;
     const observedEngine = info?.engine_id;
     if (engine === undefined && typeof observedEngine === "string") engine = observedEngine;
-    if (info?.run_id !== undefined && info.run_id !== null && String(info.run_id) !== "") {
+    if (liveIdentity && event) {
+      // Successful activation artifacts can be reused by a later run attempt.
+      // Reconcile only at the explicit live boundary, without editing the snapshot.
+      const workflowId = info?.workflowId ?? info?.workflow_id;
+      const workflowCallId = buildWorkflowCallId(liveIdentity.runId, liveIdentity.runAttempt, typeof workflowId === "string" ? workflowId : undefined);
+      event.data = {
+        ...info,
+        run_id: liveIdentity.runId,
+        run_attempt: liveIdentity.runAttempt,
+        runId: liveIdentity.runId,
+        runAttempt: liveIdentity.runAttempt,
+        workflow_call_id: workflowCallId,
+        workflowCallId,
+      };
+    } else if (info?.run_id !== undefined && info.run_id !== null && String(info.run_id) !== "") {
       currentRunId = String(info.run_id);
       currentRunAttempt = info.run_attempt !== undefined && info.run_attempt !== null ? String(info.run_attempt) : undefined;
     }
+  }
+  const durableFile = choose(["agent/durable-session.jsonl", "usage/agent/durable-session.jsonl"]);
+  if (durableFile) {
+    const events = [];
+    for (const record of records(durableFile)) {
+      const timestampMs = typeof record?.timestamp === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(record.timestamp) ? sessionTimestamp({ timestamp: record.timestamp }) : undefined;
+      if (!isDurableSessionRecord(record) || (record.timestamp !== undefined && timestampMs === undefined)) {
+        report(durableFile, "invalid_durable_session", undefined);
+        continue;
+      }
+      if (currentRunId && record.data.runId !== String(currentRunId)) continue;
+      if (currentRunAttempt && record.data.runAttempt !== String(currentRunAttempt)) continue;
+      const { data } = normalizeUnifiedSessionEvent({ type: record.type, data: record.data }, "agent");
+      events.push({ type: record.type, data, ...(timestampMs !== undefined ? { timestamp: new Date(timestampMs).toISOString() } : {}) });
+    }
+    sources.push({ component: "durable", phase: "agent", path: path.relative(rootDir, durableFile), events });
   }
   const selectedPrSha = dailyAIC.GH_AW_PR_HEAD_BASE_SHA;
   const selectedPrNumberText = dailyAIC.GH_AW_PR_HEAD_BASE_PR_NUMBER;
@@ -540,6 +575,9 @@ function collectUnifiedSession({
       if (data) {
         /** @type {SessionEvent[]} */
         const retryEvents = [{ type: "harness.retry", data }];
+        for (const decision of data.decisionResults ?? []) {
+          retryEvents.push({ type: "harness.decision", data: { ...decision }, timestamp: decision.timestamp });
+        }
         /** @type {Array<["startup" | "harness", import("./types/unified_session").HarnessRetryAttemptData[]]>} */
         const layers = [
           ["startup", data.startupAttemptResults ?? []],
@@ -896,7 +934,7 @@ function collectUnifiedSession({
 }
 
 /**
- * @param {{rootDir?: string, engine?: string, outputPath?: string, warn?: (message: string) => void, admission?: NodeJS.ProcessEnv, jobDurations?: Record<string, number>, graders?: any[], customGraderIds?: string[]}} [options]
+ * @param {{rootDir?: string, engine?: string, outputPath?: string, warn?: (message: string) => void, executionIdentity?: {runId?: string, runAttempt: number}, admission?: NodeJS.ProcessEnv, jobDurations?: Record<string, number>, graders?: any[], customGraderIds?: string[]}} [options]
  * @returns {import("./types/unified_session").UnifiedSession}
  */
 function writeUnifiedSession(options = {}) {
@@ -924,12 +962,13 @@ function writeUnifiedSession(options = {}) {
   }
 }
 
-/** @param {{rootDir?: string, engine?: string, outputPath?: string, jobDurations?: Record<string, number>, graders?: any[], customGraderIds?: string[]}} [options] @returns {Promise<void>} */
+/** @param {{rootDir?: string, engine?: string, outputPath?: string, executionIdentity?: {runId?: string, runAttempt: number}, jobDurations?: Record<string, number>, graders?: any[], customGraderIds?: string[]}} [options] @returns {Promise<void>} */
 async function main(options = {}) {
   const jobDurations = options.jobDurations ?? (await require("./workflow_job_durations.cjs").collectJobDurations({ warn: message => global.core.warning(message) }));
   const { readGraderManifestEnvironment, publishGraderSummary } = require("./grader_artifacts.cjs");
   const manifest = options.graders === undefined ? readGraderManifestEnvironment() : { graders: options.graders };
-  const events = writeUnifiedSession({ ...options, jobDurations, graders: manifest.graders, customGraderIds: options.customGraderIds ?? manifest.customGraders });
+  const executionIdentity = options.executionIdentity ?? { runId: process.env.GITHUB_RUN_ID, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT) };
+  const events = writeUnifiedSession({ ...options, executionIdentity, jobDurations, graders: manifest.graders, customGraderIds: options.customGraderIds ?? manifest.customGraders });
   const { publishUnifiedSessionSummary } = require("./unified_session_render.cjs");
   await publishUnifiedSessionSummary(options.outputPath ?? path.join(options.rootDir ?? "/tmp/gh-aw", "usage/aw_session.jsonl"));
   await publishGraderSummary(events);

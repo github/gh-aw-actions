@@ -4,6 +4,8 @@
 
 const PERMISSION_DENIED_PATTERN = /\b(?:permission denied|permissions denied|EACCES|EPERM)\b/gi;
 const NUMEROUS_PERMISSION_DENIED_THRESHOLD = 3;
+// Keep distinct from the SDK model-verification exit code (79).
+const WORKFLOW_TOOL_PERMISSION_DENIED_EXIT_CODE = 80;
 
 /**
  * Count permission-denied indicators in process output.
@@ -70,16 +72,29 @@ function extractDeniedCommands(output) {
 }
 
 /**
- * Build a structured report_missing_tool payload for repeated permission-denied failures.
+ * Detect the SDK driver's trusted workflow tool-permission denial exit code.
+ * @param {unknown} exitCode
+ * @returns {boolean}
+ */
+function hasWorkflowToolPermissionDenial(exitCode) {
+  return exitCode === WORKFLOW_TOOL_PERMISSION_DENIED_EXIT_CODE;
+}
+
+/**
+ * Build a structured report_missing_tool payload for permission-denied failures.
  * @param {string[]} [deniedCommands] - Commands that were denied (may be empty)
+ * @param {boolean} [workflowToolDenial] - Trusted SDK-driver workflow-tool denial signal
  * @returns {string}
  */
-function buildMissingToolPermissionIssuePayload(deniedCommands) {
+function buildMissingToolPermissionIssuePayload(deniedCommands, workflowToolDenial = false) {
+  const isWorkflowToolDenial = workflowToolDenial === true;
   return JSON.stringify({
     type: "report_missing_tool",
     tool: "tool/permission",
-    reason: "missing tool/permission issue: numerous permission denied errors detected",
-    alternatives: "Verify token scopes, repository permissions, and MCP/tool access configuration.",
+    reason: isWorkflowToolDenial ? "missing tool/permission issue: workflow tool permission denial detected" : "missing tool/permission issue: numerous permission denied errors detected",
+    alternatives: isWorkflowToolDenial
+      ? "Use only commands allowed by the workflow tools configuration; stop unsupported probes before the denial budget is exhausted. A workflow tool denial does not establish missing token scopes or invalid credentials."
+      : "Verify token scopes, repository permissions, and MCP/tool access configuration.",
     denied_commands: deniedCommands && deniedCommands.length > 0 ? deniedCommands : [],
   });
 }
@@ -88,5 +103,7 @@ module.exports = {
   countPermissionDeniedIssues,
   hasNumerousPermissionDeniedIssues,
   extractDeniedCommands,
+  hasWorkflowToolPermissionDenial,
+  WORKFLOW_TOOL_PERMISSION_DENIED_EXIT_CODE,
   buildMissingToolPermissionIssuePayload,
 };

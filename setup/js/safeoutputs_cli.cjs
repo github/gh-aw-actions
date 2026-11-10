@@ -18,6 +18,7 @@ const fs = require("fs");
 const { ERR_VALIDATION, ERR_SYSTEM } = require("./error_codes.cjs");
 const { getSetupTimeoutMs } = require("./child_process_timeouts.cjs");
 const { iterateJsonl } = require("./jsonl_helpers.cjs");
+const { buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
 
 const SAFEOUTPUTS_CLI_TIMEOUT_MS = getSetupTimeoutMs("safeoutputsCli");
 
@@ -100,7 +101,8 @@ function buildMissingToolAlternatives(baseAlternatives, deniedCommands) {
  *   safeOutputsPath?: string,
  *   runSafeOutputsCLI?: RunSafeOutputsCLILike,
  *   logger?: (message: string) => void,
- *   deniedCommands?: string[]
+ *   deniedCommands?: string[],
+ *   workflowToolPermissionDenied?: boolean
  * }=} options
  */
 function emitMissingToolPermissionIssue(options) {
@@ -108,16 +110,18 @@ function emitMissingToolPermissionIssue(options) {
   const runSafeOutputs = options && options.runSafeOutputsCLI ? options.runSafeOutputsCLI : runSafeOutputsCLI;
   const logger = options && options.logger ? options.logger : defaultLog;
   const deniedCommands = options && options.deniedCommands ? options.deniedCommands : [];
+  const workflowToolPermissionDenied = options && options.workflowToolPermissionDenied === true;
 
   if (!safeOutputsPath) {
     logger("report_missing_tool skipped: GH_AW_SAFE_OUTPUTS is not set");
     return;
   }
   try {
+    const payload = JSON.parse(buildMissingToolPermissionIssuePayload(deniedCommands, workflowToolPermissionDenied));
     runSafeOutputs("report_missing_tool", {
-      tool: "tool/permission",
-      reason: "missing tool/permission issue: numerous permission denied errors detected",
-      alternatives: buildMissingToolAlternatives("Verify token scopes, repository permissions, and MCP/tool access configuration.", deniedCommands),
+      tool: payload.tool,
+      reason: payload.reason,
+      alternatives: buildMissingToolAlternatives(payload.alternatives, deniedCommands),
     });
     logger(`report_missing_tool emitted via safeoutputs CLI: ${safeOutputsPath}`);
   } catch (error) {
@@ -176,7 +180,7 @@ const NON_TERMINAL_SAFE_OUTPUT_TYPES = new Set(["report_missing_tool", "report_m
  * Read the safe-outputs JSONL file and check whether it contains at least one
  * non-diagnostic entry (i.e. an output that represents real, task-level work).
  * Returns true when such an entry exists; false otherwise.
- * Used by harnesses to suppress the terminal "numerous permission-denied" verdict
+ * Used by harnesses to suppress the terminal permission-denied verdict
  * when the agent already produced the expected output — preventing false-red runs.
  * @param {string} safeOutputsPath - Path to the safe-outputs JSONL file
  * @param {{
@@ -219,6 +223,7 @@ function hasExpectedSafeOutputs(safeOutputsPath, options) {
  *   byteOffset?: number,
  *   includeMissingData?: boolean,
  *   includeReportIncomplete?: boolean,
+ *   excludePartialReviewComments?: boolean,
  *   logger?: (msg: string) => void,
  *   readFileSync?: (path: string, encoding: BufferEncoding) => string
  * }=} options
@@ -262,6 +267,8 @@ function hasTerminalSafeOutput(safeOutputsPath, options) {
   for (const parsed of iterateJsonl(content)) {
     const type = parsed && typeof parsed.type === "string" ? normalizeSafeOutputName(parsed.type) : "";
     if (!type) continue;
+    // Inline findings do not prove that the final review was submitted.
+    if ((type === "create_pull_request_review_comment" || type === "create-pull-request-review-comment") && options?.excludePartialReviewComments) continue;
     if (TERMINAL_SAFE_OUTPUT_TYPES.has(type)) {
       logger(`hasTerminalSafeOutput: terminal entry found in ${safeOutputsPath}: type=${type}`);
       return true;
