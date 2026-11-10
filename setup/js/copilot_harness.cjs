@@ -72,6 +72,7 @@ const {
 } = require("./process_runner.cjs");
 const { buildCopilotSDKServerArgs, getCopilotSDKServerPort, startCopilotSDKServer, stopCopilotSDKServer, waitForCopilotSDKServer } = require("./copilot_sdk_sidecar.cjs");
 const { resolveRetryConfig: resolveSharedRetryConfig } = require("./harness_retry_config.cjs");
+const { stopForPermissionDenied } = require("./harness_failure_handling.cjs");
 const {
   captureExecutionEvidenceConfiguration,
   resolveHarnessRetryTelemetryPath,
@@ -99,8 +100,16 @@ const {
   REFLECT_PROVIDER_ALIASES,
 } = require("./awf_reflect.cjs");
 const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete, hasExpectedSafeOutputs, hasTerminalSafeOutput, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
-const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
-const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal, isAuthenticationFailedError: isCommonAuthenticationFailedError, parseAICreditsExceededProxyRejection } = require("./harness_retry_guard.cjs");
+const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, hasWorkflowToolPermissionDenial, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
+const {
+  detectNonRetryableHarnessGuard,
+  detectExhaustedAWFInvocationBudget,
+  buildSoftTimeoutGuard,
+  emitSoftTimeoutSignal,
+  isAuthenticationFailedError: isCommonAuthenticationFailedError,
+  createOutputPatternMatcher,
+  parseAICreditsExceededProxyRejection,
+} = require("./harness_retry_guard.cjs");
 const { isCrashSignalExitCode, crashSignalNameForExitCode } = require("./harness_crash_signals.cjs");
 const { isCAPIQuotaExceededError, isCAPIServerError } = require("./detect_agent_errors.cjs");
 const { applyModelFallback } = require("./model_fallback.cjs");
@@ -147,6 +156,7 @@ function resolveLongRunTokenThreshold(env = process.env) {
 const LONG_RUN_TOKEN_THRESHOLD = resolveLongRunTokenThreshold();
 const POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS = resolvePostResultWatchdogIdleTimeoutMs();
 const COPILOT_REQUESTS_PROXY_AUTH_403_TEMPLATE_NAME = "copilot_requests_proxy_auth_403.md";
+const NATIVE_RATE_LIMIT_ERROR_PATTERN = /\b429\b|too many requests|rate[\s_-]*limit/i;
 // Pattern to detect transient CAPIError 400 in copilot output
 const CAPI_ERROR_400_PATTERN = /CAPIError:\s*400/;
 // Pattern to detect generic HTTP 400 Bad Request responses emitted by engine CLI / SDK wrappers.
@@ -679,8 +689,7 @@ async function resolveCopilotSDKMultiProvider(options) {
  * @returns {Array<{ name: string, model?: string, path: string }>}
  */
 function listCopilotAgentFiles(directory, logger = log) {
-  const { extractFrontmatterAndBody } = require("./frontmatter_hash_pure.cjs");
-  const { parseDocument } = require("./work_queue_yaml.cjs");
+  const { readMarkdownMetadata, CompilerMetadataUnavailableError } = require("./markdown_metadata.cjs");
   let entries;
   try {
     entries = fs.readdirSync(directory, { withFileTypes: true });
@@ -693,15 +702,12 @@ function listCopilotAgentFiles(directory, logger = log) {
     if (!entry.isFile() || !entry.name.endsWith(".agent.md")) continue;
     const agentPath = path.join(directory, entry.name);
     try {
-      const { frontmatterText } = extractFrontmatterAndBody(fs.readFileSync(agentPath, "utf8"));
-      /** @type {any} */
-      const document = parseDocument(frontmatterText);
-      if (!document || document.errors.length) throw new Error("cannot parse agent frontmatter");
-      const frontmatter = document.toJS() || {};
+      const frontmatter = readMarkdownMetadata("agent", fs.readFileSync(agentPath, "utf8")).value;
       if (typeof frontmatter !== "object" || Array.isArray(frontmatter)) throw new Error("agent frontmatter must be a mapping");
       const name = typeof frontmatter.name === "string" && frontmatter.name.trim() ? frontmatter.name.trim() : entry.name.slice(0, -".agent.md".length);
       agents.push({ name, path: agentPath, ...(typeof frontmatter.model === "string" ? { model: frontmatter.model.trim() } : {}) });
     } catch (error) {
+      if (error instanceof CompilerMetadataUnavailableError) throw error;
       logger(`warning: cannot read custom agent ${agentPath}: ${getErrorMessage(error)}`);
     }
   }
@@ -730,39 +736,18 @@ function listCopilotSubagents(workingDirectory, agentsBaseDir, logger = log) {
 }
 
 /**
- * Locate the top-level YAML model scalar in a Copilot agent file.
- * @param {string} content
- * @returns {{ value: string, source: string, start: number, end: number }}
- */
-function getCopilotAgentModelScalar(content) {
-  const { extractFrontmatterAndBody } = require("./frontmatter_hash_pure.cjs");
-  const { parseDocument } = require("./work_queue_yaml.cjs");
-  const { frontmatterText } = extractFrontmatterAndBody(content);
-  /** @type {any} */
-  const document = parseDocument(frontmatterText);
-  if (!document || document.errors.length || !document.contents || !Array.isArray(document.contents.items)) {
-    throw new Error("cannot parse agent frontmatter");
-  }
-  const pairs = document.contents.items.filter(pair => pair?.key?.value === "model");
-  if (pairs.length !== 1 || typeof pairs[0].value?.value !== "string" || !Array.isArray(pairs[0].value.range)) {
-    throw new Error("expected exactly one top-level string 'model:' scalar in the frontmatter");
-  }
-  const frontmatterStart = content.indexOf("\n") + 1;
-  const start = frontmatterStart + pairs[0].value.range[0];
-  const end = frontmatterStart + pairs[0].value.range[1];
-  return { value: pairs[0].value.value, source: content.slice(start, end), start, end };
-}
-
-/**
- * Replace the complete YAML model scalar, including any block-scalar continuation lines.
+ * Replace a compiler-owned top-level model while retaining every other field.
  * @param {string} content
  * @param {string} model
  * @returns {string}
  */
 function replaceCopilotAgentFileModelContent(content, model) {
-  const scalar = getCopilotAgentModelScalar(content);
-  const lineEnding = scalar.source.match(/(?:\r?\n)+$/)?.[0] || "";
-  return content.slice(0, scalar.start) + JSON.stringify(model) + lineEnding + content.slice(scalar.end);
+  const { editMarkdownMetadata, readMarkdownMetadata } = require("./markdown_metadata.cjs");
+  if (typeof readMarkdownMetadata("agent", content).value.model !== "string") throw new Error("expected exactly one top-level string 'model:' scalar in the frontmatter");
+  return editMarkdownMetadata(content, metadata => {
+    if (typeof metadata.model !== "string") throw new Error("expected exactly one top-level string 'model:' scalar in the frontmatter");
+    return { ...metadata, model };
+  });
 }
 
 /**
@@ -1158,9 +1143,7 @@ function isMCPGatewayShutdownError(output) {
  * @param {string} output
  * @returns {boolean}
  */
-function isConnectionRefusedError(output) {
-  return CONNECTION_REFUSED_ERROR_PATTERN.test(output);
-}
+const isConnectionRefusedError = createOutputPatternMatcher(CONNECTION_REFUSED_ERROR_PATTERN);
 
 /**
  * Decide whether a failed attempt qualifies for the one-shot connection-refused retry.
@@ -1255,7 +1238,7 @@ function isCopilotContentFilterError(output) {
  *   isSDKSessionIdleTimeout?: boolean,
  *   isModelRoutingFailure?: boolean,
  *   isModelEndpointMismatch?: boolean,
- *   hasNumerousPermissionDenied?: boolean,
+ *   hasWorkflowToolPermissionDenial?: boolean,
  *   tokenCount?: number,
  * }} detection
  * @returns {string}
@@ -1282,7 +1265,7 @@ function classifyCopilotFailure(detection) {
   if (detection.isAuthenticationFailed) return "authentication_failed";
   if (detection.isSDKSessionIdleTimeout) return "sdk_session_idle_timeout";
   if (detection.isMCPGatewayShutdown) return "mcp_gateway_shutdown";
-  if (detection.hasNumerousPermissionDenied) return "permission_denied";
+  if (detection.hasWorkflowToolPermissionDenial) return "permission_denied";
   if (detection.isTransientCAPIError) return "capi_error_400";
   if (detection.hasOutput && (detection.tokenCount ?? 0) > LONG_RUN_TOKEN_THRESHOLD) return "long_run_exit";
   return detection.hasOutput ? "partial_execution" : "no_output";
@@ -1299,7 +1282,7 @@ function shouldRetryFailedExecution(params) {
   if (params.exitCode === 0) return false;
   if (isCopilotContentFilterError(params.output)) return false;
   if (params.isModelRoutingFailure) return false;
-  if (hasNumerousPermissionDeniedIssues(params.output)) return false;
+  if (hasWorkflowToolPermissionDenial(params.exitCode)) return false;
   if (isCAPIQuotaExceededError(params.output)) return false;
   const nonRetryableGuard = detectNonRetryableHarnessGuard(params.output);
   if (nonRetryableGuard.modelEndpointMismatch) return false;
@@ -1657,6 +1640,21 @@ function removeExplicitPromptOptions(args) {
 }
 
 /**
+ * Grant external detection access to its compiler-owned artifact directory.
+ * The detector's prompt directory may be elsewhere, so --allow-all-tools alone
+ * does not permit Copilot to read the inputs or record a verdict.
+ * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string[]}
+ */
+function addCopilotDetectionDirectory(args, env) {
+  const inputDir = env.GH_AW_DETECTION_INPUT_DIR;
+  if (!isDetectionPhase(env.GH_AW_PHASE) || !inputDir) return args;
+  if (!path.isAbsolute(inputDir)) throw new Error("GH_AW_DETECTION_INPUT_DIR must be an absolute path");
+  return ["--add-dir", inputDir, ...args];
+}
+
+/**
  * Resolve --prompt-file arguments for the Copilot CLI.
  * Small files are inlined as -p prompt text for compatibility with older Copilot CLIs.
  * Larger files and files containing NUL bytes are returned as stdin data so the full
@@ -1760,7 +1758,7 @@ async function main() {
     const resolvedPrompt = resolvePromptFileInput(args);
     const fallbackConfigPath = !process.env.GH_AW_AWF_CONFIG_PATH && process.env.RUNNER_TEMP ? path.join(process.env.RUNNER_TEMP, "gh-aw", "awf-config.json") : undefined;
     const configPath = process.env.GH_AW_AWF_CONFIG_PATH || AWF_CONFIG_PATH;
-    resolvedArgs = addCopilotURLPermissions(resolvedPrompt.args, { sdkMode: copilotSDKMode, configPath, fallbackConfigPath });
+    resolvedArgs = addCopilotURLPermissions(addCopilotDetectionDirectory(resolvedPrompt.args, process.env), { sdkMode: copilotSDKMode, configPath, fallbackConfigPath });
     promptStdin = resolvedPrompt.stdin;
   }
 
@@ -2051,6 +2049,7 @@ async function main() {
       } else {
         let driverServerArgs = parseCopilotSDKServerArgsFromEnv(process.env.GH_AW_COPILOT_SDK_SERVER_ARGS, { logger: log });
         if (driverServerArgs.length === 0) driverServerArgs = buildCopilotSDKServerArgs(childEnv ?? process.env);
+        driverServerArgs = addCopilotDetectionDirectory(driverServerArgs, process.env);
         if (process.env.GITHUB_WORKSPACE) {
           driverServerArgs = [...driverServerArgs, "--add-dir", process.env.GITHUB_WORKSPACE];
           log(`copilot-sdk driver mode: appended workspace --add-dir ${process.env.GITHUB_WORKSPACE}`);
@@ -2104,6 +2103,7 @@ async function main() {
           observeStrategy(strategy);
           const safeArgs = currentArgs.map((arg, i) => (currentArgs[i - 1] === "--prompt" || currentArgs[i - 1] === "-p" ? "<redacted>" : arg));
           const modelObserver = !verifyModel ? { check: () => "" } : createCopilotModelObserver({ configuredModel: selectionConfiguredModel, resolvedModel: process.env.COPILOT_MODEL || "", sessionId, logger: log });
+          let nativeTerminalRateLimitError = false;
           // Driver mode: run copilot_sdk_driver.cjs as a normal subprocess. The harness has
           // already started the sidecar; the driver only opens an SDK client connection.
           const result = await runProcess({
@@ -2114,6 +2114,23 @@ async function main() {
             logArgs: safeArgs,
             env: childEnv,
             stdin: promptStdin,
+            onStdoutLine: line => {
+              let event;
+              try {
+                event = JSON.parse(line);
+              } catch {
+                return;
+              }
+              if (!copilotSDKMode && durableSession && sessionId && ["session.start", "session.resume", "assistant.message", "tool.execution_start"].includes(event?.type)) {
+                durableSession.started(sessionId);
+              }
+              if (["error", "session.error", "turn.failed"].includes(event?.type) && NATIVE_RATE_LIMIT_ERROR_PATTERN.test(JSON.stringify(event))) {
+                nativeTerminalRateLimitError = true;
+              }
+            },
+            onStderrLine: line => {
+              if (NATIVE_RATE_LIMIT_ERROR_PATTERN.test(line)) nativeTerminalRateLimitError = true;
+            },
             runtimeGuard: { shouldTerminate: () => ({ terminate: Boolean(modelObserver.check()), reason: "copilot_model_verification" }) },
             postResultWatchdog: safeOutputsPath
               ? {
@@ -2137,7 +2154,7 @@ async function main() {
           detectedCopilotErrors.agenticEngineTimeout ||= attemptDetections.agenticEngineTimeout;
           detectedCopilotErrors.modelNotSupportedError ||= attemptDetections.modelNotSupportedError;
           detectedCopilotErrors.http400ResponseError ||= attemptDetections.http400ResponseError;
-          return { ...result, strategy };
+          return { ...result, strategy, nativeTerminalRateLimitError };
         },
         handleFailure: async ({ attempt, result }) => {
           if (result.runtimeGuardReason === "copilot_model_verification") {
@@ -2173,11 +2190,21 @@ async function main() {
           const isSDKSessionIdleTimeout = isSDKSessionIdleTimeoutError(result.output);
           const isMCPGatewayShutdown = isMCPGatewayShutdownError(result.output);
           const isConnectionRefused = isConnectionRefusedError(result.output);
+          // Combined output includes untrusted assistant text; counts are diagnostic only.
           const permissionDeniedCount = countPermissionDeniedIssues(result.output);
           const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
+          const isWorkflowToolPermissionDenied = hasWorkflowToolPermissionDenial(result.exitCode);
           const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
           const isContentFiltered = isCopilotContentFilterError(result.output);
-          const isInvocationCapExceeded = nonRetryableGuard.maxRunsExceeded;
+          let isInvocationCapExceeded = nonRetryableGuard.maxRunsExceeded;
+          if (!isInvocationCapExceeded) {
+            const budget = await detectExhaustedAWFInvocationBudget({ nativeTerminalRateLimitError: result.nativeTerminalRateLimitError === true, logger: log });
+            if (budget) {
+              nonRetryableGuard.maxRunsExceeded = true;
+              isInvocationCapExceeded = true;
+              log(`attempt ${attempt + 1}: AWF shared invocation budget exhausted (${budget.invocationCount}/${budget.maxRuns}) — confirmed by fresh reflection`);
+            }
+          }
           const tokenCount = extractTokenCountFromOutput(result.output);
           const attemptDurationMs = result.durationMs ?? 0;
           const proxyAICreditsRejection = parseAICreditsExceededProxyRejection(result.output);
@@ -2215,7 +2242,7 @@ async function main() {
             isCAPIServerError: hasCAPIServerError,
             isTrustedAICreditsBudgetExhausted,
             isSDKSessionIdleTimeout,
-            hasNumerousPermissionDenied,
+            hasWorkflowToolPermissionDenial: isWorkflowToolPermissionDenied,
             tokenCount,
           });
           const outputTail = extractOutputTail(result.output);
@@ -2241,6 +2268,7 @@ async function main() {
               ` isAuthError=${isAuthErr}` +
               ` isAuthenticationFailedError=${isAuthenticationFailed}` +
               ` permissionDeniedCount=${permissionDeniedCount}` +
+              ` isWorkflowToolPermissionDenied=${isWorkflowToolPermissionDenied}` +
               ` hasNumerousPermissionDenied=${hasNumerousPermissionDenied}` +
               ` hasOutput=${result.hasOutput}` +
               ` tokenCount=${tokenCount}` +
@@ -2381,15 +2409,8 @@ async function main() {
             return { action: "stop" };
           }
 
-          if (hasNumerousPermissionDenied) {
-            if (safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
-              log(`attempt ${attempt + 1}: detected numerous permission-denied issues but safe-outputs already contain expected output — suppressing terminal verdict (false-red: core work succeeded)`);
-              return { action: "stop", exitCode: 0 };
-            }
-            const deniedCommands = extractDeniedCommands(result.output);
-            emitMissingToolPermissionIssue({ deniedCommands, logger: log });
-            log(`attempt ${attempt + 1}: detected numerous permission-denied issues — not retrying (classified as missing tool/permission issue)`);
-            return { action: "stop" };
+          if (isWorkflowToolPermissionDenied) {
+            return stopForPermissionDenied({ attempt, output: result.output, safeOutputsPath, log, deniedCommands: extractDeniedCommands(result.output), workflowToolPermissionDenied: isWorkflowToolPermissionDenied });
           }
 
           if (isMCPPolicy) {
@@ -2610,6 +2631,7 @@ if (typeof module !== "undefined" && module.exports) {
     waitForCopilotSDKServer,
     writeCopilotOutputs,
     resolvePromptFileInput,
+    addCopilotDetectionDirectory,
     resolveRetryConfig,
     parseCopilotSDKServerArgsFromEnv,
     isCAPIQuotaExceededError,

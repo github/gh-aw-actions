@@ -82,6 +82,7 @@ const REFLECT_PROVIDER_ANTHROPIC = "anthropic";
 /**
  * @typedef {{
  *   endpoints?: ReflectEndpoint[],
+ *   runs?: { enabled?: boolean, max_runs?: number, invocation_count?: number, remaining_runs?: number },
  *   routing?: {
  *     status?: string,
  *     failure_code?: string,
@@ -857,20 +858,24 @@ function resolveProviderEndpointFromReflect(options) {
 }
 
 /**
- * Check that fresh reflection selects a configured endpoint authenticated by Azure OIDC.
+ * Check that fresh reflection selects a configured endpoint authenticated by provider-specific OIDC.
  *
  * @param {any} reflectData
  * @param {string} provider
  * @returns {boolean}
  */
-function hasAzureOIDCProviderEndpoint(reflectData, provider) {
+function hasOIDCProviderEndpoint(reflectData, provider, authProvider) {
   const endpoints = Array.isArray(reflectData?.endpoints) ? reflectData.endpoints : [];
   const resolved = resolveProviderEndpointFromReflect({ provider, reflectData, logger: () => {} });
   const aliases = REFLECT_PROVIDER_ALIASES[normalizeReflectProviderName(provider)] || new Set([normalizeReflectProviderName(provider)]);
   const endpoint = endpoints.find(
     candidate => candidate?.configured === true && aliases.has(normalizeReflectProviderName(candidate.provider)) && normalizeReflectProviderName(candidate.provider) === normalizeReflectProviderName(resolved?.endpointProvider)
   );
-  return Boolean(endpoint && endpoint.auth_type === "github-oidc/azure");
+  return Boolean(endpoint && endpoint.auth_type === `github-oidc/${authProvider}`);
+}
+
+function hasAzureOIDCProviderEndpoint(reflectData, provider) {
+  return hasOIDCProviderEndpoint(reflectData, provider, "azure");
 }
 
 /**
@@ -1158,6 +1163,7 @@ if (typeof module !== "undefined" && module.exports) {
     resolveOpenAICompatibleEndpointFromReflect,
     resolveProviderEndpointFromReflect,
     hasAzureOIDCProviderEndpoint,
+    hasOIDCProviderEndpoint,
     resolveMultiProviderFromReflect,
     rewriteAPIProxyURLForHostBridge,
   };

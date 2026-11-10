@@ -603,7 +603,10 @@ function isReusableFailureIssue(body, options) {
     return failureMarker.failure_cause === options.failureCause;
   }
 
-  return (failureMarker.failure_categories || "") === options.failureCategories.join("|");
+  // Supplemental diagnostics can vary between incomplete runs without changing
+  // the completion failure. Preserve other categories so distinct causes stay separate.
+  const matchCategories = categories => (categories.includes("report_incomplete") ? categories.filter(category => !["missing_data", "missing_tool"].includes(category)) : [...categories]).sort().join("|");
+  return matchCategories((failureMarker.failure_categories || "").split("|")) === matchCategories(options.failureCategories);
 }
 
 /**
@@ -1918,7 +1921,10 @@ function buildReportIncompleteContext(items, { collectorEmptyOutputCause, rootDi
     core.info(`Found ${messages.length} report_incomplete signal(s)`);
   }
 
-  const context = nodes.warning("Task Could Not Be Completed", [nodes.text("The workflow recorded a "), nodes.code("report_incomplete"), nodes.text(" signal: the task was not completed or completion could not be confirmed.")]);
+  const missingTerminalSignal = trustedCollectorCause === "missing_terminal_safe_output" && messages.length === 0;
+  const context = missingTerminalSignal
+    ? nodes.warning("Completion Signal Missing", [nodes.text("No terminal safe output was recorded, so completion is unconfirmed; whether the requested work finished is unknown.")])
+    : nodes.warning("Task Could Not Be Completed", [nodes.text("The workflow recorded a "), nodes.code("report_incomplete"), nodes.text(" signal: the task was not completed or completion could not be confirmed.")]);
   if (messages.length > 0) {
     context.push(
       nodes.list(messages.map(message => [nodes.paragraph([nodes.strong([nodes.text("Reported reason (agent-declared, unverified):")]), nodes.text(" "), nodes.code(redactAndBoundDiagnostics(message.reason, { maxLength: 1000 }))])]))

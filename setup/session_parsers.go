@@ -7,10 +7,11 @@ import "embed"
 //
 //go:embed js/session_cli.cjs js/unified_session.cjs js/unified_session_payload.cjs js/unified_session_render.cjs
 //go:embed js/memory_save_results.cjs
+//go:embed js/durable_session_record.cjs
 //go:embed js/steering_helpers.cjs js/jsonl_helpers.cjs
 //go:embed js/schema-validation.cjs js/json_schema_validation.cjs js/memory_schema_contract.cjs
 //go:embed js/add_labels_schema.cjs
-//go:embed js/skill_inventory.cjs
+//go:embed js/skill_inventory.cjs js/markdown_metadata.cjs
 //go:embed js/unified_session_order.cjs js/unified_session_otel.cjs
 //go:embed js/trace_graders.cjs js/grader_session.cjs js/grader_artifacts.cjs js/trajectory_graders.cjs js/builtin_graders.json js/working_set_metrics.cjs
 //go:embed js/custom_graders.cjs js/custom_grader_worker.cjs
@@ -32,11 +33,12 @@ import "embed"
 //go:embed js/protected_command_output.cjs
 //go:embed js/log_parser_step_summary_builder.cjs js/markdown_unfencing.cjs
 //go:embed js/report_ast.cjs js/sanitize_content_core.cjs js/markdown_code_region_balancer.cjs
+//go:embed js/temporary_id.cjs
 //go:embed js/diagnostic_sanitization.cjs js/sanitize_content.cjs js/missing_info_formatter.cjs
 //go:embed js/ephemerals.cjs js/project_timezone.cjs
 //go:embed js/add_mask_redaction.cjs js/json_string_scanner.cjs js/mask_value_matcher.cjs js/redact_secrets.cjs js/safe_output_redaction.cjs js/safe_outputs_tools.json js/safe_outputs_config_redact.cjs js/safe_output_manifest.cjs js/safe_output_outcomes.cjs js/safe_outputs_status.cjs
 //go:embed js/otlp_header_helpers.cjs js/otlp.cjs js/work_queue_telemetry.cjs
-//go:embed js/work_queue_claim_scope.cjs js/work_queue_codec.cjs js/work_queue_resource_scope.cjs
+//go:embed js/work_queue_claim_scope.cjs js/work_queue_codec.cjs js/lock_file_headers.cjs js/work_queue_resource_scope.cjs
 //go:embed js/work_queue_host.cjs
 //go:embed js/aw_context.cjs js/experiment_helpers.cjs js/finish_work_queue_claim.cjs
 //go:embed js/webhook_context.cjs js/provider_issue_webhook.cjs js/webhook_resource.cjs
@@ -63,7 +65,7 @@ import "embed"
 //go:embed js/work_queue_expiration.cjs
 //go:embed js/work_queue_deployment.cjs js/work_queue_deployment_control.cjs
 //go:embed js/work_queue_git_tree_adapter.cjs js/work_queue_graphql_adapter.cjs js/work_queue_rest_adapter.cjs
-//go:embed js/work_queue_graph.cjs js/work_queue_limits.cjs js/work_queue_scheduler.cjs js/work_queue_yaml.cjs js/work_queue_expiration.cjs
+//go:embed js/work_queue_graph.cjs js/work_queue_limits.cjs js/work_queue_scheduler.cjs js/work_queue_expiration.cjs
 //go:embed js/work_queue_indexes.cjs
 //go:embed js/mcp_server_core.cjs js/mcp_dependencies_manager.cjs js/mcp_enhanced_errors.cjs js/mcp_logger.cjs
 //go:embed js/levenshtein_distance.cjs

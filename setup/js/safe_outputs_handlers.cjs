@@ -806,7 +806,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     const stagedFileName = `${crypto.createHash("sha256").update(filePath).digest("hex")}${fileExt}`;
     const targetPath = path.join(assetsDir, stagedFileName);
     try {
-      writeGuardedFile(targetPath, fileContent);
+      writeGuardedFile(targetPath, fileContent, { mode: 0o600, directoryMode: 0o700 });
     } catch (err) {
       if (err && typeof err === "object" && "code" in err && err.code === ERR_VALIDATION) throw err;
       throw new Error(`${ERR_SYSTEM}: Failed to copy file ${filePath} to ${targetPath}: ${getErrorMessage(err)}`, { cause: err });
@@ -3040,7 +3040,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    */
   const updateIssueHandler = args => {
     const normalizedArgs = normalizeBlankOptionalFields(args, safeOutputsToolMap.get("update_issue").inputSchema.properties);
-    const updateFields = ["status", "title", "body", "labels", "assignees", "milestone"];
+    const updateFields = ["status", "title", "body", "labels", "assignees", "milestone", "artifacts"];
     if (!updateFields.some(field => normalizedArgs[field] !== undefined && normalizedArgs[field] !== false && (normalizedArgs[field] !== null || field === "milestone"))) {
       throw {
         code: -32602,
@@ -3080,6 +3080,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       }
     }
 
+    if (normalizedArgs.artifacts !== undefined) {
+      normalizedArgs.artifacts = resolveIssueArtifactPaths(normalizedArgs.artifacts, updateIssueConfig.max_issue_artifacts, updateIssueConfig.max_issue_artifact_size, "update_issue");
+    }
     return defaultHandler("update_issue")(normalizedArgs);
   };
 
