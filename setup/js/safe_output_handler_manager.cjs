@@ -65,7 +65,9 @@ const {
 } = require("./work_queue_claim_scope.cjs");
 const { withClaimEffectClients, wrapClaimEffectClient } = require("./work_queue_effect_client.cjs");
 const { readClaimControlMessages } = require("./work_queue_control_delivery.cjs");
-const { readDeliveryControlInventory, inspectClaimDelivery, createClaimDeliveryVerifier, verifyBuiltinDeliveryOutput } = require("./work_queue_delivery.cjs");
+const { readDeliveryControlInventory, inspectClaimDelivery, createClaimDeliveryVerifier, verifyBuiltinDeliveryOutput, validateDeliveryContract, NO_WRITE_TYPES } = require("./work_queue_delivery.cjs");
+const { normalizeSafeOutputName } = require("./safe_output_names.cjs");
+const { collectDeliveryEvidence, publishDeliveryEvidence } = require("./work_queue_delivery_evidence.cjs");
 const { createClaimAdapterHandler, verifyClaimAdapterOutput, preparedAdapterPath, createDeclaredAdapterVerifier, wrapDeclaredBuiltinHandler } = require("./work_queue_claim_adapters.cjs");
 const GITHUB_TOKEN_CONFIG_KEY = "github-token";
 
@@ -74,14 +76,9 @@ const GITHUB_TOKEN_CONFIG_KEY = "github-token";
  * Maps safe output types to their handler module file paths
  */
 const HANDLER_MAP = {
-  linear_create_issue: "./linear_create_issue.cjs",
-  linear_add_comment: "./linear_add_comment.cjs",
-  linear_update_issue: "./linear_update_issue.cjs",
+  add_security_advisory_comment: "./add_security_advisory_comment.cjs",
+  create_security_advisory: "./create_security_advisory.cjs",
   create_issue: "./create_issue.cjs",
-  jira_create_issue: "./jira_create_issue.cjs",
-  jira_update_issue: "./jira_update_issue.cjs",
-  jira_add_comment: "./jira_add_comment.cjs",
-  jira_add_label: "./jira_add_label.cjs",
   add_comment: "./add_comment.cjs",
   comment_memory: "./comment_memory.cjs",
   create_discussion: "./create_discussion.cjs",
@@ -132,12 +129,6 @@ const HANDLER_MAP = {
   report_incomplete: "./report_incomplete_handler.cjs",
   create_report_incomplete_issue: "./create_report_incomplete_issue.cjs",
   create_project: "./create_project.cjs",
-  ado_create_work_item: "./create_work_item.cjs",
-  ado_update_work_item: "./update_work_item.cjs",
-  ado_comment_on_work_item: "./comment_on_work_item.cjs",
-  ado_assign_work_item: "./assign_work_item.cjs",
-  ado_link_work_items: "./link_work_items.cjs",
-  ado_upload_workitem_attachment: "./upload_workitem_attachment.cjs",
   create_project_status_update: "./create_project_status_update.cjs",
   update_project: "./update_project.cjs",
   upload_artifact: "./upload_artifact.cjs",
@@ -181,12 +172,9 @@ const WTD3_REQUIREMENT_ID = "WTD3";
  * @type {Set<string>}
  */
 const THREAT_WARNING_REVIEWABLE_TYPES = new Set([
-  "linear_create_issue",
-  "linear_add_comment",
+  "add_security_advisory_comment",
+  "create_security_advisory",
   "create_issue",
-  "jira_create_issue",
-  "jira_update_issue",
-  "jira_add_comment",
   "add_comment",
   "create_pull_request",
   "comment_memory",
@@ -210,8 +198,6 @@ const THREAT_WARNING_REVIEWABLE_TYPES = new Set([
   "ledger_mutation",
   "create_report_incomplete_issue",
   "report_incomplete",
-  "ado_create_work_item",
-  "ado_comment_on_work_item",
 ]);
 
 /**
@@ -230,7 +216,6 @@ const THREAT_WARNING_CONVERTIBLE_TYPES = new Map([["push_to_pull_request_branch"
  * @type {Set<string>}
  */
 const THREAT_WARNING_ABORT_TYPES = new Set([
-  "linear_update_issue",
   "noop",
   "close_issue",
   "link_sub_issue",
@@ -242,7 +227,6 @@ const THREAT_WARNING_ABORT_TYPES = new Set([
   "resolve_pull_request_review_thread",
   "dismiss_pull_request_review",
   "add_labels",
-  "jira_add_label",
   "remove_labels",
   "replace_label",
   "add_reviewer",
@@ -264,19 +248,16 @@ const THREAT_WARNING_ABORT_TYPES = new Set([
   "call_workflow",
   "autofix_code_scanning_alert",
   "create_agent_session",
-  "ado_update_work_item",
-  "ado_assign_work_item",
-  "ado_link_work_items",
-  "ado_upload_workitem_attachment",
 ]);
 
 /**
  * Resolve threat warning policy for a safe output type.
  * @param {string} messageType
+ * @param {Map<string, Function>} messageHandlers
  * @returns {{policy: "reviewable" | "convertible" | "abort" | "none", mappedType?: string}}
  */
-function getThreatWarningPolicy(messageType) {
-  if (THREAT_WARNING_ABORT_TYPES.has(messageType)) {
+function getThreatWarningPolicy(messageType, messageHandlers) {
+  if (THREAT_WARNING_ABORT_TYPES.has(messageType) || handlerThreatWarningAbortTypes.get(messageHandlers)?.has(messageType)) {
     return { policy: "abort" };
   }
   const mappedType = THREAT_WARNING_CONVERTIBLE_TYPES.get(messageType);
@@ -374,6 +355,15 @@ const PR_REVIEW_HANDLER_TYPES = new Set(["create_pull_request_review_comment", "
  */
 const handlerLoadErrorsByHandlerMap = new WeakMap();
 
+/** @type {WeakMap<Map<string, Function>, Set<string>>} Compiler-owned warning policies, never message payloads. */
+const handlerThreatWarningAbortTypes = new WeakMap();
+
+/** @type {WeakMap<Map<string, Function>, Map<string, {max: number, attempted: number}>>} Trusted connector proposal budgets, scoped to a handler factory. */
+const connectorBudgetsByHandlerMap = new WeakMap();
+
+/** @type {WeakSet<Function>} Only built-in local diagnostics may bypass publication checks. */
+const localDiagnosticHandlers = new WeakSet();
+
 /**
  * Wrap a handler so project-safe-output execution can temporarily bind global.github
  * to the handler-specific authenticated client.
@@ -454,6 +444,16 @@ function bindHandlerToFactoryScope(handler) {
 async function loadHandlers(config, prReviewBufferRegistry, resolvedAllowedMentionAliases, activationCommentLinks = []) {
   config = normalizeSafeOutputConfig(config);
   const messageHandlers = new Map();
+  handlerThreatWarningAbortTypes.set(messageHandlers, new Set(Object.keys(config).filter(type => config[type]?.threat_warning_policy === "abort")));
+  const connectorBudgets = new Map();
+  for (const [type, options] of Object.entries(config)) {
+    if (options?.connector_operation !== true) continue;
+    if (!Number.isSafeInteger(options.max) || options.max < 1 || options.max > 100) {
+      throw new Error(`Invalid trusted connector budget for "${type}": max must be an integer from 1 to 100`);
+    }
+    connectorBudgets.set(type, { max: options.max, attempted: 0 });
+  }
+  connectorBudgetsByHandlerMap.set(messageHandlers, connectorBudgets);
 
   /** @type {Map<string, string>} */
   const handlerLoadErrors = new Map();
@@ -539,7 +539,9 @@ async function loadHandlers(config, prReviewBufferRegistry, resolvedAllowedMenti
                   : value;
             }
           }
-          messageHandlers.set(type, factoryClaim ? authorizedHandler : bindHandlerToFactoryScope(executable));
+          const loadedHandler = factoryClaim ? authorizedHandler : bindHandlerToFactoryScope(executable);
+          if (type === "report_incomplete") localDiagnosticHandlers.add(loadedHandler);
+          messageHandlers.set(type, loadedHandler);
           core.info(`✓ Loaded and initialized handler for: ${type}`);
         } else {
           handlerLoadErrors.set(type, "handler module does not export a main function");
@@ -1124,7 +1126,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
     }
 
     if (detectionConclusion === "warning") {
-      const threatPolicy = getThreatWarningPolicy(messageType);
+      const threatPolicy = getThreatWarningPolicy(messageType, messageHandlers);
       if (threatPolicy.policy === "abort") {
         const errorCode = "threat_detected_abort_policy";
         const error = `Threat-detection warn policy aborted "${messageType}" (Requirement ${WTD3_REQUIREMENT_ID}): non-reviewable outputs must not be applied when detection conclusion is warning.`;
@@ -1224,6 +1226,22 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
     }
 
     try {
+      const budget = connectorBudgetsByHandlerMap.get(messageHandlers)?.get(messageType);
+      if (budget) {
+        if (budget.attempted >= budget.max) {
+          results.push({
+            type: messageType,
+            messageIndex: i,
+            success: false,
+            errorCode: "connector_budget_exceeded",
+            error: `Connector operation "${messageType}" exceeded its max of ${budget.max} attempted invocation(s)`,
+          });
+          return;
+        }
+        // Reserve synchronously before invoking the credentialed handler. Failed
+        // proposals consume budget too; HTTP retries stay inside that invocation.
+        budget.attempted++;
+      }
       core.info(`Processing message ${i + 1}/${messages.length}: ${messageType}`);
 
       // Convert Map to plain object for handler
@@ -1311,7 +1329,8 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
 
       // Call the message handler with the individual message and resolved temp IDs
       await assertClaimAuthorized(effectiveMessage);
-      const stalePRReason = await getStalePullRequestReason(global.github, global.context);
+      // Incomplete signals only record local diagnostics; they do not publish to the PR.
+      const stalePRReason = localDiagnosticHandlers.has(messageHandler) ? null : await getStalePullRequestReason(global.github, global.context);
       if (stalePRReason) {
         core.info(stalePRReason);
         results.push(buildSkippedResult(messageType, i, { skipped: true, reason: stalePRReason }));
@@ -1538,7 +1557,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
 
           // Call the handler again with updated temp ID map
           await assertClaimAuthorized(deferred.message);
-          const stalePRReason = await getStalePullRequestReason(global.github, global.context);
+          const stalePRReason = localDiagnosticHandlers.has(deferred.handler) ? null : await getStalePullRequestReason(global.github, global.context);
           const result = stalePRReason ? { skipped: true, reason: stalePRReason } : recordMergeDecision(deferred.type, await deferred.handler(deferred.message, resolvedTemporaryIds, temporaryIdMap), deferred.messageIndex);
 
           if (result && result.skipped === true && !result.deferred) {
@@ -2037,6 +2056,15 @@ async function settleClaimDelivery(scope, messages, results, options = {}) {
   for (const result of results) result.claim_handle = handle;
   if (options.registerVerification) options.registerVerification(messages, results);
   const controls = options.controlMessages || [];
+  if (options.registerVerification !== undefined && !isStagedMode()) {
+    try {
+      const evidence = collectDeliveryEvidence({ assignment: scope.assignment, claim_handle: handle, messages, results, effects: options.effects || [], controls, config: loadConfig(), context: verificationContext });
+      if (evidence.unsupported) core.info(`Claim ${handle}: durable delivery evidence not published (${evidence.unsupported})`);
+      else await publishDeliveryEvidence({ assignment: scope.assignment, claim_handle: handle, ...evidence, github: options.queueClient || github, context: verificationContext, core });
+    } catch (error) {
+      core.error(`Claim ${handle}: durable delivery evidence publication failed: ${getErrorMessage(error)}`);
+    }
+  }
   const controlProofs = new Map();
   const outcomes = [...results, ...controls.map((message, index) => ({ messageIndex: messages.length + index, success: true, claim_handle: handle, result: null }))];
   const queueControls = require("./work_queue_control_receipts.cjs");
@@ -2133,6 +2161,19 @@ async function main(options = {}) {
             );
           },
         };
+        try {
+          const contract = validateDeliveryContract(scope.assignment.claims.find(claim => claim.handle === handle).work.effect_contract);
+          const known = new Set(contract.outputs.map(output => normalizeSafeOutputName(output.type)));
+          const undeclared = [...new Set(scopedMessages.map(message => normalizeSafeOutputName(message.type)).filter(type => !known.has(type) && !(contract.no_writes === true && NO_WRITE_TYPES.has(type))))];
+          if (undeclared.length > 0 && !isStagedMode()) {
+            core.warning(`Claim ${handle}: refusing ${scopedMessages.length} scoped output(s); undeclared type(s): ${undeclared.join(", ")}`);
+            const delivery = await withClaimExecution({ ...scope, claim_handle: handle, authorize, effects }, () => settleClaimDelivery(scope, scopedMessages, [], claimOptions));
+            settlements.push({ claim_handle: handle, success: false, error: `Undeclared output type(s) in immutable effect_contract: ${undeclared.join(", ")}`, delivery });
+            continue;
+          }
+        } catch {
+          // Delivery settlement reports invalid immutable contracts.
+        }
         const settlement = await withClaimExecution({ ...scope, claim_handle: handle, authorize, effects }, () =>
           withClaimEffectClients({ claim_handle: handle, authorize, authorizeGithub: unscopedGithub, context }, async () => {
             try {
@@ -2187,6 +2228,8 @@ async function main(options = {}) {
     if (!isStagedMode()) {
       for (const settlement of settlements) {
         const result = finalized?.claims?.[settlement.claim_handle];
+        const delivery = settlement.delivery;
+        const attestationRefused = delivery?.verification === "verified" && delivery.attestation?.recorded === false;
         if (["result", "cancelled"].includes(result?.state)) continue;
         await withClaimExecution({ ...scope, claim_handle: settlement.claim_handle, authorize: options.authorize }, () =>
           recordSafeOutputFailure(
@@ -2197,7 +2240,16 @@ async function main(options = {}) {
                 {
                   type: "claim_delivery",
                   errorCode: result?.reason || (result?.state === "delivery_failed" ? "delivery_failed" : "verification_unresolved"),
-                  error: settlement.delivery?.reason || settlement.error || "Independent delivery verification is unavailable",
+                  error:
+                    delivery?.reason ||
+                    settlement.error ||
+                    (attestationRefused
+                      ? "Verified settlement receipt was not attested"
+                      : delivery?.verification === "verified"
+                        ? "Verified settlement was not re-verified by the trusted finalizer"
+                        : "Independent delivery verification is unavailable"),
+                  ...(delivery?.diagnostics ? { diagnostics: delivery.diagnostics } : attestationRefused ? { diagnostics: { event: "delivery.receipt.not_recorded", ...delivery.attestation } } : {}),
+                  ...(result?.verifier ? { verifier: result.verifier } : {}),
                 },
               ],
             },

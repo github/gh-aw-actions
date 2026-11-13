@@ -384,7 +384,9 @@ function sanitizeUrlProtocols(s) {
   //                   another protocol name (e.g. "ttps://" inside "https://…").
   //   (?!https://)  — negative lookahead: explicitly excludes https://, which is
   //                   passed through to sanitizeUrlDomains for domain filtering.
-  let result = normalized.replace(/(?<![a-z0-9])(?!https:\/\/)([a-z][a-z0-9+.-]*)(:\/\/)([\w.-]*)([^\s]*)/gi, (_match, scheme, _slashes, domain, _rest) => {
+  // URL redaction must leave HTML attribute quotes and tag boundaries intact:
+  // attribute stripping has already run, so deleting them could pull prose into a tag.
+  let result = normalized.replace(/(?<![a-z0-9])(?!https:\/\/)([a-z][a-z0-9+.-]*)(:\/\/)([\w.-]*)([^\s"'<>]*)/gi, (_match, scheme, _slashes, domain, _rest) => {
     const fullMatch = _match;
     if (!domain) {
       // No host present (e.g. "file:///path" or bare "http://"). Use the scheme
@@ -407,7 +409,7 @@ function sanitizeUrlProtocols(s) {
   // For schemes that do not use "//", a targeted blocklist is used because a
   // fully general single-colon pattern produces too many false positives
   // (e.g. "key:value" in YAML, "std::vector" in C++, "C:\path" on Windows).
-  return result.replace(/(?:data|javascript|vbscript|about|mailto|tel|magnet):[^\s]+/gi, match => {
+  return result.replace(/(?:data|javascript|vbscript|about|mailto|tel|magnet):(?=[^\s])[^\s"'<>]*/gi, match => {
     const protocolMatch = match.match(/^([^:]+):/);
     if (protocolMatch) {
       const protocol = protocolMatch[1] + ":";
@@ -441,7 +443,7 @@ function sanitizeUrlDomains(s, allowed) {
   // 3. Allow optional port (:8080)
   // 4. Allow optional path and query string (but not trailing commas/periods)
   // 5. Stop before another https:// URL in query params (using negative lookahead)
-  const httpsUrlRegex = /https:\/\/([\w.-]+(?::\d+)?)(\/(?:(?!https:\/\/)[^\s,])*)?/gi;
+  const httpsUrlRegex = /https:\/\/([\w.-]+(?::\d+)?)(\/(?:(?!https:\/\/)[^\s,"'<>])*)?/gi;
 
   /**
    * Shared domain-allowlist check and redaction logic.
@@ -454,7 +456,26 @@ function sanitizeUrlDomains(s, allowed) {
     const hostname = hostnameWithPort.split(":")[0].toLowerCase();
 
     // Check if domain is in the allowed list or is a subdomain of an allowed domain
-    const isAllowed = allowed.some(allowedDomain => {
+    if (isHostnameAllowed(hostname)) {
+      return match; // Keep the full URL as-is
+    } else {
+      // Redact the domain but preserve the protocol and structure for debugging
+      // A redacted www. hostname must not itself become a GFM autolink.
+      const sanitized = sanitizeDomainName(hostname).replace(/^www\./i, "www[.]");
+      const truncated = hostname.length > 12 ? hostname.substring(0, 12) + "..." : hostname;
+      core.info(`Redacted URL: ${truncated}`);
+      addRedactedDomain(hostname);
+      // Return sanitized domain format
+      return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
+    }
+  }
+
+  /**
+   * @param {string} hostname
+   * @returns {boolean}
+   */
+  function isHostnameAllowed(hostname) {
+    return allowed.some(allowedDomain => {
       const normalizedAllowed = allowedDomain.toLowerCase();
 
       // Exact match
@@ -471,18 +492,6 @@ function sanitizeUrlDomains(s, allowed) {
       // Subdomain match (example.com matches subdomain.example.com)
       return hostname.endsWith("." + normalizedAllowed);
     });
-
-    if (isAllowed) {
-      return match; // Keep the full URL as-is
-    } else {
-      // Redact the domain but preserve the protocol and structure for debugging
-      const sanitized = sanitizeDomainName(hostname);
-      const truncated = hostname.length > 12 ? hostname.substring(0, 12) + "..." : hostname;
-      core.info(`Redacted URL: ${truncated}`);
-      addRedactedDomain(hostname);
-      // Return sanitized domain format
-      return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
-    }
   }
 
   // Pass 1: handle angle-bracket autolinks and Slack mrkdwn links as a unit so
@@ -535,7 +544,7 @@ function sanitizeUrlDomains(s, allowed) {
   //   2: separator (// or a backslash variant)
   //   3: hostname (and optional port)
   //   4: optional path
-  const protoRelativeUrlRegex = new RegExp(`(^|${URL_START_DELIMITERS})([/\\\\]{2})([\\w.-]+(?::\\d+)?)((?:/(?:(?![/\\\\]{2})[^\\s,])*)?)`, "gi");
+  const protoRelativeUrlRegex = new RegExp(`(^|${URL_START_DELIMITERS})([/\\\\]{2})([\\w.-]+(?::\\d+)?)((?:/(?:(?![/\\\\]{2})[^\\s,"'<>])*)?)`, "gi");
 
   s = s.replace(protoRelativeUrlRegex, (match, prefix, _separator, hostnameWithPort, path = "") => {
     // Normalize the separator to "//" so a backslash form can never survive as
@@ -544,7 +553,173 @@ function sanitizeUrlDomains(s, allowed) {
     return prefix + applyDomainFilter(url, hostnameWithPort);
   });
 
-  return s;
+  /**
+   * @param {string} prefix
+   * @param {string} candidate
+   * @returns {string}
+   */
+  function filterWwwUrl(prefix, candidate) {
+    // Leave prose punctuation and unbalanced closing parentheses outside the URL.
+    const opening = (candidate.match(/\(/g) || []).length;
+    let closing = (candidate.match(/\)/g) || []).length;
+    let end = candidate.length;
+    while (end > 0) {
+      const last = candidate[end - 1];
+      if (last === ")" && closing > opening) closing--;
+      else if (!/[?!.,:;>*_~]/.test(last)) break;
+      end--;
+    }
+    const url = candidate.slice(0, end);
+    const suffix = candidate.slice(end);
+    let parsed;
+    try {
+      // GFM percent-encodes backslashes in autolink destinations. Keep them
+      // from being treated as URL path separators while validating the host.
+      parsed = new URL(`https://${url.replace(/\\/g, "%5C")}`);
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      core.info("Redacted invalid scheme-less www URL");
+      return prefix + "(redacted)" + suffix;
+    }
+
+    // URL parsing is authoritative for the actual host, including userinfo
+    // containing commas or backslashes. Remove all userinfo from allowed URLs
+    // before returning the original scheme-less form.
+    const authorityEnd = url.search(/[/?#]/);
+    const authority = url.slice(0, authorityEnd === -1 ? url.length : authorityEnd);
+    const userinfoEnd = authority.lastIndexOf("@");
+    const cleanUrl = userinfoEnd === -1 ? url : url.slice(userinfoEnd + 1);
+    const hostname = parsed.hostname.toLowerCase();
+    if (isHostnameAllowed(hostname)) {
+      return prefix + cleanUrl + suffix;
+    }
+
+    core.info("Redacted scheme-less www URL");
+    addRedactedDomain(hostname);
+    const sanitized = sanitizeDomainName(hostname).replace(/^www\./i, "www[.]");
+    return prefix + (sanitized ? `(${sanitized}/redacted)` : "(redacted)") + suffix;
+  }
+
+  // Scan URLs and www. candidates once from left to right. Explicit HTTPS URLs
+  // are skipped only to a Markdown boundary, or through their enclosing link
+  // destination, so emphasis and adjacent links cannot hide another autolink.
+  const urlOrWwwRegex = /https:\/\/|(^|[^a-z0-9])(www\.)/gi;
+  const parts = [];
+  const authorityUserinfoAt = new Uint8Array(s.length + 1);
+  const htmlTagAt = new Uint8Array(s.length);
+  const htmlTagQuotedAt = new Uint8Array(s.length);
+  const maxHtmlTagLength = 4096;
+  let inHtmlTag = false;
+  let htmlQuote = "";
+  let htmlTagStart = -1;
+  for (let i = 0; i < s.length; i++) {
+    const character = s[i];
+    if (inHtmlTag && ((/\r|\n/.test(character) && htmlQuote) || i - htmlTagStart >= maxHtmlTagLength)) {
+      inHtmlTag = false;
+      htmlQuote = "";
+      htmlTagStart = -1;
+    }
+    if (!inHtmlTag && character === "<" && /[a-z]/i.test(s[i + 1] || "")) {
+      let tagNameEnd = i + 2;
+      while (/[a-z0-9:-]/i.test(s[tagNameEnd] || "")) tagNameEnd++;
+      if (/[\s/>]/.test(s[tagNameEnd] || "")) {
+        inHtmlTag = true;
+        htmlTagStart = i;
+      }
+    }
+    if (!inHtmlTag) continue;
+    htmlTagAt[i] = 1;
+    htmlTagQuotedAt[i] = htmlQuote ? 1 : 0;
+    if (htmlQuote) {
+      if (character === htmlQuote) htmlQuote = "";
+    } else if (character === '"' || character === "'") {
+      htmlQuote = character;
+    } else if (character === ">") {
+      inHtmlTag = false;
+      htmlTagStart = -1;
+    }
+  }
+  let hasAuthorityUserinfo = false;
+  for (let i = s.length - 1; i >= 0; i--) {
+    const character = s[i];
+    if (character === "/" || character === "?" || character === "#" || character === "|" || character === "[" || character === "]" || /\s/.test(character)) {
+      hasAuthorityUserinfo = false;
+    } else if (character === "@") {
+      hasAuthorityUserinfo = true;
+    }
+    authorityUserinfoAt[i] = hasAuthorityUserinfo ? 1 : 0;
+  }
+  let position = 0;
+  let match;
+  while ((match = urlOrWwwRegex.exec(s))) {
+    parts.push(s.slice(position, match.index));
+    if (match[0].toLowerCase() === "https://") {
+      const destinationPrefix = /\]\(\s*$/.test(s.slice(position, match.index));
+      let end = match.index + match[0].length;
+      let depth = 0;
+      for (; end < s.length; end++) {
+        const character = s[end];
+        if (character === "\\" && end + 1 < s.length) {
+          end++;
+        } else if (character === "(") {
+          depth++;
+        } else if (character === ")") {
+          if (depth === 0) {
+            if (destinationPrefix) end++;
+            break;
+          }
+          depth--;
+        } else if (destinationPrefix && character === "]") {
+          break;
+        } else if (!destinationPrefix && /[\s<>`*~|\[\]]/.test(character)) {
+          break;
+        }
+      }
+      parts.push(s.slice(match.index, end));
+      position = end;
+      urlOrWwwRegex.lastIndex = end;
+    } else {
+      const prefix = match[1];
+      const candidateStart = match.index + match[0].length - match[2].length;
+      const hasAuthorityUserinfo = authorityUserinfoAt[candidateStart] === 1;
+      const isHtmlTagCandidate = htmlTagAt[candidateStart] === 1;
+      let end = candidateStart;
+      let depth = 0;
+      let inAuthority = true;
+      for (; end < s.length; end++) {
+        const character = s[end];
+        // GFM permits ">" inside a userinfo authority, but HTML tag candidates
+        // must stop there even when later prose contains "@".
+        if (
+          /[\s|\[\]]/.test(character) ||
+          (isHtmlTagCandidate && /["']/.test(character) && !hasAuthorityUserinfo) ||
+          (/[<>]/.test(character) && (isHtmlTagCandidate ? !htmlTagQuotedAt[end] : !inAuthority || !hasAuthorityUserinfo)) ||
+          (/["']/.test(character) && (!inAuthority || !hasAuthorityUserinfo))
+        ) {
+          break;
+        } else if (character === "\\" && end + 1 < s.length && !/["'<>]/.test(s[end + 1])) {
+          end++;
+        } else if (character === "`" && (!inAuthority || !hasAuthorityUserinfo || prefix === "`")) {
+          break;
+        } else if (character === "(") {
+          depth++;
+        } else if (character === ")") {
+          if (depth === 0) break;
+          depth--;
+        } else if (character === "/" || character === "?" || character === "#") {
+          inAuthority = false;
+        } else if (/[*_~]/.test(character) && s.slice(end + 1, end + 5).toLowerCase() === "www.") {
+          break;
+        }
+      }
+      const candidate = s.slice(candidateStart, end);
+      parts.push(prefix + filterWwwUrl("", candidate));
+      position = end;
+      urlOrWwwRegex.lastIndex = end;
+    }
+  }
+
+  return parts.join("") + s.slice(position);
 }
 
 /**
@@ -1051,66 +1226,169 @@ function convertXmlTags(s) {
     return /^https:\/\/[\w.-]+(?::\d+)?(\/[^\s<>|]*)?(?:\|[^<>]*)?$/.test(tagContent);
   }
 
-  // First, process CDATA sections specially - convert tags inside them and the CDATA markers
-  s = s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (match, content) => {
-    // Convert tags inside CDATA content
-    const convertedContent = content.replace(/<(\/?[A-Za-z][A-Za-z0-9]*(?:[^>]*?))>/g, "($1)");
-    // Return with CDATA markers also converted to parentheses
+  function createTagScanner(source) {
+    const length = source.length;
+    const normal = new Int32Array(length + 1);
+    const expectValue = new Int32Array(length + 1);
+    const unquotedValue = new Int32Array(length + 1);
+    const singleQuotedValue = new Int32Array(length + 1);
+    const doubleQuotedValue = new Int32Array(length + 1);
+    const nextGreaterThan = new Int32Array(length + 1);
+    nextGreaterThan[length] = -1;
+
+    for (let index = length - 1; index >= 0; index--) {
+      const character = source[index];
+      nextGreaterThan[index] = character === ">" ? index : nextGreaterThan[index + 1];
+
+      normal[index] = character === ">" ? index + 1 : character === "=" ? expectValue[index + 1] : normal[index + 1];
+      if (/\s/.test(character)) {
+        expectValue[index] = expectValue[index + 1];
+        unquotedValue[index] = normal[index + 1];
+      } else if (character === ">") {
+        expectValue[index] = index + 1;
+        unquotedValue[index] = index + 1;
+      } else {
+        expectValue[index] = character === "'" ? singleQuotedValue[index + 1] : character === '"' ? doubleQuotedValue[index + 1] : unquotedValue[index + 1];
+        unquotedValue[index] = unquotedValue[index + 1];
+      }
+
+      singleQuotedValue[index] = character === "'" ? normal[index + 1] : singleQuotedValue[index + 1] > 0 ? singleQuotedValue[index + 1] : character === ">" ? -(index + 1) : singleQuotedValue[index + 1];
+      doubleQuotedValue[index] = character === '"' ? normal[index + 1] : doubleQuotedValue[index + 1] > 0 ? doubleQuotedValue[index + 1] : character === ">" ? -(index + 1) : doubleQuotedValue[index + 1];
+    }
+
+    return {
+      nextGreaterThan,
+      findTagEnd(start) {
+        const result = normal[start + 1];
+        return result > 0 ? { end: result - 1, malformed: false } : result < 0 ? { end: -result - 1, malformed: true } : { end: -1, malformed: false };
+      },
+    };
+  }
+
+  /**
+   * Applies a transformation to tag-like markup while respecting quoted values.
+   * @param {string} source
+   * @param {(tagContent: string, match: string, malformed: boolean) => string} transform
+   * @param {boolean} [preserveAutolinks]
+   * @returns {string}
+   */
+  function replaceTagMarkup(source, transform, preserveAutolinks = false) {
+    const scanner = createTagScanner(source);
+    let output = "";
+    let written = 0;
+    for (let index = 0; index < source.length; index++) {
+      if (source[index] !== "<") continue;
+      const firstCharacter = source[index + 1] === "/" ? source[index + 2] : source[index + 1];
+      if (!firstCharacter || !/[A-Za-z!]/.test(firstCharacter)) continue;
+
+      const firstGreaterThan = scanner.nextGreaterThan[index + 1];
+      if (preserveAutolinks && firstGreaterThan >= 0 && isHttpsAngleBracketAutolink(source.slice(index + 1, firstGreaterThan))) {
+        output += source.slice(written, firstGreaterThan + 1);
+        written = firstGreaterThan + 1;
+        index = firstGreaterThan;
+        continue;
+      }
+
+      const boundary = scanner.findTagEnd(index);
+      if (boundary.end < 0) {
+        output += source.slice(written, index + 1);
+        written = index + 1;
+        continue;
+      }
+      const end = boundary.end + 1;
+      const match = source.slice(index, end);
+      const tagContent = source.slice(index + 1, boundary.end);
+      output += source.slice(written, index) + transform(tagContent, match, boundary.malformed);
+      written = end;
+      index = boundary.end;
+    }
+    return written ? output + source.slice(written) : source;
+  }
+
+  function escapeAngleBrackets(text) {
+    return text.replace(/[<>]/g, character => (character === "<" ? "&lt;" : "&gt;"));
+  }
+
+  /**
+   * Strips on* event handlers, style, title, and data-* attributes from tag content.
+   * Attribute values are consumed as quoted or unquoted tokens before the next
+   * attribute is considered, including when a quoted value is immediately followed
+   * by another attribute without whitespace.
+   * @param {string} tagContent
+   * @returns {string}
+   */
+  function stripDangerousAttributes(tagContent) {
+    const tagNameMatch = tagContent.match(/^\/?\s*([A-Za-z][A-Za-z0-9]*)/);
+    if (!tagNameMatch) return tagContent;
+
+    let position = tagNameMatch[0].length;
+    let written = 0;
+    let output = "";
+    while (position < tagContent.length) {
+      const separatorStart = position;
+      while (position < tagContent.length && (/\s/.test(tagContent[position]) || tagContent[position] === "/")) {
+        position++;
+      }
+      if (position >= tagContent.length) break;
+
+      const nameStart = position;
+      while (position < tagContent.length && !/[\s/=>"'`<]/.test(tagContent[position])) {
+        position++;
+      }
+      if (position === nameStart) {
+        position++;
+        continue;
+      }
+      const attributeName = tagContent.slice(nameStart, position);
+      let attributeEnd = position;
+      let valueStart = position;
+      while (valueStart < tagContent.length && /\s/.test(tagContent[valueStart])) valueStart++;
+      if (tagContent[valueStart] === "=") {
+        valueStart++;
+        while (valueStart < tagContent.length && /\s/.test(tagContent[valueStart])) valueStart++;
+        if (tagContent[valueStart] === '"' || tagContent[valueStart] === "'") {
+          const quote = tagContent[valueStart];
+          const closingQuote = tagContent.indexOf(quote, valueStart + 1);
+          attributeEnd = closingQuote < 0 ? tagContent.length : closingQuote + 1;
+        } else {
+          attributeEnd = valueStart;
+          while (attributeEnd < tagContent.length && !/\s/.test(tagContent[attributeEnd])) {
+            attributeEnd++;
+          }
+        }
+      }
+
+      if (/^(?:on\w+|style$|title$|data-)/i.test(attributeName)) {
+        output += tagContent.slice(written, separatorStart);
+        written = attributeEnd;
+      }
+      position = Math.max(attributeEnd, position);
+    }
+    return written ? output + tagContent.slice(written) : tagContent;
+  }
+
+  // Convert tags inside CDATA sections, then convert the CDATA markers themselves.
+  s = s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_match, content) => {
+    const convertedContent = replaceTagMarkup(content, tagContent => `(${escapeAngleBrackets(tagContent)})`);
     return `(![CDATA[${convertedContent}]])`;
   });
 
-  /**
-   * Strips dangerous HTML attributes from an allowed tag's content string.
-   * Removes on* event handler attributes (e.g. onclick, ontoggle), style,
-   * title, and data-* attributes in all quoting forms (double-quoted,
-   * single-quoted, unquoted, bare).
-   *
-   * title= and data-* are stripped because their values are invisible in
-   * GitHub's rendered markdown (title= appears only as a hover-tooltip;
-   * data-* attributes are stripped by GFM's sanitizer) but arrive at the
-   * agent verbatim in raw text, creating a steganographic injection channel
-   * structurally identical to the one fixed for markdown link titles.
-   *
-   * Safe attributes such as class, open, lang, id, etc. are preserved.
-   *
-   * Note: `\s+` (requiring at least one whitespace before the attribute name) is
-   * intentional — HTML attributes are always separated from the tag name and from
-   * each other by at least one whitespace character. Using `\s*` would risk false
-   * matches inside tag names (e.g. matching "ong" inside "strong").
-   *
-   * @param {string} tagContent - Tag content without surrounding angle brackets
-   * @returns {string} Tag content with dangerous attributes removed
-   */
-  function stripDangerousAttributes(tagContent) {
-    // Match: one-or-more whitespace-or-slash + (on* | style | title | data-*) + optional =value
-    // Value forms: "...", '...', or unquoted (no whitespace / > / quote chars), or bare (no =)
-    // The unquoted form excludes >, whitespace, and all quote characters (', ", `) so it
-    // cannot consume the closing > of the tag or straddle other attribute values.
-    // Using [\s/]+ (instead of \s+) also strips dangerous attributes that are immediately
-    // preceded by a "/" with no space — e.g. the malformed <img/onerror=alert(1) src=x>.
-    return tagContent.replace(/[\s/]+(?:on\w+|style|title|data-[\w-]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>"'`]*))?/gi, "");
-  }
+  // Convert opening, closing, and self-closing tags while retaining only allowed tags.
+  // Malformed quoted markup is always neutralized rather than repaired into an allowed tag.
+  return replaceTagMarkup(
+    s,
+    (tagContent, match, malformed) => {
+      if (malformed) return `(${escapeAngleBrackets(tagContent)})`;
 
-  // Convert opening tags: <tag> or <tag attr="value"> to (tag) or (tag attr="value")
-  // Convert closing tags: </tag> to (/tag)
-  // Convert self-closing tags: <tag/> or <tag /> to (tag/) or (tag /)
-  // But preserve allowed safe tags (with dangerous attributes stripped)
-  return s.replace(/<(\/?[A-Za-z!][^>]*?)>/g, (match, tagContent) => {
-    if (isHttpsAngleBracketAutolink(tagContent)) {
-      return match;
-    }
-    // Extract tag name from the content (handle closing tags and attributes)
-    const tagNameMatch = tagContent.match(/^\/?\s*([A-Za-z][A-Za-z0-9]*)/);
-    if (tagNameMatch) {
-      const tagName = tagNameMatch[1].toLowerCase();
-      if (allowedTags.includes(tagName)) {
-        // Strip dangerous attributes (on* event handlers, style, title, data-*) before preserving
-        const sanitizedContent = stripDangerousAttributes(tagContent);
-        return `<${sanitizedContent}>`;
+      const tagNameMatch = tagContent.match(/^\/?\s*([A-Za-z][A-Za-z0-9]*)/);
+      const tagNameDelimiter = tagNameMatch ? tagContent[tagNameMatch[0].length] : undefined;
+      if (tagNameMatch && (tagNameDelimiter === undefined || /[\s/]/.test(tagNameDelimiter)) && allowedTags.includes(tagNameMatch[1].toLowerCase())) {
+        return `<${stripDangerousAttributes(tagContent)}>`;
       }
-    }
-    return `(${tagContent})`; // Convert other tags to parentheses
-  });
+      return `(${escapeAngleBrackets(tagContent)})`;
+    },
+    true
+  );
 }
 
 /**

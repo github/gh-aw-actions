@@ -48,6 +48,13 @@ for arg in "$@"; do
     esac
 done
 
+AUTH_CURL_ARGS=()
+if [ -n "${GH_TOKEN:-}" ]; then
+    AUTHORIZATION_HEADER="Authorization: Bearer "
+    AUTHORIZATION_HEADER+="$GH_TOKEN"
+    AUTH_CURL_ARGS=(-H "$AUTHORIZATION_HEADER")
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -223,11 +230,7 @@ if [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)$ ]]; then
     while :; do
         RELEASES_URL="https://api.github.com/repos/$REPO/releases?per_page=$PER_PAGE&page=$PAGE"
         RELEASES_CURL_ARGS=(-sLf --connect-timeout 15 --max-time 30 -H "Accept: application/vnd.github+json" -H "User-Agent: gh-aw-install-gh-aw.sh" -H "X-GitHub-Api-Version: 2022-11-28")
-        if [ -n "${GH_TOKEN:-}" ]; then
-            AUTHORIZATION_HEADER="Authorization: Bearer "
-            AUTHORIZATION_HEADER+="$GH_TOKEN"
-            RELEASES_CURL_ARGS+=(-H "$AUTHORIZATION_HEADER")
-        fi
+        RELEASES_CURL_ARGS+=("${AUTH_CURL_ARGS[@]}")
         if ! RELEASES_RESPONSE=$(curl "${RELEASES_CURL_ARGS[@]}" "$RELEASES_URL"); then
             print_error "Failed to resolve stable releases for version channel $VERSION from GitHub API."
             exit 1
@@ -344,8 +347,27 @@ if [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)$ ]]; then
     VERSION="$BEST_TAG"
 fi
 
+cleanup_install() {
+    if [ -n "${GH_INSTALL_LOG_DIR:-}" ]; then
+        rm -rf -- "$GH_INSTALL_LOG_DIR"
+    fi
+    if [ -n "${STAGING_DIR:-}" ]; then
+        rm -rf -- "$STAGING_DIR"
+    fi
+}
+GH_INSTALL_LOG_DIR=""
+STAGING_DIR=""
+trap cleanup_install EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Try gh extension install if requested (and gh is available)
 if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
+    if ! GH_INSTALL_LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gh-aw-install-log.XXXXXX"); then
+        print_error "Failed to create temporary gh extension install log directory."
+        exit 1
+    fi
+    GH_INSTALL_LOG="$GH_INSTALL_LOG_DIR/gh-install.log"
     print_info "Attempting to install gh-aw using 'gh extension install'..."
 
     # On Windows, `gh extension install` has been observed to hang for the full
@@ -364,11 +386,11 @@ if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
     install_result=0
     if [ -n "$VERSION" ] && [ "$VERSION" != "latest" ]; then
         # shellcheck disable=SC2086  # GH_INSTALL_CMD_TIMEOUT is intentionally unquoted
-        $GH_INSTALL_CMD_TIMEOUT gh extension install "$REPO" --force --pin "$VERSION" 2>&1 | tee /tmp/gh-install.log
+        $GH_INSTALL_CMD_TIMEOUT gh extension install "$REPO" --force --pin "$VERSION" 2>&1 | tee "$GH_INSTALL_LOG"
         install_result=${PIPESTATUS[0]}
     else
         # shellcheck disable=SC2086  # GH_INSTALL_CMD_TIMEOUT is intentionally unquoted
-        $GH_INSTALL_CMD_TIMEOUT gh extension install "$REPO" --force 2>&1 | tee /tmp/gh-install.log
+        $GH_INSTALL_CMD_TIMEOUT gh extension install "$REPO" --force 2>&1 | tee "$GH_INSTALL_LOG"
         install_result=${PIPESTATUS[0]}
     fi
 
@@ -413,9 +435,6 @@ if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
         fi
     else
         print_warning "gh extension install failed, falling back to manual installation..."
-        if [ -f /tmp/gh-install.log ]; then
-            cat /tmp/gh-install.log
-        fi
     fi
 elif [ "$TRY_GH_INSTALL" = true ]; then
     print_info "gh CLI not available, proceeding with manual installation..."
@@ -439,7 +458,7 @@ LATEST_TAG=""
 FALLBACK_DOWNLOAD_URL=""
 FALLBACK_CHECKSUMS_URL=""
 if [ "$VERSION" = "latest" ]; then
-    if LATEST_RELEASE_RESPONSE=$(curl -sLf --connect-timeout 15 --max-time 30 "https://api.github.com/repos/$REPO/releases/latest"); then
+    if LATEST_RELEASE_RESPONSE=$(curl -sLf --connect-timeout 15 --max-time 30 "${AUTH_CURL_ARGS[@]}" "https://api.github.com/repos/$REPO/releases/latest"); then
         LATEST_TAG=$(printf '%s' "$LATEST_RELEASE_RESPONSE" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
     else
         print_warning "Failed to resolve latest release tag from GitHub API."
@@ -479,9 +498,6 @@ if ! STAGING_DIR=$(mktemp -d "$INSTALL_DIR/.gh-aw-install.XXXXXX"); then
 fi
 STAGED_BINARY_PATH="$STAGING_DIR/$BINARY_NAME"
 CHECKSUMS_PATH="$STAGING_DIR/checksums.txt"
-trap 'rm -rf -- "$STAGING_DIR"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 # Download the binary with retry logic
 print_info "Downloading gh-aw binary..."
@@ -492,7 +508,7 @@ download_binary_with_retry() {
     local delay="$RETRY_DELAY"
 
     for attempt in $(seq 1 $MAX_RETRIES); do
-        if curl -L -f --connect-timeout 15 --max-time 120 -o "$STAGED_BINARY_PATH" "$url"; then
+        if curl "${AUTH_CURL_ARGS[@]}" -L -f --connect-timeout 15 --max-time 120 -o "$STAGED_BINARY_PATH" "$url"; then
             print_success "Binary downloaded successfully"
             return 0
         fi
@@ -503,6 +519,14 @@ download_binary_with_retry() {
             delay=$((delay * 2))
         fi
     done
+
+    if [ "${#AUTH_CURL_ARGS[@]}" -gt 0 ]; then
+        print_warning "Authenticated download failed; retrying binary download without authentication."
+        if curl -L -f --connect-timeout 15 --max-time 120 -o "$STAGED_BINARY_PATH" "$url"; then
+            print_success "Binary downloaded successfully"
+            return 0
+        fi
+    fi
 
     return 1
 }
@@ -530,7 +554,7 @@ if [ "$SKIP_CHECKSUM" = false ]; then
     download_checksums_with_retry() {
         local url="$1"
         for attempt in $(seq 1 $MAX_RETRIES); do
-            if curl -L -f --connect-timeout 15 --max-time 60 -o "$CHECKSUMS_PATH" "$url" 2>/dev/null; then
+            if curl "${AUTH_CURL_ARGS[@]}" -L -f --connect-timeout 15 --max-time 60 -o "$CHECKSUMS_PATH" "$url" 2>/dev/null; then
                 print_success "Checksums file downloaded successfully"
                 return 0
             fi
@@ -539,6 +563,13 @@ if [ "$SKIP_CHECKSUM" = false ]; then
                 sleep 2
             fi
         done
+        if [ "${#AUTH_CURL_ARGS[@]}" -gt 0 ]; then
+            print_warning "Authenticated download failed; retrying checksums download without authentication."
+            if curl -L -f --connect-timeout 15 --max-time 60 -o "$CHECKSUMS_PATH" "$url" 2>/dev/null; then
+                print_success "Checksums file downloaded successfully"
+                return 0
+            fi
+        fi
         return 1
     }
 

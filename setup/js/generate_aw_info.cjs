@@ -9,10 +9,11 @@ const { validateContextVariables } = require("./validate_context_variables.cjs")
 const validateLockdownRequirements = require("./validate_lockdown_requirements.cjs");
 const { writeMergedModelsJSON } = require("./merge_frontmatter_models.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { GITHUB_API_QUOTA_EXHAUSTED, getGitHubAPIQuotaExhaustion, formatGitHubAPIQuotaDetails, writeGitHubAPIQuotaSummary } = require("./github_api_quota.cjs");
 const { ERR_CONFIG, ERR_SYSTEM } = require("./error_codes.cjs");
 const { buildWorkflowCallId, normalizeLegacyWorkQueueContext, normalizeWorkQueueContext, resolveWorkQueueRuntime, readInboundAwContext } = require("./aw_context.cjs");
 const { normalizeWebhookContext } = require("./webhook_context.cjs");
-const { normalizeEngineHarness, parseCompiledModelConfig } = require("./routing_analytics.cjs");
+const { isRouterModelValue, normalizeEngineHarness, parseCompiledModelConfig, ROUTER_MODEL_VALUES } = require("./routing_analytics.cjs");
 
 /**
  * Generate aw_info.json with workflow run metadata.
@@ -28,9 +29,10 @@ const { normalizeEngineHarness, parseCompiledModelConfig } = require("./routing_
  * @param {typeof import('@actions/core')} core - GitHub Actions core library
  * @param {any} ctx - GitHub Actions context object
  * @param {any} [githubClient] - Authenticated GitHub client; falls back to global.github
+ * @param {{quotaWait?: {now?: () => number, sleep?: (ms: number) => Promise<void>, maxWaitMs?: number}}} [options] - Test seams for the bounded quota wait
  * @returns {Promise<void>}
  */
-async function main(core, ctx, githubClient) {
+async function main(core, ctx, githubClient, options = {}) {
   // Validate numeric context variables before processing run info.
   // This prevents malicious payloads from hiding special text or code in numeric fields.
   await validateContextVariables(core, ctx);
@@ -61,11 +63,30 @@ async function main(core, ctx, githubClient) {
   const workflowId = process.env.GH_AW_INFO_WORKFLOW_ID || "";
   if (!process.env.GH_AW_INFO_WORKFLOW_SHA) throw new Error("Executing compiler metadata requires GH_AW_INFO_WORKFLOW_SHA; recompile this workflow");
   const { loadMarkdownMetadata, metadataManifestFields } = require("./markdown_metadata.cjs");
-  const markdownMetadata = await loadMarkdownMetadata(workflowId, process.env.GITHUB_WORKSPACE || "", {
-    repository: ctx.repo ? `${ctx.repo.owner}/${ctx.repo.repo}` : undefined,
-    githubClient: githubClient || global.github,
-    revision: process.env.GH_AW_INFO_WORKFLOW_SHA,
-  });
+  let markdownMetadata;
+  try {
+    markdownMetadata = await loadMarkdownMetadata(workflowId, process.env.GITHUB_WORKSPACE || "", {
+      repository: ctx.repo ? `${ctx.repo.owner}/${ctx.repo.repo}` : undefined,
+      githubClient: githubClient || global.github,
+      revision: process.env.GH_AW_INFO_WORKFLOW_SHA,
+      quotaWait: options.quotaWait,
+    });
+  } catch (error) {
+    const quota = getGitHubAPIQuotaExhaustion(error);
+    if (!quota) throw error;
+    // No empty or unverified metadata fallback: activation is blocked with an
+    // explicit quota reason instead of an unexplained run-info failure.
+    const reason = /** @type {any} */ error.reason || "";
+    await writeGitHubAPIQuotaSummary({
+      stage: "Activation: Generate agentic run info (executing workflow lock manifest read)",
+      quota,
+      reason,
+      impact: `Activation is blocked; the agent did not start. Compiler metadata for the executing workflow revision could not be read and no unverified fallback was used. Check existing scheduled runs after ${quota.retryNotBefore || quota.reset || "the quota reset"} before retrying; do not queue simultaneous reruns.`,
+    });
+    const message = `${ERR_SYSTEM}: ${GITHUB_API_QUOTA_EXHAUSTED}; activation blocked until at least ${quota.retryNotBefore || quota.reset || "an unknown reset"} (${formatGitHubAPIQuotaDetails(quota)}${reason ? `; reason=${reason}` : ""}).`;
+    core.setFailed(message);
+    throw new Error(message, { cause: error });
+  }
 
   // Reject model names that contain an unresolved GitHub Actions expression.
   // This can happen when a vars.* expression was used for the model in the
@@ -73,6 +94,25 @@ async function main(core, ctx, githubClient) {
   // causing GitHub Actions to pass the literal expression string at runtime.
   if (/\$\{\{/.test(model)) {
     const message = `${ERR_CONFIG}: GH_AW_INFO_MODEL contains an unresolved GitHub Actions expression: ${JSON.stringify(model)}`;
+    core.setFailed(message);
+    throw new Error(message);
+  }
+
+  const modelConfig = parseCompiledModelConfig(process.env.GH_AW_INFO_MODEL_CONFIG, process.env.GH_AW_INFO_MAX_AI_CREDITS, message => core.warning(message));
+
+  // A router value (router, router/economy, ...) chooses model routing; it is not a
+  // model name. Router values are accepted only when written in the workflow, where
+  // the compiler turns them into routing. When the main agent's model is not routed
+  // for this run and a variable or expression resolves to a router value, stop before
+  // the agent starts instead of passing it to the engine as a model. When the model
+  // expression resolves empty, the harness uses the model-variable fallback
+  // (GH_AW_INFO_MODEL_FALLBACK mirrors GH_AW_MODEL_FALLBACK), so check that value.
+  const effectiveModel = model.trim() || (process.env.GH_AW_INFO_MODEL_FALLBACK || "").trim();
+  if (isRouterModelValue(effectiveModel) && modelConfig?.routing?.enabled !== true) {
+    const message =
+      `${ERR_CONFIG}: the main agent's model resolved to the router value ${JSON.stringify(effectiveModel)} at run time. ` +
+      `Router values (${[...ROUTER_MODEL_VALUES].join(", ")}) must be written in the workflow's model or engine.model and are not accepted from expressions or variables such as vars.GH_AW_MODEL_AGENT_<ENGINE> or vars.GH_AW_DEFAULT_MODEL_<ENGINE>. ` +
+      "Set a model name in the variable or expression, or write the router value in the workflow and recompile. See https://github.github.com/gh-aw/reference/model-routing/";
     core.setFailed(message);
     throw new Error(message);
   }
@@ -204,7 +244,6 @@ async function main(core, ctx, githubClient) {
     awInfo.server_url = serverUrl;
   }
   // Configured routing, model policy and budget, published even when routing is disabled or later fails.
-  const modelConfig = parseCompiledModelConfig(process.env.GH_AW_INFO_MODEL_CONFIG, process.env.GH_AW_INFO_MAX_AI_CREDITS, message => core.warning(message));
   if (modelConfig) {
     awInfo.model_config = modelConfig;
   }

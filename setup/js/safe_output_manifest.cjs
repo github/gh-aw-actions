@@ -38,6 +38,7 @@ const MERGE_FAILURE_CODES = new Set([
   "blocking_individual_review",
   "required_approval_missing",
   "manual_review_caution",
+  "protected_files_modified",
   "blocking_review_state",
   "unresolved_review_threads",
   "merge_not_completed",
@@ -405,7 +406,8 @@ function extractCreatedItemFromResult(type, result) {
   const url = result.url || result.projectUrl || result.html_url || result.pull_request_url || result.review_url || result.issue_url;
   const number = result.number ?? result.pull_request_number ?? result.prNumber ?? result.issue_number ?? result.itemNumber;
   const repo = result.repo || result._repo;
-  const provider = result.provider || result.metadata?.provider || (type.startsWith("jira_") ? "jira" : type.startsWith("linear_") ? "linear" : type.startsWith("ado_") ? "azure-devops" : "github");
+  const connector = typeof result.connector === "string" && result.connector ? result.connector : undefined;
+  const provider = result.provider || result.metadata?.provider || connector || "github";
   const id = result.id ?? result.commentId ?? result.comment_id ?? result.review_id ?? result.issue_id;
   const identifier = result.identifier ?? result.issue_key;
   // result.target may be a scalar provider-specific identifier (e.g. Linear issue key "ENG-123")
@@ -476,6 +478,17 @@ function writeTemporaryIdMapFile(temporaryIdMap, filePath = TEMPORARY_ID_MAP_FIL
   }
 }
 
+const DIAGNOSTIC_IDENTIFIER = /^[a-z0-9_.:-]{1,64}$/;
+
+function safeFailureDiagnostics(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  return Object.values(value).every(item => {
+    if (typeof item === "boolean" || Number.isSafeInteger(item)) return true;
+    if (typeof item === "string") return DIAGNOSTIC_IDENTIFIER.test(item);
+    return Array.isArray(item) && item.length <= 32 && item.every(entry => typeof entry === "string" && DIAGNOSTIC_IDENTIFIER.test(entry));
+  });
+}
+
 /**
  * Write a structured safe-output error report for artifact upload.
  *
@@ -488,7 +501,7 @@ function writeTemporaryIdMapFile(temporaryIdMap, filePath = TEMPORARY_ID_MAP_FIL
  * after redaction succeeds for Claim workers), so failures of the "Process
  * Safe Outputs" step remain diagnosable without uploading raw error text.
  *
- * @param {{status?: string, errorCode?: string, message?: string, failures?: Array<{type?: string, errorCode?: string, error?: string}>}} report - Failure diagnostics
+ * @param {{status?: string, errorCode?: string, message?: string, failures?: Array<{type?: string, errorCode?: string, error?: string, verifier?: string, diagnostics?: Record<string, boolean | number | string | string[]>}>}} report - Failure diagnostics
  * @param {string} [filePath] - Path to the output file (defaults to SAFE_OUTPUT_ERRORS_FILE_PATH)
  */
 function writeSafeOutputErrorReport(report, filePath = SAFE_OUTPUT_ERRORS_FILE_PATH) {
@@ -507,6 +520,8 @@ function writeSafeOutputErrorReport(report, filePath = SAFE_OUTPUT_ERRORS_FILE_P
           ...(f?.type ? { type: f.type } : {}),
           ...(f?.errorCode ? { errorCode: f.errorCode } : {}),
           ...(f?.error ? { error: f.error } : {}),
+          ...(typeof f?.verifier === "string" && /^[a-z0-9_.-]{1,64}$/.test(f.verifier) ? { verifier: f.verifier } : {}),
+          ...(safeFailureDiagnostics(f?.diagnostics) ? { diagnostics: f.diagnostics } : {}),
         }))
       : [],
   };

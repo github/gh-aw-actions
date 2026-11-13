@@ -221,6 +221,8 @@ export interface ModelConfigData {
     enabled: boolean;
     goal?: string;
     mode?: string;
+    /** Router value the workflow set as its model (for example `router/economy`); absent when routing comes from `engine.model-routing` or the implicit default. */
+    requested?: "router" | "router/economy" | "router/balanced" | "router/robust";
     /** Native routing provider (`anthropic` or `openai`) sent to AWF as `apiProxy.routing.provider`; absent for GitHub Copilot routing. */
     provider?: "anthropic" | "openai";
     /** Configured routing candidates as authored (exact ids or gh-aw aliases) without provider prefix; absent means the router default or unknown. */
@@ -525,6 +527,7 @@ export type HarnessFailureClass =
   | "copilot_model_verification"
   | "overloaded_error"
   | "rate_limit_error"
+  | "rate_limit_wait_exceeded"
   | "max_turns"
   | "no_deferred_marker"
   | "invalid_model"
@@ -638,7 +641,7 @@ export interface AdmissionDecisionData {
 }
 
 export interface DailyAICDecisionData {
-  status: "disabled" | "skipped" | "under_budget" | "exceeded" | "structural_error" | "transient_error";
+  status: "disabled" | "skipped" | "under_budget" | "exceeded" | "structural_error" | "transient_error" | "quota_blocked";
   exceeded?: boolean;
   total?: number;
   estimated?: number;
@@ -774,8 +777,8 @@ export interface UnifiedSessionEventDataMap {
   "skill.context_delivered_ref": { interactionId?: JsonValue; source?: JsonValue; contentId?: JsonValue };
   "session.format": SessionFileFormatData;
   "agent.execution": AgentExecutionData;
-  "session.init": Pick<SessionInitData, "sourceEngine" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
-  "session.start": Pick<SessionInitData, "sourceEngine" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
+  "session.init": Pick<SessionInitData, "sourceEngine" | "agentVersion" | "provider" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
+  "session.start": Pick<SessionInitData, "sourceEngine" | "agentVersion" | "provider" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
   "session.error": {
     error?: JsonValue;
     message?: JsonValue;
