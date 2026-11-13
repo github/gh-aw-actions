@@ -42,6 +42,13 @@ function isFileNotFound(error) {
   return error.cause ? isFileNotFound(error.cause) : false;
 }
 
+function isHttpNotFound(error) {
+  if (!error) return false;
+  const status = error.status || error.response?.status;
+  if (status !== undefined) return status === HTTP_STATUS_NOT_FOUND;
+  return error.cause ? isHttpNotFound(error.cause) : false;
+}
+
 /**
  * Parses a boolean flag from frontmatter text using simple text scanning.
  * Matches lines of the form "key: true" or "key: false" at the top level.
@@ -248,7 +255,7 @@ async function processImportsTextBased(frontmatterText, baseDir, visited = new S
       importedFiles.push(...nestedResult.importedFiles);
       importedFrontmatterTexts.push(...nestedResult.importedFrontmatterTexts);
     } catch (err) {
-      if (!isFileNotFound(err)) throw err;
+      if (!isFileNotFound(err) || (isHttpNotFound(err) && !isWorkflowSpecImport(importPath))) throw err;
       onMissingImport?.(fullPath, /** @type {Error} */ err);
       continue;
     }
@@ -269,6 +276,8 @@ function extractImportsFromText(frontmatterText) {
 
   let inImports = false;
   let baseIndent = 0;
+  /** @type {number|null} */
+  let importItemIndent = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -294,6 +303,12 @@ function extractImportsFromText(frontmatterText) {
 
       // Extract array item
       if (trimmed.startsWith("-")) {
+        if (importItemIndent === null) {
+          importItemIndent = lineIndent;
+        } else if (lineIndent !== importItemIndent) {
+          continue;
+        }
+
         let item = trimmed.substring(1).trim();
         // Extract path from object-form imports (uses: <path> / path: <path>).
         // These are valid import forms that the compiler accepts; extract the path
@@ -584,19 +599,25 @@ function runtimeImportHashCandidatePaths(importPath, baseDir) {
  * @param {string} baseDir
  * @returns {string}
  */
+function findGitHubFolder(baseDir) {
+  let directory = path.normalize(baseDir);
+  while (!directory.endsWith(".github")) {
+    const parent = path.dirname(directory);
+    if (parent === directory || parent === "." || parent === "/") {
+      return baseDir;
+    }
+    directory = parent;
+  }
+  return directory;
+}
+
+/**
+ * @param {string} baseDir
+ * @returns {string}
+ */
 function runtimeImportHashWorkspaceRoot(baseDir) {
-  const normalized = path.normalize(baseDir).replace(/\\/g, "/");
-  if (normalized === ".github" || normalized.startsWith(".github/")) {
-    return ".";
-  }
-  const markerIndex = normalized.indexOf("/.github/");
-  if (markerIndex >= 0) {
-    return normalized.substring(0, markerIndex);
-  }
-  if (normalized.endsWith("/.github")) {
-    return path.dirname(baseDir);
-  }
-  return baseDir;
+  const githubFolder = findGitHubFolder(baseDir);
+  return githubFolder.endsWith(".github") ? path.dirname(githubFolder) : baseDir;
 }
 
 /**
@@ -688,7 +709,7 @@ async function collectImportedBodies(frontmatterText, baseDir, visited = new Set
       const nestedBodies = await collectImportedBodies(importFrontmatterText, importBaseDir, visited, fileReader, rootDir);
       importedBodyTexts.push(...nestedBodies);
     } catch (err) {
-      if (!isFileNotFound(err)) throw err;
+      if (!isFileNotFound(err) || (isHttpNotFound(err) && !isWorkflowSpecImport(importPath))) throw err;
       continue;
     }
   }
@@ -696,17 +717,54 @@ async function collectImportedBodies(frontmatterText, baseDir, visited = new Set
   return importedBodyTexts;
 }
 
+function isWorkflowSpecImport(importPath) {
+  let cleanPath = importPath.split("#", 1)[0];
+  cleanPath = cleanPath.split("@", 1)[0];
+  const parts = cleanPath.split("/");
+  if (parts.length < 3) return false;
+  if (cleanPath.includes("://")) return true;
+  if (cleanPath.startsWith(".") || cleanPath.startsWith("shared/") || cleanPath.startsWith("/")) return false;
+  return parts[0] !== "" && parts[1] !== "";
+}
+
 /**
- * Mirrors the compiler's nested local import resolution: bare names and ./ paths
- * are file-relative; qualified paths are relative to the root workflow directory.
+ * Mirrors native imports' base selection, allowed roots, and containment checks.
  * @param {string} importPath
  * @param {string} baseDir
  * @param {string} rootDir
  * @returns {string}
  */
 function resolveHashImportPath(importPath, baseDir, rootDir) {
+  importPath = importPath.split("#", 1)[0];
   const fileRelative = !importPath.includes("/") || importPath.startsWith("./");
-  return path.join(fileRelative ? baseDir : rootDir, importPath);
+  let resolveBase = fileRelative ? baseDir : rootDir;
+  const githubFolder = findGitHubFolder(resolveBase);
+  let securityBase = githubFolder;
+  let filePath = importPath;
+  let filePathSlash = filePath.split(path.sep).join("/");
+  if (githubFolder.endsWith(".github")) {
+    const repoRoot = path.dirname(githubFolder);
+    if (filePathSlash.startsWith(".github/")) {
+      resolveBase = repoRoot;
+    } else if (filePathSlash.startsWith("/")) {
+      filePath = filePathSlash.substring(1);
+      filePathSlash = filePath;
+      if (!filePath.startsWith(".github/") && !filePath.startsWith(".agents/")) {
+        throw new Error(`${ERR_VALIDATION}: security: path ${importPath} must be within .github or .agents folder`);
+      }
+      resolveBase = repoRoot;
+      if (filePath.startsWith(".agents/")) securityBase = path.join(repoRoot, ".agents");
+    }
+  }
+  if (filePathSlash.startsWith("/") && !filePathSlash.substring(1).startsWith(".github/") && !filePathSlash.substring(1).startsWith(".agents/")) {
+    throw new Error(`${ERR_VALIDATION}: security: path ${importPath} must be within .github or .agents folder`);
+  }
+  const fullPath = path.join(resolveBase, filePath);
+  const relativePath = path.relative(securityBase, fullPath);
+  if (relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    throw new Error(`${ERR_VALIDATION}: security: path ${importPath} must be within ${path.basename(securityBase)} folder (resolves to: ${relativePath})`);
+  }
+  return fullPath;
 }
 
 /**

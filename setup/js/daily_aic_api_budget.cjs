@@ -1,6 +1,6 @@
 // @ts-check
 
-const { getGitHubAPIQuota, getGitHubAPIDiagnostic, getSanitizedGitHubAPICause } = require("./github_api_diagnostics.cjs");
+const { RESERVE_STOPS, getGitHubAPIQuota, getGitHubAPIDiagnostic, getSanitizedGitHubAPICause } = require("./github_api_diagnostics.cjs");
 
 const SAFE_HEADERS = ["x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-used", "x-ratelimit-reset", "x-ratelimit-resource", "retry-after"];
 const API_READ_OPERATIONS = Object.freeze({
@@ -14,8 +14,6 @@ const API_READ_OPERATIONS = Object.freeze({
 });
 const READ_OPERATIONS = new Set(Object.values(API_READ_OPERATIONS));
 const READ_FAILURES = new WeakMap();
-// A synthetic quota stop can also represent a secondary limit above the reserve.
-const RESERVE_STOPS = new WeakSet();
 
 function getAPIReadFailure(error) {
   // Artifact transport wrappers retain the original failure as their cause.
@@ -74,7 +72,7 @@ async function withQuotaResetRecovery(operation, { now = Date.now, sleep = delay
   } catch (error) {
     const diagnostic = getGitHubAPIDiagnostic(error, now());
     if (!isQuotaError(error) || ["authentication_failed", "permission_denied"].includes(diagnostic?.classification || "")) throw error;
-    const retryAt = retryNotBefore(error?.response?.headers, now(), RESERVE_STOPS.has(error));
+    const retryAt = diagnostic?.retryNotBefore || "";
     const retryAtMs = Date.parse(retryAt);
     const delayMs = retryAtMs + 1000 - now();
     const remainingMs = maxWaitMs - (now() - startedAt);
@@ -173,4 +171,9 @@ function createAPIBudget(reserve = 100) {
   return budget;
 }
 
-module.exports = { API_READ_OPERATIONS, safeResponseHeaders, apiError, retryNotBefore, createAPIBudget, getErrorStatus, isQuotaError, isTransientError, getAPIReadFailure, withQuotaResetRecovery };
+// Exported by the restore step for the guardrail step in the same job. Its
+// presence means restore stopped on genuine quota exhaustion that bounded
+// recovery could not resume; accounting stays unverified.
+const DAILY_AIC_QUOTA_BLOCKED_ENV = "GH_AW_DAILY_AIC_QUOTA_BLOCKED";
+
+module.exports = { DAILY_AIC_QUOTA_BLOCKED_ENV, API_READ_OPERATIONS, safeResponseHeaders, apiError, retryNotBefore, createAPIBudget, getErrorStatus, isQuotaError, isTransientError, getAPIReadFailure, withQuotaResetRecovery };
