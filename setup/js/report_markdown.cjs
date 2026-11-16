@@ -197,7 +197,7 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
   function substitute(source) {
     return source.replace(/\{(\w+)\}/g, (match, key) => {
       const value = valueFor(key);
-      if (typeof value === "object") throw new TypeError("Report nodes cannot appear in scalar fields");
+      if (value !== null && typeof value === "object") throw new TypeError("Report nodes cannot appear in scalar fields");
       return value === undefined ? match : String(value);
     });
   }
@@ -317,7 +317,7 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
         else {
           const value = valueFor(match[1]);
           if (Array.isArray(value)) throw new TypeError("Report blocks cannot appear inline");
-          if (typeof value === "object") nodes.push(...value.children.map(node => ({ ...node })));
+          if (value !== null && typeof value === "object") nodes.push(...value.children.map(node => ({ ...node })));
           else text(value === undefined ? match[0] : String(value));
         }
       } else if (
@@ -473,7 +473,7 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
         for (const field of line.matchAll(/\{(\w+)\}/g)) {
           const value = valueFor(field[1]);
           if (Array.isArray(value)) nodes.push(...value);
-          else if (typeof value === "object") nodes.push(fromSource({ type: "paragraph", children: value.children }));
+          else if (value !== null && typeof value === "object") nodes.push(fromSource({ type: "paragraph", children: value.children }));
           else if (String(value).trim()) nodes.push(fromSource({ type: "paragraph", children: [fromSource({ type: "text", value: String(value) })] }));
         }
         index++;
@@ -501,7 +501,10 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
             // Invalid JSON examples remain literal code.
           }
         }
-        nodes.push(fromSource({ type: "code_block", language: /^[a-zA-Z0-9_+:-]*$/.test(language) ? language : "text", value, ...(fence[0] === "`" && fence.length > 3 ? { fenceLength: Math.min(fence.length, 128) } : {}) }));
+        // Only trusted persistence may construct ledger blocks as typed nodes.
+        // Markdown imports include ordinary comments published by the same bot.
+        const safeLanguage = !language.startsWith("gh-aw-comment-ledger:") && /^[a-zA-Z0-9_+:-]*$/.test(language) ? language : "text";
+        nodes.push(fromSource({ type: "code_block", language: safeLanguage, value, ...(fence[0] === "`" && fence.length > 3 ? { fenceLength: Math.min(fence.length, 128) } : {}) }));
       } else if ((match = /^(#{1,6})\s+(.+)$/.exec(line))) {
         nodes.push(fromSource({ type: "heading", level: Math.max(minimumHeadingLevel, match[1].length), children: inline(match[2]) }));
         index++;

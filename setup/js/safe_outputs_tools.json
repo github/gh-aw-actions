@@ -85,13 +85,13 @@
   },
   {
     "name": "ledger_append",
-    "description": "Submit a custom record or a typed operation to a configured Git-backed ledger. Supported built-in types: counter, log, set, table. For map ledgers, use ledger_map_put or ledger_map_delete instead. Persistence follows trusted validation.",
+    "description": "Submit a custom record or a typed operation to a configured Git-backed ledger. Supported built-in types: counter, log, set, table. For map ledgers, use ledger_map_put or ledger_map_delete instead. Use `record` only for custom ledgers; for counter, log, set, and table ledgers send `operation` plus `value` (or `key`/`patch`/`name`/`amount`) and no `record`. `record` and `value` must be real JSON objects, never JSON-encoded strings. Persistence follows trusted validation.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "ledger": { "type": "string", "description": "Configured custom, counter, log, set, or table ledger name. For map ledgers, use ledger_map_put or ledger_map_delete instead." },
         "temp_id": { "type": "string", "description": "Optional temporary ID for same-batch references." },
-        "record": { "type": "object", "description": "Custom ledger record payload." },
+        "record": { "type": "object", "description": "Custom ledger record payload, only for custom ledgers. Pass a JSON object (not a JSON-encoded string). Built-in ledger types use `operation` and `value` instead." },
         "operation": {
           "type": "string",
           "enum": ["append", "add", "remove", "put", "delete", "insert", "update", "upsert", "increment", "decrement"],
@@ -854,7 +854,7 @@
   },
   {
     "name": "add_labels",
-    "description": "Add labels to an existing GitHub issue or pull request for categorization and filtering. Labels must already exist in the repository. For creating new issues with labels, use create_issue with the labels property instead.",
+    "description": "Add labels to an existing GitHub issue or pull request for categorization and filtering. Labels must already exist in the repository. When a label object includes `rationale`, keep it at or under 280 characters; longer values are rejected. For creating new issues with labels, use create_issue with the labels property instead.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -879,7 +879,7 @@
                   "rationale": {
                     "type": "string",
                     "maxLength": 280,
-                    "description": "Optional rationale for the change (max 280 characters)."
+                    "description": "Optional rationale for the change. Hard limit: 280 characters \u2014 longer values are rejected, so keep it to one or two short sentences."
                   },
                   "confidence": {
                     "type": "string",
@@ -942,7 +942,7 @@
                   "rationale": {
                     "type": "string",
                     "maxLength": 280,
-                    "description": "Optional rationale for the change (max 280 characters)."
+                    "description": "Optional rationale for the change. Hard limit: 280 characters \u2014 longer values are rejected, so keep it to one or two short sentences."
                   },
                   "confidence": {
                     "type": "string",
@@ -1285,7 +1285,7 @@
         "operation": {
           "type": "string",
           "enum": ["replace", "append", "prepend", "replace-island"],
-          "description": "How to update the issue body: 'append' (default - add to end with separator), 'prepend' (add to start with separator), 'replace' (overwrite entire body), or 'replace-island' (update a run-specific section)."
+          "description": "How to update the issue body: 'append' (add to end with separator), 'prepend' (add to start with separator), 'replace' (overwrite entire body), or 'replace-island' (update a workflow-specific section). If omitted, uses the workflow's configured update-issue operation, or 'append' if none is configured. An explicit operation overrides the workflow default."
         },
         "labels": {
           "type": "array",
@@ -1307,7 +1307,7 @@
                   "rationale": {
                     "type": "string",
                     "maxLength": 280,
-                    "description": "Optional rationale for the change (max 280 characters)."
+                    "description": "Optional rationale for the change. Hard limit: 280 characters \u2014 longer values are rejected, so keep it to one or two short sentences."
                   },
                   "confidence": {
                     "type": "string",
@@ -1528,13 +1528,13 @@
   },
   {
     "name": "upload_artifact",
-    "description": "Upload files as a run-scoped GitHub Actions artifact. Files can be referenced by their original absolute path (auto-copied into the staging area under /tmp/gh-aw/safeoutputs/upload-artifacts/) or by a short relative filename if already staged. Use /tmp/gh-aw/... paths for staging-related references. Shell variable syntax (for example, \"$VAR/...\") must NOT appear in path values because variables are not expanded in JSON strings. Absolute paths and paths relative to the workspace are supported. Returns a temporary artifact ID (aw_*) that can be resolved to a download URL by an authorized step. Retention and archive settings are fixed by workflow configuration. Exactly one of path or filters must be present.",
+    "description": "Upload files as a run-scoped GitHub Actions artifact. Source files must be inside the workspace (GITHUB_WORKSPACE) or already in the staging area under /tmp/gh-aw/safeoutputs/upload-artifacts/; absolute paths elsewhere (for example /tmp/gh-aw/agent/... or other /tmp paths) are rejected with \"path is outside allowed source roots\", so copy such files into the workspace first. Workspace files may be referenced by absolute or workspace-relative path and are auto-copied into the staging area. Shell variable syntax (for example, \"$VAR/...\") must NOT appear in path values because variables are not expanded in JSON strings. Absolute paths and paths relative to the workspace are supported. Returns a temporary artifact ID (aw_*) that can be resolved to a download URL by an authorized step. Retention and archive settings are fixed by workflow configuration. Exactly one of path or filters must be present.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "path": {
           "type": "string",
-          "description": "Path to the file or directory to upload. Three formats are accepted: (1) filename only (e.g., \"chart.png\") for files already in the upload staging directory at /tmp/gh-aw/safeoutputs/upload-artifacts/; (2) absolute path (e.g., \"/tmp/gh-aw/charts/chart.png\") to auto-copy from disk into the staging directory; (3) workspace-relative path (e.g., \"reports/summary.json\") resolved from the workspace root. Do NOT use shell variable syntax like \"$VAR/...\" because shell variables are not expanded in JSON string values. Example: \"path\": \"activity_overview.png\" is correct for staged files, while \"path\": \"$VAR/gh-aw/safeoutputs/upload-artifacts/activity_overview.png\" is invalid. Required unless filters is provided."
+          "description": "Path to the file or directory to upload. Three formats are accepted: (1) filename only (e.g., \"chart.png\") for files already in the upload staging directory at /tmp/gh-aw/safeoutputs/upload-artifacts/; (2) absolute path inside the workspace (e.g., \"/home/runner/work/repo/repo/reports/chart.png\") to auto-copy into the staging directory; absolute paths outside the workspace and staging directory (e.g., /tmp/gh-aw/agent/chart.png) are rejected, so copy the file into the workspace first; (3) workspace-relative path (e.g., \"reports/summary.json\") resolved from the workspace root. Do NOT use shell variable syntax like \"$VAR/...\" because shell variables are not expanded in JSON string values. Example: \"path\": \"activity_overview.png\" is correct for staged files, while \"path\": \"$VAR/gh-aw/safeoutputs/upload-artifacts/activity_overview.png\" is invalid. Required unless filters is provided."
         },
         "filters": {
           "type": "object",
@@ -1728,20 +1728,20 @@
   },
   {
     "name": "hide_comment",
-    "description": "Hide a comment on a GitHub issue, pull request, or discussion. This collapses the comment and marks it as spam, abuse, off-topic, outdated, resolved, or low-quality. Use this for inappropriate, off-topic, or outdated comments. The comment_id must be a GraphQL node ID (string like 'IC_kwDOABCD123456'), not a numeric REST API comment ID. NOTE: By default, this tool requires discussions:write permission. If your GitHub App lacks Discussions permission, set 'discussions: false' in the workflow's safe-outputs.hide-comment configuration to exclude this permission.",
+    "description": "Hide a comment on a GitHub issue, pull request, or discussion. This collapses the comment and marks it as spam, abuse, off-topic, outdated, resolved, or low-quality. Use this for inappropriate, off-topic, or outdated comments. Pass comment_id as a quoted GraphQL node ID string (e.g., 'IC_kwDOABCD123456'), not a numeric REST API comment ID. If provided, reason must exactly match an uppercase enum value: SPAM, ABUSE, OFF_TOPIC, OUTDATED, RESOLVED, or LOW_QUALITY. NOTE: By default, this tool requires discussions:write permission. If your GitHub App lacks Discussions permission, set 'discussions: false' in the workflow's safe-outputs.hide-comment configuration to exclude this permission.",
     "inputSchema": {
       "type": "object",
       "required": ["comment_id"],
       "properties": {
         "comment_id": {
           "type": "string",
-          "description": "GraphQL node ID of the comment to hide (e.g., 'IC_kwDOABCD123456'). This is the GraphQL node ID, not the numeric comment ID from REST API. Can be obtained from GraphQL queries or comment API responses.",
+          "description": "Quoted GraphQL node ID string of the comment to hide (e.g., 'IC_kwDOABCD123456'), not the numeric comment ID from REST API. Can be obtained from GraphQL queries or comment API responses.",
           "x-synonyms": ["commentId"]
         },
         "reason": {
           "type": "string",
           "enum": ["SPAM", "ABUSE", "OFF_TOPIC", "OUTDATED", "RESOLVED", "LOW_QUALITY"],
-          "description": "Optional reason for hiding the comment. Defaults to SPAM if not provided. Valid values: SPAM (spam content), ABUSE (abusive/harassment content), OFF_TOPIC (not relevant to discussion), OUTDATED (no longer applicable), RESOLVED (issue/question has been resolved), LOW_QUALITY (low-quality content)."
+          "description": "Optional reason for hiding the comment. Defaults to SPAM if not provided. Must exactly match an uppercase enum value: SPAM (spam content), ABUSE (abusive/harassment content), OFF_TOPIC (not relevant to discussion), OUTDATED (no longer applicable), RESOLVED (issue/question has been resolved), LOW_QUALITY (low-quality content)."
         },
         "secrecy": {
           "type": "string",
@@ -1775,7 +1775,7 @@
         "rationale": {
           "type": "string",
           "maxLength": 280,
-          "description": "Optional rationale for the change (max 280 characters)."
+          "description": "Optional rationale for the change. Hard limit: 280 characters \u2014 longer values are rejected, so keep it to one or two short sentences."
         },
         "confidence": {
           "type": "string",
@@ -1827,7 +1827,7 @@
         "rationale": {
           "type": "string",
           "maxLength": 280,
-          "description": "Optional rationale for the change (max 280 characters)."
+          "description": "Optional rationale for the change. Hard limit: 280 characters \u2014 longer values are rejected, so keep it to one or two short sentences."
         },
         "confidence": {
           "type": "string",
