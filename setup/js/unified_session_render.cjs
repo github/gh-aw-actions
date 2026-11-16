@@ -204,7 +204,7 @@ function eventDetail(event) {
     case "firewall.http_access":
       return fields(data, ["host", "method", "status", "decision"]);
     case "firewall.steering":
-      return fields(data, ["event", "threshold", "message", "reason"]);
+      return fields(data, ["event", "trigger", "threshold", "conversation", "message", "reason"]);
     case "firewall.token_usage":
     case "usage.report":
       return (
@@ -245,7 +245,7 @@ function eventDetail(event) {
     case "safe_output.result":
       return `${fields(data, ["type", "status", "repo", "number", "provider", "identifier", "url"])} [execution recorded]`;
     case "safe_output.outcome":
-      return fields(data, ["type", "messageIndex", "status", "staged", "url"]);
+      return fields(data, ["type", "messageIndex", "status", "staged", "operation_outcome", "url"]);
     case "safe_output.error":
       return `${fields(data, ["type", "status", "errorCode", "message", "error"])}${Array.isArray(data.errors) ? ` errors=${data.errors.length} [${data.errors.map(error => fields(error, ["type", "errorCode"])).join("; ")}]` : ""}`;
     case "experiment.assignment":

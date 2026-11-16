@@ -37,6 +37,7 @@
 "use strict";
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { isGitHubProviderCybersecurityPolicyRejection } = require("./github_provider_policy_rejection.cjs");
 const fs = require("fs");
 const { openDurableSession, observeDurableSession } = require("./durable_native_session.cjs");
 const { runProcess, formatDuration, resolvePostResultWatchdogIdleTimeoutMs } = require("./process_runner.cjs");
@@ -91,7 +92,7 @@ const {
 const { isCrashSignalExitCode, crashSignalNameForExitCode } = require("./harness_crash_signals.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
 const { applyModelFallback, normalizeClaudeModel } = require("./model_fallback.cjs");
-const { resolveEngineModel } = require("./resolve_model_alias.cjs");
+const { buildCatalogFromReflect, resolveEngineModel, splitModelIdentifier } = require("./resolve_model_alias.cjs");
 const { applyClaudeSubagentModels, isDetectionPhase } = require("./engine_subagent_models.cjs");
 const { parseMaxAICreditsExceededFromAuditLog } = require("./ai_credits_context.cjs");
 const { resolveAWFModelRoutingSelection, mapAWFRoutingEffort, recordAWFModelRoutingOutcome, getAWFModelRoutingPolicy, getAWFModelRoutingFailureCode, resolveAWFRoutingProvider } = require("./awf_model_routing.cjs");
@@ -476,18 +477,27 @@ function removeClaudeRoutingOverrides(args) {
 }
 
 /**
- * Append --settings from GH_AW_CLAUDE_SETTINGS when the caller passed no --settings.
- * The external threat-detect binary builds its own Claude Code arguments, so the
- * compiler hands the Copilot modelOverrides map to Claude Code through this variable.
+ * Preserve user settings, otherwise supply Copilot Claude ID mappings from the live
+ * inventory and resolved models. This also covers the external detector's CLI args.
  * @param {string[]} args
  * @param {NodeJS.ProcessEnv} [env]
+ * @param {any} [reflectData]
+ * @param {string[]} [resolvedModels]
  * @returns {string[]}
  */
-function applyClaudeSettingsEnv(args, env = process.env) {
-  const settings = (env.GH_AW_CLAUDE_SETTINGS || "").trim();
-  if (!settings) return args;
+function applyClaudeSettingsEnv(args, env = process.env, reflectData, resolvedModels = []) {
   if (args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) return args;
-  return [...args, "--settings", settings];
+  const settings = (env.GH_AW_CLAUDE_SETTINGS || "").trim();
+  if (settings) return [...args, "--settings", settings];
+  if (!REFLECT_PROVIDER_ALIASES.github.has(normalizeReflectProviderName(env.GH_AW_LLM_PROVIDER, "anthropic"))) return args;
+  const endpoints = reflectData?.endpoints?.filter(endpoint => endpoint?.configured === true && REFLECT_PROVIDER_ALIASES.github.has(normalizeReflectProviderName(endpoint.provider))) || [];
+  /** @type {Record<string, string>} */
+  const modelOverrides = {};
+  for (const value of [...buildCatalogFromReflect({ endpoints }), env.ANTHROPIC_MODEL || "", ...resolvedModels]) {
+    const id = splitModelIdentifier(value).base.replace(/^(?:copilot|github-copilot|github)\//, "");
+    if (id.startsWith("claude-") && id.includes(".")) modelOverrides[id.replaceAll(".", "-")] = id;
+  }
+  return Object.keys(modelOverrides).length ? [...args, "--settings", JSON.stringify({ modelOverrides })] : args;
 }
 
 /**
@@ -517,7 +527,7 @@ async function main() {
     const resolved = resolveClaudePromptFileArgs(args);
     prompt = resolved.prompt;
     const capabilities = claudeBareCapabilities(claudeRepositoryEditPolicy(stripContinueArgs(resolved.args), process.env));
-    initialArgs = applyClaudeSettingsEnv(capabilities.args, process.env);
+    initialArgs = capabilities.args;
     pluginDir = capabilities.pluginDir;
   } catch (err) {
     const e = /** @type {Error} */ err;
@@ -558,13 +568,6 @@ async function main() {
     throw error;
   }
 
-  const freshRetryArgs = stripContinueArgs(initialArgs);
-  // Args without --prompt-file, used as the base for --continue retries.
-  const continueBaseArgs = freshRetryArgs;
-
-  const safeInitialArgs = initialArgs;
-  const safeFreshRetryArgs = freshRetryArgs;
-
   // Pre-flight: skip the agent entirely when a noop has already been written by a prior step.
   // A noop indicates the work is complete or there is nothing to do — starting the agent
   // would be wasteful and potentially harmful.
@@ -577,6 +580,7 @@ async function main() {
   // Sub-agent models are resolved on routed runs too, but a pre-existing noop must not
   // make startup depend on sub-agent model availability. Threat detection uses no
   // sub-agents, so it neither reads, resolves, records nor writes agent files.
+  const resolvedSubagentModels = [];
   if (!isDetectionPhase(process.env.GH_AW_PHASE)) {
     let subagents;
     try {
@@ -596,7 +600,14 @@ async function main() {
       removeClaudePlugin(pluginDir);
       process.exit(1);
     }
+    resolvedSubagentModels.push(...subagents.resolutions.map(resolution => resolution.model));
   }
+
+  initialArgs = applyClaudeSettingsEnv(initialArgs, childEnv, reflection.reflectData, resolvedSubagentModels);
+  const freshRetryArgs = stripContinueArgs(initialArgs);
+  const continueBaseArgs = freshRetryArgs;
+  const safeInitialArgs = initialArgs;
+  const safeFreshRetryArgs = freshRetryArgs;
 
   let lastExitCode = 1;
   let useContinueOnRetry = false;
@@ -702,6 +713,7 @@ async function main() {
         return { action: "stop", exitCode: 0 };
       }
       const classifierOutput = claudeFailureEvidence(result.output);
+      const isCybersecurityPolicyRejection = isGitHubProviderCybersecurityPolicyRejection(result.output, process.env.GH_AW_LLM_PROVIDER, "claude");
       const isOverloaded = isOverloadedError(classifierOutput);
       const isRateLimit = isRateLimitError(classifierOutput);
       const isAuthenticationFailed = isAuthenticationFailedError(classifierOutput);
@@ -719,6 +731,7 @@ async function main() {
       const hasNumerousPermissionDenied = permissionDeniedCount >= 3;
       const crashSignalName = crashSignalNameForExitCode(result.exitCode);
       result.failureClasses = Object.entries({
+        content_filter: isCybersecurityPolicyRejection,
         overloaded_error: isOverloaded,
         rate_limit_error: isRateLimit,
         authentication_failed: isAuthenticationFailed,
@@ -745,12 +758,18 @@ async function main() {
           ` isInvalidModelError=${isInvalidModel}` +
           ` isInvalidJsonBodyError=${isInvalidJsonBody}` +
           ` isConnectionRefusedError=${isConnectionRefused}` +
+          ` isCybersecurityPolicyRejection=${isCybersecurityPolicyRejection}` +
           ` sessionHasProgress=${sessionHasProgress}` +
           ` permissionDeniedCount=${permissionDeniedCount}` +
           ` hasNumerousPermissionDenied=${hasNumerousPermissionDenied}` +
           ` hasOutput=${result.hasOutput}` +
           ` retriesRemaining=${maxRetries - attempt}`
       );
+
+      if (isCybersecurityPolicyRejection) {
+        log(`attempt ${attempt + 1}: GitHub provider blocked the request for cybersecurity policy — not retrying; task completion could not be confirmed`);
+        return { action: "stop" };
+      }
 
       if (shouldStopForNoopSafeOutputs({ attempt, safeOutputsPath, hasNoopInSafeOutputs, log })) {
         return { action: "stop", exitCode: 0 };

@@ -2,7 +2,7 @@
 
 const { iterateJsonl, readJsonlFile } = require("./jsonl_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { computeInferenceAIC } = require("./model_costs.cjs");
+const { ERR_SYSTEM } = require("./error_codes.cjs");
 
 const ROUTING_STATUSES = new Set(["selected", "pending", "failed", "rejected", "unavailable"]);
 const ROUTING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "off"]);
@@ -45,7 +45,7 @@ function readFallbackMetadata(filePath) {
   try {
     return JSON.parse(require("fs").readFileSync(filePath, "utf8"));
   } catch (error) {
-    throw new Error(`Cannot read model fallback metadata '${filePath}': ${getErrorMessage(error)}`, { cause: error });
+    throw new Error(`${ERR_SYSTEM}: Cannot read model fallback metadata '${filePath}': ${getErrorMessage(error)}`, { cause: error });
   }
 }
 
@@ -67,7 +67,7 @@ function recordFallbackModel(model, env, infoPath) {
     fs.mkdirSync(require("path").dirname(infoPath), { recursive: true });
     fs.writeFileSync(infoPath, JSON.stringify(info, null, 2));
   } catch (error) {
-    throw new Error(`Cannot record model fallback metadata '${infoPath}': ${getErrorMessage(error)}`, { cause: error });
+    throw new Error(`${ERR_SYSTEM}: Cannot record model fallback metadata '${infoPath}': ${getErrorMessage(error)}`, { cause: error });
   }
 }
 
@@ -124,7 +124,7 @@ function recordModelRouting(routing, env = process.env, infoPath = `${env.GH_AW_
     fs.mkdirSync(require("path").dirname(infoPath), { recursive: true });
     fs.writeFileSync(infoPath, JSON.stringify(info, null, 2));
   } catch (error) {
-    throw new Error(`Cannot record model routing metadata '${infoPath}': ${getErrorMessage(error)}`, { cause: error });
+    throw new Error(`${ERR_SYSTEM}: Cannot record model routing metadata '${infoPath}': ${getErrorMessage(error)}`, { cause: error });
   }
   return modelRouting;
 }
@@ -223,25 +223,13 @@ function classifierAIC(sessionEvents) {
   const classifierUsage = sessionEvents.filter(event => event.type === "firewall.token_usage" && event.data?.purpose === "routing_classification");
   if (classifierUsage.length === 0) return undefined;
 
-  return classifierUsage.reduce((total, event) => {
-    const data = event.data;
-    const reportedAIC = data.aic;
-    if (typeof reportedAIC === "number" && Number.isFinite(reportedAIC) && reportedAIC >= 0) return total + reportedAIC;
-
-    const usage = data.usage ?? {};
-    const tokenCount = value => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0);
-    const estimatedAIC = computeInferenceAIC({
-      provider: typeof data.provider === "string" ? data.provider : "",
-      model: typeof data.model === "string" ? data.model : "",
-      inputTokens: tokenCount(usage.inputTokens),
-      outputTokens: tokenCount(usage.outputTokens),
-      cacheReadTokens: tokenCount(usage.cacheReadInputTokens),
-      cacheWriteTokens: tokenCount(usage.cacheCreationInputTokens),
-      reasoningTokens: tokenCount(usage.reasoningOutputTokens),
-      ...(typeof usage.inputTokensIncludeCache === "boolean" ? { inputTokensIncludeCache: usage.inputTokensIncludeCache } : {}),
-    });
-    return total + (Number.isFinite(estimatedAIC) && estimatedAIC >= 0 ? estimatedAIC : 0);
-  }, 0);
+  let total = 0;
+  for (const event of classifierUsage) {
+    const reportedAIC = event.data.aic;
+    if (typeof reportedAIC !== "number" || !Number.isFinite(reportedAIC) || reportedAIC < 0) return undefined;
+    total += reportedAIC;
+  }
+  return total;
 }
 
 function firstValidated(...values) {

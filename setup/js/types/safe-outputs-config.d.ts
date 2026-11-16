@@ -223,6 +223,7 @@ interface UpdateIssueConfig extends SafeOutputConfig {
   target?: string;
   title?: boolean;
   body?: boolean;
+  operation?: "append" | "prepend" | "replace" | "replace-island";
   footer?: boolean;
 }
 
@@ -266,6 +267,7 @@ interface PushToPullRequestBranchConfig extends SafeOutputConfig {
  * Configuration for merging pull requests with policy checks.
  */
 interface MergePullRequestConfig extends SafeOutputConfig {
+  "allowed-base-branches": string[];
   "required-labels"?: string[];
   "required-title-prefix"?: string;
   "required-checks"?: string[];

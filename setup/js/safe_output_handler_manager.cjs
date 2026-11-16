@@ -13,7 +13,7 @@ const { loadAgentOutput } = require("./load_agent_output.cjs");
 const { normalizeSafeOutputConfig } = require("./safe_output_names.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { getStalePullRequestReason } = require("./pr_lifecycle.cjs");
-const { ERR_CONFIG, ERR_PARSE, ERR_SYSTEM, ERR_VALIDATION, SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
+const { ERR_CONFIG, ERR_PARSE, ERR_SYSTEM, ERR_VALIDATION, SAFE_OUTPUT_E007, SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
 const { classifySafeOutputResult, computeSafeOutputsStatus, isFailedProcessingResult } = require("./safe_outputs_status.cjs");
 const { buildSafeOutputDependencyPlan, checkSafeOutputDependencies } = require("./safe_output_dependencies.cjs");
 const { finalizeBufferedReviewOutcomes } = require("./safe_output_outcomes.cjs");
@@ -554,8 +554,9 @@ async function loadHandlers(config, prReviewBufferRegistry, resolvedAllowedMenti
           throw error;
         }
         // For other errors (e.g., module not found), log warning and continue
-        handlerLoadErrors.set(type, errorMessage);
-        core.warning(`Failed to load handler for ${type}: ${errorMessage}`);
+        const diagnostic = type === "merge_pull_request" ? "merge_pull_request handler initialization failed; check trusted policy and authentication configuration" : errorMessage;
+        handlerLoadErrors.set(type, diagnostic);
+        core.warning(`Failed to load handler for ${type}: ${diagnostic}`);
       }
     } else {
       core.debug(`Handler not enabled: ${type}`);
@@ -945,6 +946,7 @@ function buildSkippedResult(type, messageIndex, result) {
 /** @param {string} type @param {any} result @param {number} messageIndex */
 function recordMergeDecision(type, result, messageIndex) {
   if (type !== "merge_pull_request" || !result || result.deferred) return result;
+  if (result.success === false) result = { ...result, error: mergeProcessingError(result) };
   try {
     writeMergePullRequestDecision(result, messageIndex);
     return { ...result, audit_recorded: true };
@@ -955,6 +957,24 @@ function recordMergeDecision(type, result, messageIndex) {
   }
 }
 
+/** @param {any} [result] */
+function mergeProcessingError(result) {
+  if (result?.operation_outcome === "indeterminate") return "Merge outcome is indeterminate; inspect the live pull request before any further action. The merge was not retried.";
+  // Only preserve exact fixed diagnostics; other handler errors can contain private API data.
+  switch (result?.error) {
+    case "merge_pull_request gate checks failed":
+    case `${SAFE_OUTPUT_E007}: Missing check producer evidence for required check`:
+    case `${SAFE_OUTPUT_E007}: Unexpected check producer for required check`:
+    case `${SAFE_OUTPUT_E007}: Ambiguous check producers for required check`:
+    case `${SAFE_OUTPUT_E007}: GitHub rejected the merge request (HTTP 405); the merge was not retried`:
+    case `${SAFE_OUTPUT_E007}: GitHub rejected the merge request (HTTP 409); the merge was not retried`:
+    case `${SAFE_OUTPUT_E007}: GitHub rejected the merge request (HTTP 422); the merge was not retried`:
+      return result.error;
+    default:
+      return "merge_pull_request failed";
+  }
+}
+
 /** @param {any} result */
 function projectMergeFailure(result) {
   return {
@@ -962,6 +982,7 @@ function projectMergeFailure(result) {
     ...(result.audit_recorded ? { audit_recorded: true } : {}),
     ...(result.audit_failed ? { audit_failed: true, audit_error: result.audit_error } : {}),
     ...(typeof result.staged === "boolean" ? { staged: result.staged } : {}),
+    ...(result.operation_outcome === "indeterminate" ? { operation_outcome: "indeterminate", merged: null, data_trust: "untrusted" } : {}),
   };
 }
 
@@ -1000,7 +1021,7 @@ function sortMessagesByTemporaryIdDependencies(messages) {
  * @param {Map<string, Function>} messageHandlers - Map of message handler functions
  * @param {Array<Object>} messages - Array of safe output messages
  * @param {((item: {type: string, url?: string, number?: number, repo?: string, temporaryId?: string}) => void)|null} [onItemCreated] - Optional callback invoked after each successful create operation (for manifest logging)
- * @param {((results: Array<any>) => Promise<void>)|null} [finalizeBufferedOutputs] - Finalize buffered effects before resolving waiting dependencies
+ * @param {((results: Array<any>, protectedTargets: Set<string>, requiredComments: Map<string, any[]>) => Promise<void>)|null} [finalizeBufferedOutputs] - Finalize buffered effects before resolving waiting dependencies
  * @returns {Promise<{success: boolean, results: Array<any>, temporaryIdMap: Object, artifactUrlMap: Map<string, string>, outputsWithUnresolvedIds: Array<any>, missings: Object, codePushFailures: Array<{type: string, error: string}>}>}
  */
 async function processMessages(messageHandlers, messages, onItemCreated = null, finalizeBufferedOutputs = null) {
@@ -1019,6 +1040,53 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
   const processingOrder = dependencyPlan.order;
   const waitingMessages = [];
   const results = [];
+  /** @type {any} */
+  const reviewHandler = messageHandlers.get("submit_pull_request_review");
+  const reviewTargets = messages.map(message => (message.type === "submit_pull_request_review" && typeof reviewHandler?.getReviewTarget === "function" ? reviewHandler.getReviewTarget(message) : null));
+  const reviewKey = target => (target?.repo && target?.pull_request_number ? `${target.repo}#${target.pull_request_number}` : null);
+
+  function reviewCommentPrerequisites(i) {
+    const target = reviewKey(reviewTargets[i]);
+    if (!target) return new Set();
+    return new Set(
+      [...dependencyPlan.prerequisites[i]].filter(prerequisite => {
+        const record = results.find(result => result.messageIndex === prerequisite);
+        return record?.type === "create_pull_request_review_comment" && record.result?.buffered && record.result?.deferred_manifest && reviewKey(record.result) === target;
+      })
+    );
+  }
+
+  function protectedReviews() {
+    const published = new Set(results.filter(record => record.type === "submit_pull_request_review" && record.success && !record.skipped && record.result?.deferred_manifest).map(record => reviewKey(record.result)));
+    return new Set(
+      reviewTargets.flatMap((target, i) => {
+        const key = reviewKey(target);
+        const result = results.find(record => record.messageIndex === i);
+        if (!key && messages[i].type === "submit_pull_request_review" && typeof reviewHandler?.getReviewTarget === "function" && (!result || !result.success || result.skipped)) {
+          return [...dependencyPlan.prerequisites[i]].flatMap(prerequisite => {
+            const record = results.find(item => item.messageIndex === prerequisite && item.type === "create_pull_request_review_comment");
+            const commentKey = reviewKey(record?.result);
+            return commentKey && !published.has(commentKey) ? [commentKey] : [];
+          });
+        }
+        const dependsOnOwnComment = reviewCommentPrerequisites(i).size > 0;
+        const failedDependency = result && (!result.success || result.skipped) && dependencyPlan.prerequisites[i].size > 0;
+        return key && !published.has(key) && (dependsOnOwnComment || failedDependency) ? [key] : [];
+      })
+    );
+  }
+
+  function requiredReviewComments() {
+    const required = new Map();
+    for (let i = 0; i < messages.length; i++) {
+      const target = reviewKey(reviewTargets[i]);
+      const review = results.find(record => record.messageIndex === i);
+      if (!target || !review?.success || !review.result?.deferred_manifest) continue;
+      const comments = [...reviewCommentPrerequisites(i)].map(index => results.find(record => record.messageIndex === index)?.result?.metadata);
+      if (comments.length) required.set(target, comments);
+    }
+    return required;
+  }
   const detectionConclusion = getEffectiveDetectionConclusion(process.env.GH_AW_DETECTION_CONCLUSION, process.env.GH_AW_DETECTION_REASON);
   const detectionConclusionMissing = String(process.env.GH_AW_RUN_DETECTION || "").trim() === "true" && detectionConclusion === "";
 
@@ -1073,7 +1141,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
   async function processMessage(i, allowWaiting) {
     let message = messages[i];
     const messageType = message.type;
-    const dependency = checkSafeOutputDependencies(dependencyPlan, i, results, allowWaiting);
+    const dependency = checkSafeOutputDependencies(dependencyPlan, i, results, allowWaiting, reviewCommentPrerequisites(i));
     if (dependency.state === "waiting") {
       waitingMessages.push(i);
       return;
@@ -1360,7 +1428,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
           messageIndex: i,
           success: false,
           error: errorMsg,
-          ...(messageType === "merge_pull_request" ? { result: projectMergeFailure(result) } : {}),
+          ...(messageType === "merge_pull_request" ? { result: projectMergeFailure(result) } : result.operation_outcome === "indeterminate" ? { result: { operation_outcome: "indeterminate" } } : {}),
         });
         // Track code-push failures for later comment annotations and conclusion reporting.
         if (CODE_PUSH_TYPES.has(messageType)) {
@@ -1499,12 +1567,13 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
 
       core.info(`✓ Message ${i + 1} (${messageType}) completed successfully`);
     } catch (error) {
-      core.error(`✗ Message ${i + 1} (${messageType}) failed: ${getErrorMessage(error)}`);
+      const errorMsg = messageType === "merge_pull_request" ? mergeProcessingError() : getErrorMessage(error);
+      core.error(`✗ Message ${i + 1} (${messageType}) failed: ${errorMsg}`);
       results.push({
         type: messageType,
         messageIndex: i,
         success: false,
-        error: getErrorMessage(error),
+        error: errorMsg,
       });
       // Track code-push failures for later comment annotations and conclusion reporting.
       if (CODE_PUSH_TYPES.has(messageType)) {
@@ -1521,7 +1590,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
   async function drainWaitingMessages() {
     for (let position = 0; position < waitingMessages.length;) {
       const i = waitingMessages[position];
-      if (checkSafeOutputDependencies(dependencyPlan, i, results, true).state === "waiting") {
+      if (checkSafeOutputDependencies(dependencyPlan, i, results, true, reviewCommentPrerequisites(i)).state === "waiting") {
         position++;
         continue;
       }
@@ -1645,7 +1714,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
             logCreatedItemFromResult(onItemCreated, deferred.type, result);
           }
         } catch (error) {
-          const errorMsg = getErrorMessage(error);
+          const errorMsg = deferred.type === "merge_pull_request" ? mergeProcessingError() : getErrorMessage(error);
           core.error(`✗ Retry of message ${deferred.messageIndex + 1} (${deferred.type}) failed: ${errorMsg}`);
           // Replace the deferred record so terminal retry exceptions classify as failed.
           const resultIndex = results.findIndex(r => r.messageIndex === deferred.messageIndex);
@@ -1686,17 +1755,26 @@ async function processMessages(messageHandlers, messages, onItemCreated = null, 
       const pendingResults = new Set(pendingPublications.map(record => record.result));
       const temporaryIdCount = temporaryIdMap.size;
       const deferredCount = deferredMessages.length;
-      await finalizeBufferedOutputs(results);
+      await finalizeBufferedOutputs(results, protectedReviews(), requiredReviewComments());
       const publicationProgress = pendingPublications.some(record => classifySafeOutputResult(record) !== "deferred");
       await drainWaitingMessages();
       if (publicationProgress || temporaryIdMap.size !== temporaryIdCount || deferredMessages.length !== deferredCount) {
         await retryDeferredMessages();
       }
-      if (!results.some(record => record.success && !record.skipped && record.result?.deferred_manifest && !pendingResults.has(record.result))) break;
+      if (!(publicationProgress && protectedReviews().size > 0) && !results.some(record => record.success && !record.skipped && record.result?.deferred_manifest && !pendingResults.has(record.result))) break;
     }
   }
   for (const i of waitingMessages) {
     await processMessage(i, false);
+  }
+
+  const protectedTargets = protectedReviews();
+  for (const record of results) {
+    const key = reviewKey(record.result);
+    if (key && record.success && record.result?.deferred_manifest && protectedTargets.has(key)) {
+      record.success = false;
+      record.error = "Review was not submitted because its submit_pull_request_review output did not succeed";
+    }
   }
 
   for (const result of results) {
@@ -2363,12 +2441,12 @@ async function main(options = {}) {
 
     // Finalize buffered PR reviews before releasing their dependent outputs.
     const finalizedReviewResults = new Set();
-    /** @param {Array<any>} results */
-    async function finalizeBufferedReviews(results) {
-      const reviewResults = results.filter(record => record.result?.deferred_manifest && !finalizedReviewResults.has(record));
-      for (const record of reviewResults) finalizedReviewResults.add(record);
-      const registryEntries = prReviewBufferRegistry.drainEntries();
+    /** @param {Array<any>} results @param {Set<string>} protectedTargets @param {Map<string, any[]>} requiredComments */
+    async function finalizeBufferedReviews(results, protectedTargets, requiredComments) {
+      const registryEntries = prReviewBufferRegistry.drainEntries(protectedTargets);
       for (const { repo: reviewRepo, prNumber: reviewPrNum, buffer: reviewBuffer } of registryEntries) {
+        const reviewResults = results.filter(record => record.result?.deferred_manifest && !finalizedReviewResults.has(record) && record.result.repo === reviewRepo && record.result.pull_request_number === reviewPrNum);
+        for (const record of reviewResults) finalizedReviewResults.add(record);
         if (reviewBuffer.hasBufferedComments() || reviewBuffer.hasReviewMetadata()) {
           core.info(`\n=== Finalizing PR Review for ${reviewRepo}#${reviewPrNum} ===`);
           const bufferedCount = reviewBuffer.getBufferedCount();
@@ -2387,7 +2465,7 @@ async function main(options = {}) {
               skipReviewResultsForPR(reviewResults, reviewRepo, reviewPrNum, stalePRReason);
               continue;
             }
-            const reviewResult = await reviewBuffer.submitReview();
+            const reviewResult = await reviewBuffer.submitReview(requiredComments.get(`${reviewRepo}#${reviewPrNum}`));
             if (reviewResult.success && !reviewResult.skipped) {
               finalizeBufferedReviewOutcomes(reviewResults, reviewRepo, reviewPrNum, reviewResult);
               logCreatedItemFromResult(logCreatedItem, "submit_pull_request_review", reviewResult);
