@@ -4,7 +4,8 @@
 const { normalizeReflectProviderName, REFLECT_PROVIDER_ALIASES } = require("./awf_reflect.cjs");
 const { isCopilotProviderName } = require("./copilot_sdk_multi_provider.cjs");
 
-const RESPONSE_STATUS_PATTERN = /\bHTTP(?:\/\d(?:\.\d)?)?\s+(\d{3})\b|\bCAPIError:\s*(?:(\d{3})\b|Too Many Requests\b)|\b429\s+Too Many Requests\b|["']?(?:status|statusCode|status_code)["']?\s*:\s*["']?(\d{3})["']?\b/gi;
+const RESPONSE_STATUS_PATTERN =
+  /\bHTTP(?:\/\d(?:\.\d)?)?\s+(\d{3})\b|\bCAPIError:\s*(?:(\d{3})\b|Too Many Requests\b)|\b429\s+(?:Too Many Requests|Token limit is exceeded)\b|["']?(?:status|statusCode|status_code)["']?\s*:\s*["']?(\d{3})["']?\b/gi;
 const RETRY_AFTER_PATTERN = /(?:^|[\s{,])["']?retry-after["']?\s*:\s*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|(\d+)(?=\s*(?:[,}"'\r\n]|$))|([^"'\r\n}]+))/gi;
 const MONTHS = new Map(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].map((month, index) => [month, index]));
 
@@ -157,4 +158,17 @@ function parseTerminalRetryAfterMs(line, engine) {
   }
 }
 
-module.exports = { hasCopilotResponseStatus, isGitHubRetryAfterProvider, parseCopilotRetryAfterMs, parseTerminalRetryAfterMs };
+/**
+ * Fold one stdout line into the longest provider-requested HTTP 429 wait seen so far.
+ * Applies to every inference provider, including BYOK endpoints.
+ * @param {number | null} current
+ * @param {string} line
+ * @param {"claude" | "codex"} engine
+ * @returns {number | null}
+ */
+function mergeTerminalRetryAfterMs(current, line, engine) {
+  const delay = parseTerminalRetryAfterMs(line, engine);
+  return delay == null ? current : Math.max(current ?? 0, delay);
+}
+
+module.exports = { hasCopilotResponseStatus, isGitHubRetryAfterProvider, mergeTerminalRetryAfterMs, parseCopilotRetryAfterMs, parseTerminalRetryAfterMs };

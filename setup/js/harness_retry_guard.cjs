@@ -8,6 +8,7 @@ const { fetchAWFReflect } = require("./awf_reflect.cjs");
 // Stop retrying this long before the step hard timeout so the harness can emit
 // structured safe-output diagnostics instead of being terminated by Actions.
 const SOFT_TIMEOUT_BUFFER_MS = 90 * 1000;
+const NO_TIMEOUT_RETRY_AFTER_LIMIT_MS = 60 * 1000;
 
 const errorPatterns = require("./harness_error_patterns.cjs");
 
@@ -37,6 +38,54 @@ async function detectExhaustedAWFInvocationBudget({ nativeTerminalRateLimitError
   } catch {
     return null;
   }
+}
+
+/**
+ * Add fresh budget evidence to an engine's already-classified guard, without changing trust policy.
+ * Engines that classify afterwards derive their failure class from the updated guard.
+ * @param {{
+ *   guard: { maxRunsExceeded: boolean }, attempt: number,
+ *   nativeTerminalRateLimitError: boolean, log: (message: string) => void,
+ *   result?: import("./harness_retry_runner.cjs").HarnessAttemptResult,
+ *   env?: NodeJS.ProcessEnv, fetchReflect?: typeof fetchAWFReflect,
+ * }} options
+ */
+async function observeInvocationBudget({ guard, attempt, nativeTerminalRateLimitError, log, result, env, fetchReflect }) {
+  if (guard.maxRunsExceeded) return;
+  const budget = await detectExhaustedAWFInvocationBudget({ nativeTerminalRateLimitError, logger: log, env, fetchReflect });
+  if (!budget) return;
+  guard.maxRunsExceeded = true;
+  if (result) result.failureClasses = [...new Set([...(result.failureClasses || []), "invocation_cap_exceeded"])];
+  log(`attempt ${attempt + 1}: AWF shared invocation budget exhausted (${budget.invocationCount}/${budget.maxRuns}) — confirmed by fresh reflection`);
+}
+
+/**
+ * Enforce provider waits once, after engine-local retry vetoes have been applied.
+ * @param {{
+ *   attempt: number, result: import("./harness_retry_runner.cjs").HarnessAttemptResult,
+ *   softTimeoutGuard: { softDeadlineMs: number } | null,
+ *   harnessName: string, log: (message: string) => void, terminal?: boolean,
+ * }} options
+ * @returns {import("./harness_retry_runner.cjs").HarnessFailureDecision | null}
+ */
+function resolveRetryAfterDecision({ attempt, result, softTimeoutGuard, harnessName, log, terminal = false }) {
+  const wait = result.retryAfterMs;
+  if (wait == null) return null;
+  const invalidWait = !Number.isSafeInteger(wait) || wait < 0;
+  const exceedsTimerLimit = wait > 2147483647;
+  const exceedsTimeout = softTimeoutGuard && Date.now() + wait >= softTimeoutGuard.softDeadlineMs;
+  const exceedsFallbackLimit = !softTimeoutGuard && wait > NO_TIMEOUT_RETRY_AFTER_LIMIT_MS;
+  if (invalidWait || exceedsTimerLimit || exceedsTimeout || exceedsFallbackLimit) {
+    const reason = invalidWait ? "a valid nonnegative timer delay" : exceedsTimerLimit ? "maximum timer delay (2147483647ms)" : exceedsTimeout ? "remaining job timeout budget" : "no-timeout fallback limit (60000ms)";
+    result.failureClasses = ["rate_limit_wait_exceeded"];
+    log(`attempt ${attempt + 1}: failureClass=rate_limit_wait_exceeded — HTTP 429 rate limited, retry after ${wait / 1000} s; Retry-After=${wait}ms exceeds ${reason}; not retrying`);
+    emitInfrastructureIncomplete(`${harnessName} HTTP 429 rate limited, retry after ${wait / 1000} s. Retry-After wait exceeds ${reason}. Stopping rather than retrying inside the rate-limit window.`, { logger: log });
+    return { action: "stop" };
+  }
+  if (terminal) return null;
+  result.failureClasses = ["rate_limit_error"];
+  log(`attempt ${attempt + 1}: failureClass=rate_limit_error — HTTP 429 Retry-After requires ${wait}ms before next attempt`);
+  return { action: "retry", nextDelayMs: wait };
 }
 
 /**
@@ -74,6 +123,8 @@ if (typeof module !== "undefined" && module.exports) {
     SOFT_TIMEOUT_BUFFER_MS,
     buildSoftTimeoutGuard,
     detectExhaustedAWFInvocationBudget,
+    observeInvocationBudget,
+    resolveRetryAfterDecision,
     emitSoftTimeoutSignal,
   };
 }

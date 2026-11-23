@@ -46,6 +46,7 @@ require(path.join(__dirname, "shim.cjs"));
  * @property {string}  [endpoint]     - Override the OTLP endpoint.  Defaults to `OTEL_EXPORTER_OTLP_ENDPOINT`.
  * @property {boolean} [isError]      - When `true`, the span status is set to ERROR (code 2).
  * @property {string}  [errorMessage] - Human-readable status message included when `isError` is `true`.
+ * @property {() => void} [onError] - Report export failures without exposing exporter diagnostics.
  */
 
 /**
@@ -86,6 +87,7 @@ async function logSpan(toolName, attributes = {}, options = {}) {
       SPAN_KIND_CLIENT,
       buildGitHubActionsResourceAttributes,
       readJSONIfExists,
+      isGenAiV1,
     } = require(path.join(__dirname, "send_otlp_span.cjs"));
 
     const now = Date.now();
@@ -131,6 +133,7 @@ async function logSpan(toolName, attributes = {}, options = {}) {
       awfVersion,
       awmgVersion,
       staged,
+      workflowName: process.env.GITHUB_WORKFLOW || "",
     });
 
     const payload = buildOTLPPayload({
@@ -145,7 +148,7 @@ async function logSpan(toolName, attributes = {}, options = {}) {
       kind: SPAN_KIND_CLIENT,
       attributes: spanAttrs,
       resourceAttributes,
-      statusCode: options.isError ? 2 : 1,
+      statusCode: options.isError ? 2 : isGenAiV1() ? 0 : 1,
       ...(options.isError && options.errorMessage ? { statusMessage: options.errorMessage } : {}),
     });
 
@@ -166,7 +169,8 @@ async function logSpan(toolName, attributes = {}, options = {}) {
     }
   } catch (err) {
     // Export failures must never break the workflow.
-    console.warn(`[otlp] ${toolName}: failed to emit span: ${getErrorMessage(err)}`);
+    if (options.onError) options.onError();
+    else console.warn(`[otlp] ${toolName}: failed to emit span: ${getErrorMessage(err)}`);
   }
 }
 
