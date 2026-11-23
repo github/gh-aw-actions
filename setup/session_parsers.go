@@ -7,7 +7,7 @@ import "embed"
 //
 //go:embed js/session_cli.cjs js/unified_session.cjs js/unified_session_payload.cjs js/unified_session_render.cjs
 //go:embed js/memory_save_results.cjs
-//go:embed js/durable_session_record.cjs
+//go:embed js/durable_session_record.cjs js/durable_files.cjs
 //go:embed js/steering_helpers.cjs js/jsonl_helpers.cjs
 //go:embed js/schema-validation.cjs js/json_schema_validation.cjs js/memory_schema_contract.cjs
 //go:embed js/add_labels_schema.cjs
@@ -28,6 +28,7 @@ import "embed"
 //go:embed js/copilot_workflow_events.cjs js/dynamic_workflow_session.cjs
 //go:embed js/subagent_session_render.cjs
 //go:embed js/gemini_session.cjs
+//go:embed js/langgraph_session.cjs
 //go:embed js/pi_session.cjs js/pi_session_redaction.cjs js/session_artifact.cjs
 //go:embed js/log_parser_bootstrap.cjs js/log_parser_format.cjs js/log_parser_shared.cjs
 //go:embed js/protected_command_output.cjs
@@ -79,7 +80,7 @@ import "embed"
 //go:embed js/agent_execution.cjs js/agent_error_patterns.cjs js/harness_error_patterns.cjs js/harness_crash_signals.cjs js/harness_retry_record.cjs
 //go:embed js/harness_retry_session.cjs
 //go:embed js/engine_log_parser.cjs
-//go:embed js/routing_analytics.cjs js/resolve_model_alias.cjs
+//go:embed js/routing_analytics.cjs js/routing_observation.cjs js/resolve_model_alias.cjs
 //go:embed js/parse_kiro_log.cjs
 //go:embed js/parse_deepseek_log.cjs
 //go:embed js/parse_pydantic_log.cjs
