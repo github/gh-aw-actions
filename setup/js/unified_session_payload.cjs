@@ -17,6 +17,8 @@ const { sessionMessageTimestamp } = require("./unified_session_order.cjs");
 
 /** AWF failed-request origins: provider response versus AWF-originated rejection. */
 const ERROR_SOURCES = new Set(["upstream", "awf"]);
+const SELECTION_SOURCES = new Set(["router", "fallback"]);
+const FALLBACK_TIERS = new Set(["standard", "premium", "unclassified", "lightweight", "none"]);
 
 const SCOPED_AGENT_TYPES = new Set([
   "session.init",
@@ -99,6 +101,7 @@ function normalizeSteeringDelivery(value) {
 /** @type {Fields} */
 const MCP_FIELDS = {
   serverName: ["serverName", "server_name", "server_id"],
+  sessionId: ["sessionId", "session_id"],
   direction: ["direction"],
   rpcId: ["rpcId"],
   method: ["method"],
@@ -147,6 +150,9 @@ const MODEL_ROUTING_FIELDS = {
   mode: ["mode"],
   selectedId: ["selected_id", "selectedId"],
   routerVersion: ["router_version", "routerVersion"],
+  selectionSource: ["selection_source", "selectionSource"],
+  fallbackReason: ["fallback_reason", "fallbackReason"],
+  fallbackTier: ["fallback_tier", "fallbackTier"],
   failureCode: ["failure_code", "failureCode"],
 };
 const MODEL_SELECTION_FIELDS = {
@@ -419,6 +425,9 @@ const EVENT_FIELDS = {
     errorCode: ["error_code", "errorCode"],
     errorType: ["error_type", "errorType"],
     errorSource: ["error_source", "errorSource"],
+    selectionSource: ["selection_source", "selectionSource"],
+    fallbackReason: ["fallback_reason", "fallbackReason"],
+    fallbackTier: ["fallback_tier", "fallbackTier"],
   },
   // Identifier-only projection; response bodies, headers and messages are never copied.
   "firewall.upstream_error": {
@@ -696,6 +705,16 @@ function normalizeRankedChoices(choices) {
 }
 
 /**
+ * Drop malformed AWF selection-provenance fields while keeping valid strings and explicit nulls.
+ * @param {Record<string, any>} target
+ */
+function sanitizeModelRoutingFallbackFields(target) {
+  if (Object.hasOwn(target, "selectionSource") && !SELECTION_SOURCES.has(target.selectionSource)) delete target.selectionSource;
+  if (Object.hasOwn(target, "fallbackReason") && target.fallbackReason !== null && !isErrorIdentifier(target.fallbackReason)) delete target.fallbackReason;
+  if (Object.hasOwn(target, "fallbackTier") && target.fallbackTier !== null && !FALLBACK_TIERS.has(target.fallbackTier)) delete target.fallbackTier;
+}
+
+/**
  * Compact known payloads without truncating text or changing native parser traces.
  * Unknown extension data remains opaque for forward compatibility.
  * @param {SessionEvent} event
@@ -786,6 +805,7 @@ function normalizeUnifiedSessionEvent(event, phase, copilotSource) {
       if (Object.hasOwn(data, key) && !isErrorIdentifier(data[key])) delete data[key];
     }
     if (Object.hasOwn(data, "errorSource") && !ERROR_SOURCES.has(data.errorSource)) delete data.errorSource;
+    sanitizeModelRoutingFallbackFields(data);
   }
   if (event.type === "firewall.upstream_error") {
     for (const key of ["errorCode", "errorType", "errorParam"]) {
@@ -805,6 +825,7 @@ function normalizeUnifiedSessionEvent(event, phase, copilotSource) {
     const modelRouting = source.modelRouting ?? source.model_routing;
     if (modelRouting && typeof modelRouting === "object" && !Array.isArray(modelRouting)) {
       data.modelRouting = selectFields(modelRouting, MODEL_ROUTING_FIELDS);
+      sanitizeModelRoutingFallbackFields(data.modelRouting);
     }
     const modelSelection = source.modelSelection ?? source.model_selection;
     if (modelSelection && typeof modelSelection === "object" && !Array.isArray(modelSelection)) {
